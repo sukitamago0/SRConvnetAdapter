@@ -8,6 +8,18 @@ from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 
+def _pick_sparse_adapter_blocks(depth: int):
+    if int(depth) == 28:
+        return [14, 18, 22, 26]
+    ratios = [0.50, 0.64, 0.78, 0.93]
+    picks = []
+    for r in ratios:
+        idx = int(round((depth - 1) * r))
+        idx = max(0, min(depth - 1, idx))
+        picks.append(idx)
+    return sorted(list(dict.fromkeys(picks)))
+
+
 @MODELS.register_module()
 class PixArtSigmaSR(PixArtMS):
     def __init__(self, force_null_caption: bool = True, **kwargs):
@@ -34,6 +46,35 @@ class PixArtSigmaSR(PixArtMS):
         self.input_adaln = nn.ModuleList([nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=True) for _ in range(self.depth)])
         self.input_res_proj = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size, bias=True) for _ in range(self.depth)])
         self.inject_gate = nn.Parameter(torch.full((self.depth,), -4.0))
+        # legacy-unused in MSM-DCA forward: kept for compatibility only.
+
+        self.adapter_ca_block_ids = _pick_sparse_adapter_blocks(self.depth)
+        self.adapter_ca_norm_q = nn.ModuleDict()
+        self.adapter_ca_layers = nn.ModuleDict()
+        self.adapter_ca_out = nn.ModuleDict()
+        self.adapter_ca_gate = nn.ParameterDict()
+
+        for bid in self.adapter_ca_block_ids:
+            bid_key = str(int(bid))
+            num_heads = int(getattr(self.blocks[bid].attn, "num_heads", kwargs.get("num_heads", 16)))
+            self.adapter_ca_norm_q[bid_key] = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+            self.adapter_ca_layers[bid_key] = nn.MultiheadAttention(
+                embed_dim=self.hidden_size,
+                num_heads=num_heads,
+                batch_first=True,
+            )
+            self.adapter_ca_out[bid_key] = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+            # IMPORTANT: keep out-proj zero for zero-impact start, but gate must be non-zero
+            # to avoid dead-branch gradients (if gate=0 and out=0 simultaneously, gradients vanish).
+            self.adapter_ca_gate[bid_key] = nn.Parameter(torch.ones(1))
+
+            nn.init.zeros_(self.adapter_ca_out[bid_key].weight)
+            nn.init.zeros_(self.adapter_ca_out[bid_key].bias)
+
+        ca_heads = {k: int(self.adapter_ca_layers[k].num_heads) for k in self.adapter_ca_layers.keys()}
+        print(f"[PixArtAdapterCA] depth={self.depth}, block_ids={self.adapter_ca_block_ids}, heads={ca_heads}")
+        print("[PixArtLegacyRoute] cond_route_logits=disabled, early/mid/late path=disabled")
+        print("[PixArtLegacyBridge] input_adaln/input_res_proj/inject_gate are legacy-unused in MSM-DCA forward")
 
         for lin in self.input_adaln:
             nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
@@ -63,9 +104,9 @@ class PixArtSigmaSR(PixArtMS):
             c_size, ar = data_info['img_hw'].to(self.dtype), data_info['aspect_ratio'].to(self.dtype)
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
-        cond_tokens = None
+        memory_tokens = None
         if isinstance(adapter_cond, dict):
-            cond_tokens = adapter_cond.get("cond_tokens", None)
+            memory_tokens = adapter_cond.get("memory_tokens", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -84,15 +125,6 @@ class PixArtSigmaSR(PixArtMS):
 
         for i, block in enumerate(self.blocks):
             adaln_shift, adaln_scale, adaln_alpha = None, None, None
-            if cond_tokens is not None:
-                feat = self.input_adapter_ln(cond_tokens.to(dtype=torch.float32))
-                adaln_shift, adaln_scale = self.input_adaln[i](feat).chunk(2, dim=-1)
-                res = self.input_res_proj[i](feat).to(dtype=x.dtype)
-                gate = torch.sigmoid(self.inject_gate[i]).to(dtype=x.dtype)
-                x = x + gate * res
-                adaln_shift = adaln_shift.to(dtype=x.dtype)
-                adaln_scale = adaln_scale.to(dtype=x.dtype)
-                adaln_alpha = gate.view(1, 1, 1)
 
             x = auto_grad_checkpoint(
                 block,
@@ -108,6 +140,15 @@ class PixArtSigmaSR(PixArtMS):
                 adaln_alpha=adaln_alpha,
                 **kwargs,
             )
+
+            if (memory_tokens is not None) and (i in self.adapter_ca_block_ids):
+                bid_key = str(int(i))
+                q = self.adapter_ca_norm_q[bid_key](x.to(dtype=torch.float32))
+                kv = memory_tokens.to(dtype=torch.float32)
+                delta, _ = self.adapter_ca_layers[bid_key](q, kv, kv, need_weights=False)
+                delta = self.adapter_ca_out[bid_key](delta).to(dtype=x.dtype)
+                gate = self.adapter_ca_gate[bid_key].to(dtype=x.dtype)
+                x = x + gate.view(1, 1, 1) * delta
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
