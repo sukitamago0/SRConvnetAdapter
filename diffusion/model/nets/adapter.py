@@ -24,6 +24,8 @@ class SRConvNetLSAAdapter(nn.Module):
         )
 
         c2, c3, c4 = self._infer_feature_channels()
+        # legacy-unused: kept only for historical checkpoint compatibility.
+        # MSM-DCA main forward no longer uses proj2/proj3/proj4/out_proj.
         self.proj2 = nn.Conv2d(c2, 256, 1)
         self.proj3 = nn.Conv2d(c3, 256, 1)
         self.proj4 = nn.Conv2d(c4, 256, 1)
@@ -72,6 +74,7 @@ class SRConvNetLSAAdapter(nn.Module):
             nn.init.zeros_(m.bias)
 
         print(f"[AdapterChannelCheck] c2={c2}, c3={c3}, c4={c4}, mem_dim={self.mem_dim}")
+        print("[AdapterLegacy] proj2/proj3/proj4/out_proj are legacy-unused in MSM-DCA forward")
 
     def _infer_feature_channels(self):
         with torch.no_grad():

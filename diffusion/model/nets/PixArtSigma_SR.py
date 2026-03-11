@@ -46,6 +46,7 @@ class PixArtSigmaSR(PixArtMS):
         self.input_adaln = nn.ModuleList([nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=True) for _ in range(self.depth)])
         self.input_res_proj = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size, bias=True) for _ in range(self.depth)])
         self.inject_gate = nn.Parameter(torch.full((self.depth,), -4.0))
+        # legacy-unused in MSM-DCA forward: kept for compatibility only.
 
         self.adapter_ca_block_ids = _pick_sparse_adapter_blocks(self.depth)
         self.adapter_ca_norm_q = nn.ModuleDict()
@@ -71,6 +72,7 @@ class PixArtSigmaSR(PixArtMS):
         ca_heads = {k: int(self.adapter_ca_layers[k].num_heads) for k in self.adapter_ca_layers.keys()}
         print(f"[PixArtAdapterCA] depth={self.depth}, block_ids={self.adapter_ca_block_ids}, heads={ca_heads}")
         print("[PixArtLegacyRoute] cond_route_logits=disabled, early/mid/late path=disabled")
+        print("[PixArtLegacyBridge] input_adaln/input_res_proj/inject_gate are legacy-unused in MSM-DCA forward")
 
         for lin in self.input_adaln:
             nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
