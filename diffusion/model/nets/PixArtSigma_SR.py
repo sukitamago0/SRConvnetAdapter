@@ -70,6 +70,7 @@ class PixArtSigmaSR(PixArtMS):
 
         ca_heads = {k: int(self.adapter_ca_layers[k].num_heads) for k in self.adapter_ca_layers.keys()}
         print(f"[PixArtAdapterCA] depth={self.depth}, block_ids={self.adapter_ca_block_ids}, heads={ca_heads}")
+        print("[PixArtLegacyRoute] cond_route_logits=disabled, early/mid/late path=disabled")
 
         for lin in self.input_adaln:
             nn.init.normal_(lin.weight, mean=0.0, std=1e-3)

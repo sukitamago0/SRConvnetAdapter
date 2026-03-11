@@ -23,18 +23,23 @@ class SRConvNetLSAAdapter(nn.Module):
             nn.Linear(self.hidden_size, 2 * (64 + 128 + 256 + 256)),
         )
 
-        self.proj2 = nn.Conv2d(128, 256, 1)
-        self.proj3 = nn.Conv2d(256, 256, 1)
-        self.proj4 = nn.Conv2d(256, 256, 1)
+        c2, c3, c4 = self._infer_feature_channels()
+        self.proj2 = nn.Conv2d(c2, 256, 1)
+        self.proj3 = nn.Conv2d(c3, 256, 1)
+        self.proj4 = nn.Conv2d(c4, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
 
         self.mem_dim = 512
-        self.mem_proj_f2 = nn.Conv2d(128, self.mem_dim, 1)
-        self.mem_proj_f3 = nn.Conv2d(256, self.mem_dim, 1)
-        self.mem_proj_f4 = nn.Conv2d(256, self.mem_dim, 1)
+        self.mem_proj_f2 = nn.Conv2d(c2, self.mem_dim, 1)
+        self.mem_proj_f3 = nn.Conv2d(c3, self.mem_dim, 1)
+        self.mem_proj_f4 = nn.Conv2d(c4, self.mem_dim, 1)
 
-        self.scale_embed = nn.Parameter(torch.zeros(3, self.mem_dim))
-        nn.init.normal_(self.scale_embed, mean=0.0, std=0.02)
+        self.scale_embed_f2 = nn.Parameter(torch.zeros(1, 1, self.mem_dim))
+        self.scale_embed_f3 = nn.Parameter(torch.zeros(1, 1, self.mem_dim))
+        self.scale_embed_f4 = nn.Parameter(torch.zeros(1, 1, self.mem_dim))
+        nn.init.normal_(self.scale_embed_f2, mean=0.0, std=0.02)
+        nn.init.normal_(self.scale_embed_f3, mean=0.0, std=0.02)
+        nn.init.normal_(self.scale_embed_f4, mean=0.0, std=0.02)
 
         self.resampler_f2 = MultiScaleResampler(
             latent_tokens=64,
@@ -66,6 +71,18 @@ class SRConvNetLSAAdapter(nn.Module):
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
 
+        print(f"[AdapterChannelCheck] c2={c2}, c3={c3}, c4={c4}, mem_dim={self.mem_dim}")
+
+    def _infer_feature_channels(self):
+        with torch.no_grad():
+            p = next(self.stem.parameters())
+            dummy = torch.zeros(1, 3, 64, 64, device=p.device, dtype=p.dtype)
+            f1 = self.stage1(self.stem(dummy))
+            f2 = self.stage2(self.down1(f1))
+            f3 = self.stage3(self.down2(f2))
+            f4 = self.stage4(f3)
+        return int(f2.shape[1]), int(f3.shape[1]), int(f4.shape[1])
+
     @staticmethod
     def _build_2d_sincos(h: int, w: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if dim % 4 != 0:
@@ -81,11 +98,11 @@ class SRConvNetLSAAdapter(nn.Module):
         pos = torch.cat([torch.sin(py), torch.cos(py), torch.sin(px), torch.cos(px)], dim=-1)
         return pos.to(dtype=dtype)
 
-    def _tokenize(self, feat: torch.Tensor, scale_id: int) -> torch.Tensor:
-        b, c, h, w = feat.shape
+    def _tokenize(self, feat: torch.Tensor, scale_embed: torch.Tensor) -> torch.Tensor:
+        _, c, h, w = feat.shape
         tok = feat.flatten(2).transpose(1, 2)
         pos = self._build_2d_sincos(h, w, c, feat.device, feat.dtype)
-        tok = tok + pos.unsqueeze(0) + self.scale_embed[scale_id].to(dtype=tok.dtype).view(1, 1, -1)
+        tok = tok + pos.unsqueeze(0) + scale_embed.to(dtype=tok.dtype)
         return tok
 
     @staticmethod
@@ -107,9 +124,9 @@ class SRConvNetLSAAdapter(nn.Module):
             f3 = self._film(f3, g3, b3)
             f4 = self._film(f4, g4, b4)
 
-        tf2 = self._tokenize(self.mem_proj_f2(f2), scale_id=0)
-        tf3 = self._tokenize(self.mem_proj_f3(f3), scale_id=1)
-        tf4 = self._tokenize(self.mem_proj_f4(f4), scale_id=2)
+        tf2 = self._tokenize(self.mem_proj_f2(f2), self.scale_embed_f2)
+        tf3 = self._tokenize(self.mem_proj_f3(f3), self.scale_embed_f3)
+        tf4 = self._tokenize(self.mem_proj_f4(f4), self.scale_embed_f4)
 
         m2 = self.resampler_f2(tf2)
         m3 = self.resampler_f3(tf3)
@@ -128,7 +145,7 @@ class SRConvNetLSAAdapter(nn.Module):
 
         return {
             "memory_tokens": memory_tokens,
-            "memory_meta": {"n2": 64, "n3": 32, "n4": 16},
+            "memory_meta": {"n_f2": 64, "n_f3": 32, "n_f4": 16},
         }
 
 

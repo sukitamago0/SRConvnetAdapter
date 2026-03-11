@@ -95,7 +95,7 @@ VAE_PATH = os.path.join(DIFFUSERS_ROOT, "vae")
 NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth")
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
-INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
+INIT_CKPT_PATH = ""  # cold-start only: SR checkpoint warm-start disabled
 OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
@@ -219,8 +219,8 @@ KV_COMPRESS_ENABLE = True
 KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
-# Staged unfreeze for resume from old checkpoint
-TRAIN_STAGE = os.getenv("DTSR_TRAIN_STAGE", "A").upper()  # A | B
+# Single-stage training only (cold-start new interface)
+TRAIN_STAGE = "single"
 AUTO_STAGE_ENABLED = False
 ENABLE_SELECTIVE_TUNING = False
 ENABLE_LORA = True
@@ -399,7 +399,15 @@ def _extract_adapter_ca_gate_stats(pixart: nn.Module):
         return 0.0, 0.0
     g = torch.cat(gate_vals, dim=0)
     g_norm = float(torch.norm(g, p=2).item())
-    return float(g.mean().item()), g_norm
+    g_absmax = float(g.abs().max().item())
+    return float(g.mean().item()), g_norm, g_absmax
+
+
+def _extract_memory_token_norm(cond):
+    if isinstance(cond, dict) and torch.is_tensor(cond.get("memory_tokens", None)):
+        m = cond["memory_tokens"].detach().float()
+        return float(torch.norm(m, p=2).item())
+    return 0.0
 
 
 def _extract_dual_gate_stats(pixart: nn.Module):
@@ -1145,7 +1153,6 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    stage = str(TRAIN_STAGE).upper()
     legacy_bridge_keywords = ["input_adaln", "input_res_proj", "inject_gate"]
     adapter_ca_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate"]
 
@@ -1157,10 +1164,10 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             p.requires_grad_(False)
             continue
         if FINAL_LAYER_KEYWORD in n:
-            p.requires_grad_(stage == "B")
+            p.requires_grad_(True)
             continue
         if ("lora_A" in n) or ("lora_B" in n):
-            p.requires_grad_(stage == "B")
+            p.requires_grad_(True)
             continue
 
     if not train_x_embedder:
@@ -1176,27 +1183,21 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             if ("lora_A" in n) or ("lora_B" in n):
                 bid = _block_id_from_name(n)
                 kind = _lora_target_kind(n)
-                p.requires_grad_(bool(stage == "B" and bid is not None and 0 <= bid <= 27 and kind == "attn"))
+                p.requires_grad_(bool(bid is not None and 0 <= bid <= 27 and kind == "attn"))
 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
-    print(f"✅ PixArt trainable configured(stage={stage}): before={total_trainable_before}, after={total_trainable_after}")
+    print(f"✅ PixArt trainable configured(single-stage): before={total_trainable_before}, after={total_trainable_after}")
 
 
 def configure_adapter_trainable_params(adapter: nn.Module):
-    stage = str(TRAIN_STAGE).upper()
     total_before = sum(1 for _, p in adapter.named_parameters() if p.requires_grad)
-    for _, p in adapter.named_parameters():
-        p.requires_grad_(False)
     for n, p in adapter.named_parameters():
-        is_memory = any(k in n for k in ["mem_proj_", "resampler_", "memory_out_proj", "memory_ln", "scale_embed"])
-        if stage == "A":
-            p.requires_grad_(is_memory)
-        else:
-            p.requires_grad_(True)
+        _ = n
+        p.requires_grad_(True)
     total_after = sum(1 for _, p in adapter.named_parameters() if p.requires_grad)
-    print(f"✅ Adapter trainable configured(stage={stage}): before={total_before}, after={total_after}")
+    print(f"✅ Adapter trainable configured(single-stage): before={total_before}, after={total_after}")
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
@@ -1212,7 +1213,6 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
 
 
 def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
-    stage = str(TRAIN_STAGE).upper()
     adapter_memory_params = []
     adapter_backbone_params = []
 
@@ -1243,17 +1243,18 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     optim_groups = []
     if len(adapter_memory_params) > 0:
-        optim_groups.append({"params": adapter_memory_params, "lr": 1e-4 if stage == "A" else 5e-5, "weight_decay": 0.01})
+        optim_groups.append({"params": adapter_memory_params, "lr": 3e-5, "weight_decay": 0.01})
     if len(adapter_ca_params) > 0:
-        optim_groups.append({"params": adapter_ca_params, "lr": 5e-5 if stage == "A" else 2e-5, "weight_decay": 0.01})
-    if stage == "B" and len(adapter_backbone_params) > 0:
-        optim_groups.append({"params": adapter_backbone_params, "lr": 2e-5, "weight_decay": 0.01})
-    if stage == "B" and len(final_head_params) > 0:
-        optim_groups.append({"params": final_head_params, "lr": 5e-6, "weight_decay": 0.01})
-    if stage == "B" and len(lora_params) > 0:
-        optim_groups.append({"params": lora_params, "lr": 5e-6, "weight_decay": 0.01})
+        optim_groups.append({"params": adapter_ca_params, "lr": 2e-5, "weight_decay": 0.01})
+    if len(adapter_backbone_params) > 0:
+        optim_groups.append({"params": adapter_backbone_params, "lr": 3e-5, "weight_decay": 0.01})
+    if len(final_head_params) > 0:
+        optim_groups.append({"params": final_head_params, "lr": 1e-5, "weight_decay": 0.01})
+    if len(lora_params) > 0:
+        optim_groups.append({"params": lora_params, "lr": 1e-5, "weight_decay": 0.01})
     if len(bridge_params) > 0:
-        optim_groups.append({"params": bridge_params, "lr": 5e-5 if stage == "A" else 2e-5, "weight_decay": 0.01})
+        # old bridge path should stay frozen in single-stage MSM-DCA
+        print(f"ℹ️ legacy bridge params kept frozen/unoptimized: {len(bridge_params)}")
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
@@ -1269,7 +1270,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
 
     group_counts = {
-        "bridge": len(bridge_params),
+        "bridge_legacy_frozen": len(bridge_params),
         "adapter_ca": len(adapter_ca_params),
         "lora": len(lora_params),
         "final_head": len(final_head_params),
@@ -1438,6 +1439,11 @@ def save_smart(
                 "transition_layers": list(TRANSITION_INJECTION_LAYERS),
                 "detail_layers": list(DETAIL_INJECTION_LAYERS),
             },
+            "model_variant": "msm_dca_coldstart_v1",
+            "interface_type": "memory_decoupled_cross_attention",
+            "loaded_sr_checkpoint": False,
+            "loaded_pixart_base_only": True,
+            "uses_old_route_path": False,
         }
         return state
 
@@ -1523,76 +1529,15 @@ def _build_limited_val_loader(val_loader, num_samples: int):
 
 
 def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
-    if not ckpt_path:
-        return False
-    if not os.path.exists(ckpt_path):
-        print(f"ℹ️ INIT_CKPT_PATH not found, skip bootstrap: {ckpt_path}")
-        return False
-    print(f"📦 Bootstrapping model weights from {ckpt_path} (weights-only, no optimizer)")
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
-    _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="init")
-    adapter_sd = ckpt.get("adapter", None)
-    if isinstance(adapter_sd, dict):
-        _, _, skipped = load_state_dict_shape_compatible(adapter, adapter_sd, context="init-adapter")
-        print(f"✅ Adapter bootstrap compatible load done. skipped={len(skipped)}")
+    del pixart, adapter, ckpt_path
+    print("ℹ️ SR warm-start disabled: init_from_ckpt_weights_only is bypassed (cold-start mode).")
     return True
 
 
 def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
-    if not os.path.exists(LAST_CKPT_PATH):
-        return 0, 0, [], None
-    print(f"📥 Resuming from {LAST_CKPT_PATH}...")
-    ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
-    ckpt_role = str(ckpt.get("checkpoint_role", "last"))
-    if ckpt_role not in ("last", "best", "best_train"):
-        raise RuntimeError(
-            f"Checkpoint role '{ckpt_role}' is not resume-capable. "
-            "Use last.pth or best.pth for resume."
-        )
-    saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
-    required_frags = get_required_v7_key_fragments_for_model(pixart)
-    missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
-    if missing_required:
-        print("⚠️ Checkpoint missing some currently-trainable fragments (stage-switch expected): " + ", ".join(missing_required))
-
-    adapter_sd = ckpt.get("adapter", {})
-    miss_a, unexp_a, skip_a = load_state_dict_shape_compatible(adapter, adapter_sd, context="resume-adapter")
-    print(f"[resume-adapter] missing={len(miss_a)} unexpected={len(unexp_a)} skipped={len(skip_a)}")
-
-    _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="resume")
-    try:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    except Exception as e:
-        print(f"⚠️ Optimizer state restore skipped due to mismatch: {e}")
-    rs = ckpt.get("rng_state", None)
-    if rs is not None:
-        try:
-            if rs.get("torch") is not None: torch.set_rng_state(rs["torch"])
-            if torch.cuda.is_available() and rs.get("cuda") is not None: torch.cuda.set_rng_state_all(rs["cuda"])
-            if rs.get("numpy") is not None: np.random.set_state(rs["numpy"])
-            if rs.get("python") is not None: random.setstate(rs["python"])
-        except Exception as e: print(f"⚠️ RNG restore failed (non-fatal): {e}")
-    dl_state = ckpt.get("dl_gen_state", None)
-    if dl_state is not None:
-        try: dl_gen.set_state(dl_state)
-        except Exception as e: print(f"⚠️ DataLoader generator restore failed (non-fatal): {e}")
-    if ema is not None:
-        ema_sd = ckpt.get("ema_state", None)
-        if isinstance(ema_sd, dict) and len(ema_sd) > 0:
-            dev_map = {}
-            if ema_named_params is not None:
-                dev_map = {name: p.device for name, p in ema_named_params}
-            restored = {}
-            for k, v in ema_sd.items():
-                if k not in dev_map:
-                    continue
-                restored[k] = v.float().to(device=dev_map[k])
-            ema.shadow = restored
-            print(f"✅ EMA restored: {len(ema.shadow)} tensors")
-        else:
-            print("ℹ️ EMA state not found in checkpoint; proceeding without EMA restore.")
-    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), None
+    del pixart, adapter, optimizer, dl_gen, ema, ema_named_params
+    print("ℹ️ Auto-resume disabled in cold-start mode.")
+    return 0, 0, [], None
 
 # ================= 9. Validation =================
 def run_phase0_regression_check(pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu):
@@ -1847,6 +1792,12 @@ def main():
 
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
+    print("[InitFlags] loaded_sr_checkpoint=False")
+    print("[InitFlags] loaded_pixart_base_only=True")
+    print("[InitFlags] lora_loaded_from_old_ckpt=False")
+    print("[InitFlags] interface=MSM-DCA")
+    print("[InitFlags] old_route=disabled")
+
     # Single-stage optimizer is built once.
 
     # [V8 Change] Switch to V-Prediction logic manually in loop (since IDDPM is epsilon based)
@@ -1867,15 +1818,14 @@ def main():
     print(f"📏 EMA validation frequency: every {EMA_VALIDATE_EVERY} validations")
     print("📏 Raw validation frequency: every validation trigger")
 
-    if not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
-        init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
+    init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
 
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     configure_adapter_trainable_params(adapter)
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
     optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
-    print(f"✅ Optim groups(stage={TRAIN_STAGE}): {group_counts}")
+    print(f"✅ Optim groups(single-stage): {group_counts}")
     _maybe_empty_cuda_cache()
 
     ep_start, step, best, _ = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
@@ -2048,7 +1998,8 @@ def main():
                     alpha_mean = 0.0
                 legacy_gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 mem_shape = _extract_memory_token_shape(cond_in)
-                ca_gate_mean, ca_gate_norm = _extract_adapter_ca_gate_stats(pixart)
+                ca_gate_mean, ca_gate_norm, ca_gate_absmax = _extract_adapter_ca_gate_stats(pixart)
+                mem_norm = _extract_memory_token_norm(cond_in)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
@@ -2067,7 +2018,10 @@ def main():
                     'gate_legacy': f"{legacy_gate_mean:.3f}",
                     'ca_gate_m': f"{ca_gate_mean:.3f}",
                     'ca_gate_n': f"{ca_gate_norm:.3f}",
+                    'ca_gate_abs': f"{ca_gate_absmax:.3f}",
                     'mem_tok': f"{mem_shape}",
+                    'mem_norm': f"{mem_norm:.3f}",
+                    'legacy_route': "unused",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
