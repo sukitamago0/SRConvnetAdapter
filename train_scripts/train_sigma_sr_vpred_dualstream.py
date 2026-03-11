@@ -1308,6 +1308,24 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         print(f"⚠️ [GradSanity] near-zero grad on critical paths: {warnings}")
 
 
+def log_adapter_ca_gradients_early(step: int, pixart: nn.Module):
+    """Print adapter-CA key gradients during first 100 optimization steps."""
+    if step > 100:
+        return
+    named = dict(pixart.named_parameters())
+    gate_vals = []
+    out_vals = []
+    for n, p in named.items():
+        if "adapter_ca_gate" in n and p.grad is not None:
+            gate_vals.append(float(p.grad.detach().float().norm().item()))
+        if "adapter_ca_out" in n and n.endswith("weight") and p.grad is not None:
+            out_vals.append(float(p.grad.detach().float().norm().item()))
+
+    gate_mean = float(np.mean(gate_vals)) if len(gate_vals) > 0 else 0.0
+    out_mean = float(np.mean(out_vals)) if len(out_vals) > 0 else 0.0
+    print(f"[CA-Grad@step{step}] gate_grad_mean={gate_mean:.3e} out_w_grad_mean={out_mean:.3e}")
+
+
 # ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
     # Main SR experiment: select best checkpoints by PSNR first, LPIPS as tie-breaker only.
@@ -1977,6 +1995,7 @@ def main():
 
             loss.backward()
             accum_micro_steps += 1
+            log_adapter_ca_gradients_early(step + 1, pixart)
 
             if accum_micro_steps == GRAD_ACCUM_STEPS:
                 log_critical_path_gradients(step + 1, pixart, adapter)

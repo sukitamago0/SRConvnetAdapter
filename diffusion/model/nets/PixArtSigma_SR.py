@@ -64,7 +64,9 @@ class PixArtSigmaSR(PixArtMS):
                 batch_first=True,
             )
             self.adapter_ca_out[bid_key] = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-            self.adapter_ca_gate[bid_key] = nn.Parameter(torch.zeros(1))
+            # IMPORTANT: keep out-proj zero for zero-impact start, but gate must be non-zero
+            # to avoid dead-branch gradients (if gate=0 and out=0 simultaneously, gradients vanish).
+            self.adapter_ca_gate[bid_key] = nn.Parameter(torch.ones(1))
 
             nn.init.zeros_(self.adapter_ca_out[bid_key].weight)
             nn.init.zeros_(self.adapter_ca_out[bid_key].bias)
