@@ -220,7 +220,7 @@ KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
 # Staged unfreeze for resume from old checkpoint
-TRAIN_STAGE = "single"
+TRAIN_STAGE = os.getenv("DTSR_TRAIN_STAGE", "A").upper()  # A | B
 AUTO_STAGE_ENABLED = False
 ENABLE_SELECTIVE_TUNING = False
 ENABLE_LORA = True
@@ -380,22 +380,26 @@ def structure_consistency_loss(pred_m11: torch.Tensor, lr_m11: torch.Tensor) -> 
 
 
 def _extract_adapter_cond_stats(cond):
-    gate_mean = 0.0
-    gate_std = 0.0
-    if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
-        means = []
-        spatial_stds = []
-        for v in cond[2].values():
-            if torch.is_tensor(v):
-                flat = v.detach().float().reshape(v.shape[0], -1)
-                means.append(flat.mean(dim=1))
-                spatial_stds.append(flat.std(dim=1, unbiased=False))
-        if len(means) > 0:
-            gm = torch.stack(means, dim=0).mean(dim=0)
-            gs = torch.stack(spatial_stds, dim=0).mean(dim=0)
-            gate_mean = float(gm.mean().item())
-            gate_std = float(gs.mean().item())
-    return gate_mean, gate_std
+    # legacy path stats (kept for compatibility print only)
+    return 0.0, 0.0
+
+
+def _extract_memory_token_shape(cond):
+    if isinstance(cond, dict) and torch.is_tensor(cond.get("memory_tokens", None)):
+        return tuple(cond["memory_tokens"].shape)
+    return None
+
+
+def _extract_adapter_ca_gate_stats(pixart: nn.Module):
+    gate_vals = []
+    for n, p in pixart.named_parameters():
+        if "adapter_ca_gate" in n:
+            gate_vals.append(p.detach().float().view(-1))
+    if len(gate_vals) == 0:
+        return 0.0, 0.0
+    g = torch.cat(gate_vals, dim=0)
+    g_norm = float(torch.norm(g, p=2).item())
+    return float(g.mean().item()), g_norm
 
 
 def _extract_dual_gate_stats(pixart: nn.Module):
@@ -1141,13 +1145,23 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = ["final_layer", "input_adaln", "input_res_proj", "inject_gate"]
-    if ENABLE_LORA:
-        always_train_keywords.extend(["lora_A", "lora_B"])
+    stage = str(TRAIN_STAGE).upper()
+    legacy_bridge_keywords = ["input_adaln", "input_res_proj", "inject_gate"]
+    adapter_ca_keywords = ["adapter_ca_norm_q", "adapter_ca_layers", "adapter_ca_out", "adapter_ca_gate"]
 
     for n, p in pixart.named_parameters():
-        if any(k in n for k in always_train_keywords):
+        if any(k in n for k in adapter_ca_keywords):
             p.requires_grad_(True)
+            continue
+        if any(k in n for k in legacy_bridge_keywords):
+            p.requires_grad_(False)
+            continue
+        if FINAL_LAYER_KEYWORD in n:
+            p.requires_grad_(stage == "B")
+            continue
+        if ("lora_A" in n) or ("lora_B" in n):
+            p.requires_grad_(stage == "B")
+            continue
 
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
@@ -1162,12 +1176,27 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             if ("lora_A" in n) or ("lora_B" in n):
                 bid = _block_id_from_name(n)
                 kind = _lora_target_kind(n)
-                p.requires_grad_(bool(bid is not None and 0 <= bid <= 27 and kind == "attn"))
+                p.requires_grad_(bool(stage == "B" and bid is not None and 0 <= bid <= 27 and kind == "attn"))
 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
-    print(f"✅ PixArt trainable configured(single-stage): before={total_trainable_before}, after={total_trainable_after}")
+    print(f"✅ PixArt trainable configured(stage={stage}): before={total_trainable_before}, after={total_trainable_after}")
+
+
+def configure_adapter_trainable_params(adapter: nn.Module):
+    stage = str(TRAIN_STAGE).upper()
+    total_before = sum(1 for _, p in adapter.named_parameters() if p.requires_grad)
+    for _, p in adapter.named_parameters():
+        p.requires_grad_(False)
+    for n, p in adapter.named_parameters():
+        is_memory = any(k in n for k in ["mem_proj_", "resampler_", "memory_out_proj", "memory_ln", "scale_embed"])
+        if stage == "A":
+            p.requires_grad_(is_memory)
+        else:
+            p.requires_grad_(True)
+    total_after = sum(1 for _, p in adapter.named_parameters() if p.requires_grad)
+    print(f"✅ Adapter trainable configured(stage={stage}): before={total_before}, after={total_after}")
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
@@ -1183,11 +1212,21 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
 
 
 def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
-    inject_gate_keys = INJECT_GATE_KEYWORDS
-    adapter_params = [p for p in adapter.parameters() if p.requires_grad]
+    stage = str(TRAIN_STAGE).upper()
+    adapter_memory_params = []
+    adapter_backbone_params = []
+
+    for n, p in adapter.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(k in n for k in ["mem_proj_", "resampler_", "memory_out_proj", "memory_ln", "scale_embed"]):
+            adapter_memory_params.append(p)
+        else:
+            adapter_backbone_params.append(p)
 
     lora_params = []
     final_head_params = []
+    adapter_ca_params = []
     bridge_params = []
 
     for n, p in pixart.named_parameters():
@@ -1195,28 +1234,35 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
             continue
         if ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
+        elif "adapter_ca_" in n:
+            adapter_ca_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
             final_head_params.append(p)
         else:
             bridge_params.append(p)
 
     optim_groups = []
-    if len(adapter_params) > 0:
-        optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
-    bridge_and_head = bridge_params + final_head_params
-    if len(bridge_and_head) > 0:
-        optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
-    if len(lora_params) > 0:
-        optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(adapter_memory_params) > 0:
+        optim_groups.append({"params": adapter_memory_params, "lr": 1e-4 if stage == "A" else 5e-5, "weight_decay": 0.01})
+    if len(adapter_ca_params) > 0:
+        optim_groups.append({"params": adapter_ca_params, "lr": 5e-5 if stage == "A" else 2e-5, "weight_decay": 0.01})
+    if stage == "B" and len(adapter_backbone_params) > 0:
+        optim_groups.append({"params": adapter_backbone_params, "lr": 2e-5, "weight_decay": 0.01})
+    if stage == "B" and len(final_head_params) > 0:
+        optim_groups.append({"params": final_head_params, "lr": 5e-6, "weight_decay": 0.01})
+    if stage == "B" and len(lora_params) > 0:
+        optim_groups.append({"params": lora_params, "lr": 5e-6, "weight_decay": 0.01})
+    if len(bridge_params) > 0:
+        optim_groups.append({"params": bridge_params, "lr": 5e-5 if stage == "A" else 2e-5, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params
+    params_to_clip = adapter_memory_params + adapter_backbone_params + adapter_ca_params + bridge_params + final_head_params + lora_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params
+    grouped = bridge_params + adapter_ca_params + final_head_params + lora_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1224,9 +1270,11 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     group_counts = {
         "bridge": len(bridge_params),
+        "adapter_ca": len(adapter_ca_params),
         "lora": len(lora_params),
         "final_head": len(final_head_params),
-        "adapter": len(adapter_params),
+        "adapter_memory": len(adapter_memory_params),
+        "adapter_backbone": len(adapter_backbone_params),
     }
     return optimizer, params_to_clip, group_counts
 
@@ -1238,9 +1286,9 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     ad_named = dict(adapter.named_parameters())
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("pixart.input_res_proj.0.weight", pix_named.get("input_res_proj.0.weight", None)),
-        ("pixart.input_adaln.0.weight", pix_named.get("input_adaln.0.weight", None)),
-        ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
+        ("pixart.adapter_ca_out.14.weight", pix_named.get("adapter_ca_out.14.weight", None)),
+        ("pixart.adapter_ca_gate.14", pix_named.get("adapter_ca_gate.14", None)),
+        ("adapter.memory_out_proj.weight", ad_named.get("memory_out_proj.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
     ]
     msg = [f"[GradSanity][step={step}]"]
@@ -1486,11 +1534,8 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="init")
     adapter_sd = ckpt.get("adapter", None)
     if isinstance(adapter_sd, dict):
-        try:
-            adapter.load_state_dict(adapter_sd, strict=True)
-            print("✅ Adapter bootstrap load succeeded.")
-        except Exception as e:
-            print(f"⚠️ Adapter bootstrap load skipped due to mismatch: {e}")
+        _, _, skipped = load_state_dict_shape_compatible(adapter, adapter_sd, context="init-adapter")
+        print(f"✅ Adapter bootstrap compatible load done. skipped={len(skipped)}")
     return True
 
 
@@ -1512,10 +1557,8 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
         print("⚠️ Checkpoint missing some currently-trainable fragments (stage-switch expected): " + ", ".join(missing_required))
 
     adapter_sd = ckpt.get("adapter", {})
-    try:
-        adapter.load_state_dict(adapter_sd, strict=True)
-    except RuntimeError as e:
-        raise RuntimeError(f"Adapter strict load failed during resume: {e}") from e
+    miss_a, unexp_a, skip_a = load_state_dict_shape_compatible(adapter, adapter_sd, context="resume-adapter")
+    print(f"[resume-adapter] missing={len(miss_a)} unexpected={len(unexp_a)} skipped={len(skip_a)}")
 
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="resume")
     try:
@@ -1828,12 +1871,11 @@ def main():
         init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
 
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
-    for p in adapter.parameters():
-        p.requires_grad_(True)
+    configure_adapter_trainable_params(adapter)
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
     optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
-    print(f"✅ Optim groups(single-stage): {group_counts}")
+    print(f"✅ Optim groups(stage={TRAIN_STAGE}): {group_counts}")
     _maybe_empty_cuda_cache()
 
     ep_start, step, best, _ = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
@@ -2004,7 +2046,9 @@ def main():
                     alpha_mean = float(np.mean([float(v) for v in a.values()]))
                 else:
                     alpha_mean = 0.0
-                gate_mean, _ = _extract_adapter_cond_stats(cond_in)
+                legacy_gate_mean, _ = _extract_adapter_cond_stats(cond_in)
+                mem_shape = _extract_memory_token_shape(cond_in)
+                ca_gate_mean, ca_gate_norm = _extract_adapter_ca_gate_stats(pixart)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
@@ -2020,7 +2064,10 @@ def main():
                     'px_n': f"{pixel_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
-                    'gate': f"{gate_mean:.3f}",
+                    'gate_legacy': f"{legacy_gate_mean:.3f}",
+                    'ca_gate_m': f"{ca_gate_mean:.3f}",
+                    'ca_gate_n': f"{ca_gate_norm:.3f}",
+                    'mem_tok': f"{mem_shape}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
