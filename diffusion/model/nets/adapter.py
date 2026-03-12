@@ -59,8 +59,8 @@ class SRConvNetLSAAdapter(nn.Module):
         cond_tokens = cond_map.flatten(2).transpose(1, 2)
 
         return {
+            "cond_map": cond_map,
             "cond_tokens": cond_tokens,
-            "cond_maps": [f2, f3, f4],
         }
 
 
