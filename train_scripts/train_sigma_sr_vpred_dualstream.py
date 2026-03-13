@@ -213,6 +213,7 @@ DUALSTREAM_ENABLED = False
 DUAL_CROSS_ATTN_START = 22
 DUAL_NUM_HEADS = 16
 USE_STYLE_FUSION = False
+GUIDE_AUX_W = 0.1
 
 # Conservative KV-compress to reduce attention memory with minimal quality impact.
 KV_COMPRESS_ENABLE = True
@@ -1611,6 +1612,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         psnrs, ssims, lpipss = [], [], []; vis_done = False
         cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
+        guide_r2_psnrs, guide_r2_l1s = [], []
+        guide_feat_norms, guide_to_c2_norms, guide_to_c3_norms, guide_to_c4_norms = [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1627,7 +1630,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                 with torch.no_grad():
                     t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                    cond = adapter(lr_small, t_embed=t_embed)
+                    cond = adapter(lr_small, lr_full_up=lr.to(dtype=COMPUTE_DTYPE), t_embed=t_embed)
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     if FORCE_DROP_TEXT: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.ones(latents.shape[0], device=DEVICE)
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
@@ -1653,6 +1656,21 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     gm, gs = _extract_adapter_cond_stats(cond)
                     gate_means.append(gm)
                     gate_stds.append(gs)
+
+                    r2 = cond.get("guide_residual", None) if isinstance(cond, dict) else None
+                    if r2 is not None:
+                        r2 = r2.clamp(-1, 1)
+                        r2_l1 = torch.mean(torch.abs(r2.float() - hr.float())).item()
+                        guide_r2_l1s.append(float(r2_l1))
+                        r2y = rgb01_to_y01((r2 + 1) / 2)[..., 4:-4, 4:-4]
+                        hy_r2 = rgb01_to_y01((hr + 1) / 2)[..., 4:-4, 4:-4]
+                        guide_r2_psnrs.append(float(psnr(r2y, hy_r2, data_range=1.0).item()))
+                    gstats = cond.get("guide_stats", {}) if isinstance(cond, dict) else {}
+                    if isinstance(gstats, dict) and len(gstats) > 0:
+                        guide_feat_norms.append(float(gstats.get("guide_feat_norm", 0.0)))
+                        guide_to_c2_norms.append(float(gstats.get("guide_to_c2_norm", 0.0)))
+                        guide_to_c3_norms.append(float(gstats.get("guide_to_c3_norm", 0.0)))
+                        guide_to_c4_norms.append(float(gstats.get("guide_to_c4_norm", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", None)
                     if isinstance(sft_stats, dict):
@@ -1700,11 +1718,19 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         sft_ss = float(np.mean(sft_scale_stds)) if len(sft_scale_stds) > 0 else 0.0
         sft_shm = float(np.mean(sft_shift_means)) if len(sft_shift_means) > 0 else 0.0
         sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
+        gr2_psnr = float(np.mean(guide_r2_psnrs)) if len(guide_r2_psnrs) > 0 else 0.0
+        gr2_l1 = float(np.mean(guide_r2_l1s)) if len(guide_r2_l1s) > 0 else 0.0
+        gfn = float(np.mean(guide_feat_norms)) if len(guide_feat_norms) > 0 else 0.0
+        gc2 = float(np.mean(guide_to_c2_norms)) if len(guide_to_c2_norms) > 0 else 0.0
+        gc3 = float(np.mean(guide_to_c3_norms)) if len(guide_to_c3_norms) > 0 else 0.0
+        gc4 = float(np.mean(guide_to_c4_norms)) if len(guide_to_c4_norms) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
             f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
-            f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f}"
+            f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
+            f"guide_r2_psnr={gr2_psnr:.4f} | guide_r2_l1={gr2_l1:.4f} | "
+            f"guide_feat_norm={gfn:.4f} | guide_to_c2_norm={gc2:.4f} | guide_to_c3_norm={gc3:.4f} | guide_to_c4_norm={gc4:.4f}"
         )
         if DUALSTREAM_ENABLED:
             msg += f" | dual_gate={dual_m:.4f}±{dual_s:.4f}"
@@ -1897,7 +1923,7 @@ def main():
             with torch.no_grad():
                 t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
+                cond = adapter(adapter_in, lr_full_up=lr.to(dtype=COMPUTE_DTYPE), t_embed=t_embed) # time-aware adapter conditioning
             cond_in = cond
             cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
@@ -1988,6 +2014,11 @@ def main():
                     pixel_loss_num_samples = 0
 
                 inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
+                r2 = cond.get("guide_residual", None) if isinstance(cond, dict) else None
+                if r2 is not None:
+                    loss_guide = F.mse_loss(r2.float(), hr.float())
+                else:
+                    loss_guide = torch.zeros((), device=DEVICE, dtype=model_pred.dtype)
                 loss = (
                     loss_v 
                     + w['latent_l1']*loss_latent_l1
@@ -1995,6 +2026,7 @@ def main():
                     + w['edge_grad'] * loss_edge + w['flat_hf'] * loss_flat_hf
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + inject_reg
+                    + GUIDE_AUX_W * loss_guide
                 ) / GRAD_ACCUM_STEPS
 
             loss.backward()
@@ -2031,6 +2063,7 @@ def main():
                     'w_flat': f"{w['flat_hf']:.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
+                    'g_aux': f"{loss_guide.item():.3f}",
                     'px_n': f"{pixel_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",

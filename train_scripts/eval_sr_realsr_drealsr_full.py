@@ -364,7 +364,7 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
-            cond = adapter(adapter_in, t_embed=t_embed.float())
+            cond = adapter(adapter_in, lr_full_up=lr.to(dtype=compute_dtype), t_embed=t_embed.float())
             out = pixart(
                 x=latents.to(compute_dtype),
                 timestep=t_b,
