@@ -54,8 +54,8 @@ BASE_PIXART_SHA256 = None
 
 # Added "aug_embedder" to required keys
 V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
-    "input_adaln", "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj",
-    "input_adapter_ln", "style_fusion_mlp", "aug_embedder", "injection_scales"
+    "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj",
+    "style_fusion_mlp", "aug_embedder", "injection_scales", "sft_cond_reduce", "sft_layers"
 )
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
@@ -574,7 +574,7 @@ class ParamEMA:
 
 def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = "small"):
     names = (
-        "alpha_struct", "alpha_trans", "alpha_detail", "input_adaln", "input_res_proj", "style_fusion_mlp", "input_adapter_ln",
+        "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj", "style_fusion_mlp", "sft_cond_reduce", "sft_layers",
         "aug_embedder", "injection_scales", "csft_dw", "csft_pw", "final_layer", "lora_A", "lora_B", "x_embedder",
         "lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate"
     )
@@ -1141,7 +1141,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = ["final_layer", "input_adaln", "input_res_proj", "inject_gate"]
+    always_train_keywords = ["final_layer", "input_res_proj", "inject_gate", "sft_cond_reduce", "sft_layers"]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
 
@@ -1239,7 +1239,7 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.input_res_proj.0.weight", pix_named.get("input_res_proj.0.weight", None)),
-        ("pixart.input_adaln.0.weight", pix_named.get("input_adaln.0.weight", None)),
+        ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
         ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
     ]
@@ -1610,6 +1610,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         scheduler.set_timesteps(steps, device=DEVICE)
         psnrs, ssims, lpipss = [], [], []; vis_done = False
         cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
+        sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1653,6 +1654,13 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     gate_means.append(gm)
                     gate_stds.append(gs)
 
+                    sft_stats = getattr(pixart, "_last_sft_stats", None)
+                    if isinstance(sft_stats, dict):
+                        sft_scale_means.append(float(sft_stats.get("sft_scale_mean", 0.0)))
+                        sft_scale_stds.append(float(sft_stats.get("sft_scale_std", 0.0)))
+                        sft_shift_means.append(float(sft_stats.get("sft_shift_mean", 0.0)))
+                        sft_shift_stds.append(float(sft_stats.get("sft_shift_std", 0.0)))
+
                     if CFG_SCALE == 1.0:
                         out = out_cond
                     else:
@@ -1688,9 +1696,15 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         ast = float(np.mean(alpha_stds)) if len(alpha_stds) > 0 else 0.0
         gm = float(np.mean(gate_means)) if len(gate_means) > 0 else 0.0
         gs = float(np.mean(gate_stds)) if len(gate_stds) > 0 else 0.0
+        sft_sm = float(np.mean(sft_scale_means)) if len(sft_scale_means) > 0 else 0.0
+        sft_ss = float(np.mean(sft_scale_stds)) if len(sft_scale_stds) > 0 else 0.0
+        sft_shm = float(np.mean(sft_shift_means)) if len(sft_shift_means) > 0 else 0.0
+        sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f}"
+            f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
+            f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
+            f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f}"
         )
         if DUALSTREAM_ENABLED:
             msg += f" | dual_gate={dual_m:.4f}±{dual_s:.4f}"
