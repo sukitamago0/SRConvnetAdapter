@@ -66,7 +66,10 @@ class PixArtSigmaSR(PixArtMS):
         self.guide_fuse64 = nn.Conv2d(8, 4, 1)
         self.guide_proj32 = nn.Conv2d(self.guidance_channels * (16 ** 2), self.hidden_size, 1)
         self.guide_fuse32 = nn.Conv2d(self.hidden_size * 2, self.hidden_size, 1)
-        for m in [self.guide_proj64, self.guide_fuse64, self.guide_proj32, self.guide_fuse32]:
+        for m in [self.guide_proj64, self.guide_proj32]:
+            nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(m.bias)
+        for m in [self.guide_fuse64, self.guide_fuse32]:
             nn.init.zeros_(m.weight)
             nn.init.zeros_(m.bias)
         self._last_guide_r2 = None
