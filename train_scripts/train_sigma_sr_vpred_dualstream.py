@@ -53,9 +53,14 @@ from diffusion.model.gaussian_diffusion import _extract_into_tensor
 BASE_PIXART_SHA256 = None
 
 # Added "aug_embedder" to required keys
+GUIDANCE_PIXART_KEY_FRAGMENTS = (
+    "guidance_branch", "guide_proj64", "guide_fuse64", "guide_proj32", "guide_fuse32"
+)
+
 V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
     "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj",
-    "style_fusion_mlp", "aug_embedder", "injection_scales", "sft_cond_reduce", "sft_layers"
+    "style_fusion_mlp", "aug_embedder", "injection_scales", "sft_cond_reduce", "sft_layers",
+    *GUIDANCE_PIXART_KEY_FRAGMENTS,
 )
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
@@ -577,7 +582,8 @@ def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = 
     names = (
         "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj", "style_fusion_mlp", "sft_cond_reduce", "sft_layers",
         "aug_embedder", "injection_scales", "csft_dw", "csft_pw", "final_layer", "lora_A", "lora_B", "x_embedder",
-        "lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate"
+        "lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate",
+        "guidance_branch", "guide_proj64", "guide_fuse64", "guide_proj32", "guide_fuse32"
     )
     out = []
     for n, p in adapter.named_parameters():
@@ -1142,7 +1148,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = ["final_layer", "input_res_proj", "inject_gate", "sft_cond_reduce", "sft_layers"]
+    always_train_keywords = ["final_layer", "input_res_proj", "inject_gate", "sft_cond_reduce", "sft_layers", *GUIDANCE_PIXART_KEY_FRAGMENTS]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
 
