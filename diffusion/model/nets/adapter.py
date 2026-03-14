@@ -51,9 +51,16 @@ class ImageGuidanceNetwork(nn.Module):
 class GuideSRFullResBranch(nn.Module):
     def __init__(self, guide_channels: int = 64):
         super().__init__()
-        self.stem = nn.Conv2d(3, guide_channels, 3, padding=1)
-        self.frbs = nn.Sequential(*[FullResolutionBlock(guide_channels, num_fca=2) for _ in range(4)])
-        self.ign = ImageGuidanceNetwork(guide_channels)
+        self.guide_channels = int(guide_channels)
+        self.stem = nn.Conv2d(3, self.guide_channels, 3, padding=1)
+        self.frbs = nn.Sequential(*[FullResolutionBlock(self.guide_channels, num_fca=2) for _ in range(4)])
+        self.ign = ImageGuidanceNetwork(self.guide_channels)
+
+        # Build a real multi-scale guidance stream using chained pixel-unshuffle.
+        # 512 -> 256 -> 128 -> 64 (all via pixel-unshuffle), while keeping channel width controlled.
+        self.scale_reduce_1 = nn.Conv2d(self.guide_channels * 4, self.guide_channels, 1)
+        self.scale_reduce_2 = nn.Conv2d(self.guide_channels * 4, self.guide_channels, 1)
+        self.scale_reduce_3 = nn.Conv2d(self.guide_channels * 4, self.guide_channels, 1)
 
     @staticmethod
     def _pixel_unshuffle_to(feat: torch.Tensor, target_hw) -> torch.Tensor:
@@ -73,8 +80,17 @@ class GuideSRFullResBranch(nn.Module):
         f0 = self.stem(lr_full_up)
         fd = self.frbs(f0)
         fg_full, r2 = self.ign(fd, lr_full_up)
-        guide_pyramid = [self._pixel_unshuffle_to(fg_full, hw) for hw in target_shapes]
-        return fg_full, r2, guide_pyramid
+
+        # Real pyramid features (different source scales), all downsampled by pixel-unshuffle.
+        s1 = self.scale_reduce_1(F.pixel_unshuffle(fg_full, 2))  # 1/2
+        s2 = self.scale_reduce_2(F.pixel_unshuffle(s1, 2))       # 1/4
+        s3 = self.scale_reduce_3(F.pixel_unshuffle(s2, 2))       # 1/8
+
+        # Map to adapter targets from different scales to avoid degenerate identical guidance tensors.
+        g2 = self._pixel_unshuffle_to(s3, target_shapes[0])
+        g3 = self._pixel_unshuffle_to(s2, target_shapes[1])
+        g4 = self._pixel_unshuffle_to(s1, target_shapes[2])
+        return fg_full, r2, [g2, g3, g4]
 
 
 class SRConvNetLSAAdapter(nn.Module):
@@ -102,9 +118,10 @@ class SRConvNetLSAAdapter(nn.Module):
         self.proj3 = nn.Conv2d(256, 256, 1)
         self.proj4 = nn.Conv2d(256, 256, 1)
 
-        self.guide_to_c2 = nn.Conv2d(self.guide_channels, 256, 1)
-        self.guide_to_c3 = nn.Conv2d(self.guide_channels, 256, 1)
-        self.guide_to_c4 = nn.Conv2d(self.guide_channels, 256, 1)
+        # In current adapter geometry: g2/g3/g4 become 256/1024/4096 channels at 32x32.
+        self.guide_to_c2 = nn.Conv2d(self.guide_channels * 4, 256, 1)
+        self.guide_to_c3 = nn.Conv2d(self.guide_channels * 16, 256, 1)
+        self.guide_to_c4 = nn.Conv2d(self.guide_channels * 64, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
 
         for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
