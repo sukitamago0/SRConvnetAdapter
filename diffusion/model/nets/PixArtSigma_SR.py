@@ -21,6 +21,7 @@ from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
 from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
+from diffusion.model.nets.guidesr_guidance import GuideSRGuidanceBranch
 
 
 @MODELS.register_module()
@@ -58,12 +59,42 @@ class PixArtSigmaSR(PixArtMS):
             nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(lin.bias)
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
+        self.use_guidesr_guidance = True
+        self.guidance_channels = 64
+        self.guidance_branch = GuideSRGuidanceBranch(channels=self.guidance_channels, num_frb=4)
+        self.guide_proj64 = nn.Conv2d(self.guidance_channels * (8 ** 2), 4, 1)
+        self.guide_fuse64 = nn.Conv2d(8, 4, 1)
+        self.guide_proj32 = nn.Conv2d(self.guidance_channels * (16 ** 2), self.hidden_size, 1)
+        self.guide_fuse32 = nn.Conv2d(self.hidden_size * 2, self.hidden_size, 1)
+        for m in [self.guide_proj64, self.guide_fuse64, self.guide_proj32, self.guide_fuse32]:
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+        self._last_guide_r2 = None
+        self._last_guide_stats = None
+
+    def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, lr_full_up=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
         bs = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
         y = y.to(self.dtype)
+
+        self._last_guide_r2 = None
+        self._last_guide_stats = None
+        guide_g32 = None
+        guide_g64_norm = 0.0
+        guide_g32_norm = 0.0
+        if self.use_guidesr_guidance and (lr_full_up is not None):
+            guide_out = self.guidance_branch(lr_full_up.to(dtype=self.dtype))
+            self._last_guide_r2 = guide_out.get("r2", None)
+            g64 = guide_out.get("g64", None)
+            guide_g32 = guide_out.get("g32", None)
+            if g64 is not None:
+                guide_g64_norm = float(g64.detach().float().norm().item())
+                g64p = self.guide_proj64(g64.to(dtype=x.dtype))
+                x = self.guide_fuse64(torch.cat([x, g64p], dim=1)) + x
+            if guide_g32 is not None:
+                guide_g32_norm = float(guide_g32.detach().float().norm().item())
 
         self.h, self.w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         pos_embed = torch.from_numpy(
@@ -71,6 +102,11 @@ class PixArtSigmaSR(PixArtMS):
         ).unsqueeze(0).to(x.device).to(self.dtype)
 
         x = self.x_embedder(x) + pos_embed
+        if guide_g32 is not None:
+            x_map = x.transpose(1, 2).reshape(bs, self.hidden_size, self.h, self.w)
+            g32p = self.guide_proj32(guide_g32.to(dtype=x_map.dtype))
+            x_map = self.guide_fuse32(torch.cat([x_map, g32p], dim=1)) + x_map
+            x = x_map.reshape(bs, self.hidden_size, self.h * self.w).transpose(1, 2).contiguous()
         t = self.t_embedder(timestep)
         if aug_level is not None:
             t = t + self.aug_embedder(aug_level.to(self.dtype))
@@ -145,6 +181,15 @@ class PixArtSigmaSR(PixArtMS):
             }
         else:
             self._last_sft_stats = None
+
+        guide_r2 = self._last_guide_r2
+        self._last_guide_stats = {
+            "guide_g64_norm": float(guide_g64_norm),
+            "guide_g32_norm": float(guide_g32_norm),
+            "guide_fuse64_norm": float(self.guide_fuse64.weight.detach().float().norm().item()),
+            "guide_fuse32_norm": float(self.guide_fuse32.weight.detach().float().norm().item()),
+            "guide_r2_l1": float(torch.mean(torch.abs(guide_r2.detach().float())).item()) if torch.is_tensor(guide_r2) else 0.0,
+        }
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)

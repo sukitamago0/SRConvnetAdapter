@@ -1613,7 +1613,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
         guide_r2_psnrs, guide_r2_l1s = [], []
-        guide_feat_norms, guide_to_c2_norms, guide_to_c3_norms, guide_to_c4_norms = [], [], [], []
+        guide_g64_norms, guide_g32_norms, guide_fuse64_norms, guide_fuse32_norms = [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1630,14 +1630,14 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                 with torch.no_grad():
                     t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                    cond = adapter(lr_small, lr_full_up=lr.to(dtype=COMPUTE_DTYPE), t_embed=t_embed)
+                    cond = adapter(lr_small, t_embed=t_embed)
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     if FORCE_DROP_TEXT: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.ones(latents.shape[0], device=DEVICE)
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, lr_full_up=lr.to(dtype=COMPUTE_DTYPE))
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond, lr_full_up=lr.to(dtype=COMPUTE_DTYPE))
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
@@ -1657,7 +1657,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     gate_means.append(gm)
                     gate_stds.append(gs)
 
-                    r2 = cond.get("guide_residual", None) if isinstance(cond, dict) else None
+                    r2 = getattr(pixart, "_last_guide_r2", None)
                     if r2 is not None:
                         r2 = r2.clamp(-1, 1)
                         r2_l1 = torch.mean(torch.abs(r2.float() - hr.float())).item()
@@ -1665,12 +1665,12 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                         r2y = rgb01_to_y01((r2 + 1) / 2)[..., 4:-4, 4:-4]
                         hy_r2 = rgb01_to_y01((hr + 1) / 2)[..., 4:-4, 4:-4]
                         guide_r2_psnrs.append(float(psnr(r2y, hy_r2, data_range=1.0).item()))
-                    gstats = cond.get("guide_stats", {}) if isinstance(cond, dict) else {}
+                    gstats = getattr(pixart, "_last_guide_stats", None)
                     if isinstance(gstats, dict) and len(gstats) > 0:
-                        guide_feat_norms.append(float(gstats.get("guide_feat_norm", 0.0)))
-                        guide_to_c2_norms.append(float(gstats.get("guide_to_c2_norm", 0.0)))
-                        guide_to_c3_norms.append(float(gstats.get("guide_to_c3_norm", 0.0)))
-                        guide_to_c4_norms.append(float(gstats.get("guide_to_c4_norm", 0.0)))
+                        guide_g64_norms.append(float(gstats.get("guide_g64_norm", 0.0)))
+                        guide_g32_norms.append(float(gstats.get("guide_g32_norm", 0.0)))
+                        guide_fuse64_norms.append(float(gstats.get("guide_fuse64_norm", 0.0)))
+                        guide_fuse32_norms.append(float(gstats.get("guide_fuse32_norm", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", None)
                     if isinstance(sft_stats, dict):
@@ -1720,17 +1720,17 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
         gr2_psnr = float(np.mean(guide_r2_psnrs)) if len(guide_r2_psnrs) > 0 else 0.0
         gr2_l1 = float(np.mean(guide_r2_l1s)) if len(guide_r2_l1s) > 0 else 0.0
-        gfn = float(np.mean(guide_feat_norms)) if len(guide_feat_norms) > 0 else 0.0
-        gc2 = float(np.mean(guide_to_c2_norms)) if len(guide_to_c2_norms) > 0 else 0.0
-        gc3 = float(np.mean(guide_to_c3_norms)) if len(guide_to_c3_norms) > 0 else 0.0
-        gc4 = float(np.mean(guide_to_c4_norms)) if len(guide_to_c4_norms) > 0 else 0.0
+        g64n = float(np.mean(guide_g64_norms)) if len(guide_g64_norms) > 0 else 0.0
+        g32n = float(np.mean(guide_g32_norms)) if len(guide_g32_norms) > 0 else 0.0
+        gf64 = float(np.mean(guide_fuse64_norms)) if len(guide_fuse64_norms) > 0 else 0.0
+        gf32 = float(np.mean(guide_fuse32_norms)) if len(guide_fuse32_norms) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
             f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
             f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
             f"guide_r2_psnr={gr2_psnr:.4f} | guide_r2_l1={gr2_l1:.4f} | "
-            f"guide_feat_norm={gfn:.4f} | guide_to_c2_norm={gc2:.4f} | guide_to_c3_norm={gc3:.4f} | guide_to_c4_norm={gc4:.4f}"
+            f"guide_g64_norm={g64n:.4f} | guide_g32_norm={g32n:.4f} | guide_fuse64_norm={gf64:.4f} | guide_fuse32_norm={gf32:.4f}"
         )
         if DUALSTREAM_ENABLED:
             msg += f" | dual_gate={dual_m:.4f}±{dual_s:.4f}"
@@ -1923,7 +1923,7 @@ def main():
             with torch.no_grad():
                 t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                cond = adapter(adapter_in, lr_full_up=lr.to(dtype=COMPUTE_DTYPE), t_embed=t_embed) # time-aware adapter conditioning
+                cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
             cond_in = cond
             cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
@@ -1932,7 +1932,7 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in)
+                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, lr_full_up=lr.to(dtype=COMPUTE_DTYPE))
                 kwargs["force_drop_ids"] = drop_uncond
 
                 out = pixart(**kwargs)
@@ -2014,7 +2014,7 @@ def main():
                     pixel_loss_num_samples = 0
 
                 inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
-                r2 = cond.get("guide_residual", None) if isinstance(cond, dict) else None
+                r2 = getattr(pixart, "_last_guide_r2", None)
                 if r2 is not None:
                     loss_guide = F.mse_loss(r2.float(), hr.float())
                 else:
