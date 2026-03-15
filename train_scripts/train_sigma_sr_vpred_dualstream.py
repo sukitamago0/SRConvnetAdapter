@@ -1899,7 +1899,7 @@ def main():
             hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE); lr_small_b = batch['lr_small']
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
-                zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
+                z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
             # [V8 Logic] V-Prediction Training
             t = sample_t(zh.shape[0], DEVICE, step)
