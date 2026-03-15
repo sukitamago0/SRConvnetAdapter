@@ -374,7 +374,7 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
                 data_info=data_info,
                 adapter_cond=cond,
                 force_drop_ids=torch.ones(latents.shape[0], device=device),
-                lr_full_up=lr.to(dtype=compute_dtype),
+                lr_latent=z_lr.to(dtype=compute_dtype),
             )
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 

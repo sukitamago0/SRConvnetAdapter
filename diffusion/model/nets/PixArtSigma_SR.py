@@ -21,7 +21,6 @@ from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
 from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
-from diffusion.model.nets.guidesr_guidance import GuideSRGuidanceBranch
 
 
 @MODELS.register_module()
@@ -59,45 +58,39 @@ class PixArtSigmaSR(PixArtMS):
             nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(lin.bias)
 
-        self.use_guidesr_guidance = True
-        self.guidance_channels = 64
-        self.guidance_branch = GuideSRGuidanceBranch(channels=self.guidance_channels, num_frb=4)
-        self.guide_proj64 = nn.Conv2d(self.guidance_channels * (8 ** 2), 4, 1)
-        self.guide_fuse64 = nn.Conv2d(8, 4, 1)
-        self.guide_proj32 = nn.Conv2d(self.guidance_channels * (16 ** 2), self.hidden_size, 1)
-        self.guide_fuse32 = nn.Conv2d(self.hidden_size * 2, self.hidden_size, 1)
-        for m in [self.guide_proj64, self.guide_proj32]:
-            nn.init.normal_(m.weight, mean=0.0, std=1e-3)
-            nn.init.zeros_(m.bias)
-        for m in [self.guide_fuse64, self.guide_fuse32]:
-            nn.init.zeros_(m.weight)
-            nn.init.zeros_(m.bias)
-        self._last_guide_r2 = None
-        self._last_guide_stats = None
+        self.use_lr_mlp_injection = True
+        self.lr_inject_on_blocks = list(range(len(self.blocks)))
+        self.lr_mlp_fc1 = nn.ModuleList([])
+        self.lr_mlp_fc2 = nn.ModuleList([])
+        self.lr_inject_dwconv = nn.ModuleList([])
+        self.lr_inject_gamma = nn.ParameterList([])
+        for blk in self.blocks:
+            fc1 = nn.Linear(blk.mlp.fc1.in_features, blk.mlp.fc1.out_features, bias=(blk.mlp.fc1.bias is not None))
+            fc2 = nn.Linear(blk.mlp.fc2.in_features, blk.mlp.fc2.out_features, bias=(blk.mlp.fc2.bias is not None))
+            fc1.weight.data.copy_(blk.mlp.fc1.weight.data)
+            if fc1.bias is not None and blk.mlp.fc1.bias is not None:
+                fc1.bias.data.copy_(blk.mlp.fc1.bias.data)
+            fc2.weight.data.copy_(blk.mlp.fc2.weight.data)
+            if fc2.bias is not None and blk.mlp.fc2.bias is not None:
+                fc2.bias.data.copy_(blk.mlp.fc2.bias.data)
+            self.lr_mlp_fc1.append(fc1)
+            self.lr_mlp_fc2.append(fc2)
+            dw = nn.Conv2d(blk.mlp.fc1.out_features, blk.mlp.fc1.out_features, kernel_size=3, stride=1, padding=1, groups=blk.mlp.fc1.out_features)
+            nn.init.zeros_(dw.weight)
+            if dw.bias is not None:
+                nn.init.zeros_(dw.bias)
+            self.lr_inject_dwconv.append(dw)
+            self.lr_inject_gamma.append(nn.Parameter(torch.zeros(1)))
+        self._last_lr_inject_stats = None
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, lr_full_up=None, **kwargs):
+    def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, lr_latent=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
         bs = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
         y = y.to(self.dtype)
 
-        self._last_guide_r2 = None
-        self._last_guide_stats = None
-        guide_g32 = None
-        guide_g64_norm = 0.0
-        guide_g32_norm = 0.0
-        if self.use_guidesr_guidance and (lr_full_up is not None):
-            guide_out = self.guidance_branch(lr_full_up.to(dtype=self.dtype))
-            self._last_guide_r2 = guide_out.get("r2", None)
-            g64 = guide_out.get("g64", None)
-            guide_g32 = guide_out.get("g32", None)
-            if g64 is not None:
-                guide_g64_norm = float(g64.detach().float().norm().item())
-                g64p = self.guide_proj64(g64.to(dtype=x.dtype))
-                x = self.guide_fuse64(torch.cat([x, g64p], dim=1)) + x
-            if guide_g32 is not None:
-                guide_g32_norm = float(guide_g32.detach().float().norm().item())
+        self._last_lr_inject_stats = None
 
         self.h, self.w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         pos_embed = torch.from_numpy(
@@ -105,11 +98,9 @@ class PixArtSigmaSR(PixArtMS):
         ).unsqueeze(0).to(x.device).to(self.dtype)
 
         x = self.x_embedder(x) + pos_embed
-        if guide_g32 is not None:
-            x_map = x.transpose(1, 2).reshape(bs, self.hidden_size, self.h, self.w)
-            g32p = self.guide_proj32(guide_g32.to(dtype=x_map.dtype))
-            x_map = self.guide_fuse32(torch.cat([x_map, g32p], dim=1)) + x_map
-            x = x_map.reshape(bs, self.hidden_size, self.h * self.w).transpose(1, 2).contiguous()
+        lr_tokens = None
+        if self.use_lr_mlp_injection and (lr_latent is not None):
+            lr_tokens = self.x_embedder(lr_latent.to(dtype=x.dtype)) + pos_embed
         t = self.t_embedder(timestep)
         if aug_level is not None:
             t = t + self.aug_embedder(aug_level.to(self.dtype))
@@ -175,6 +166,22 @@ class PixArtSigmaSR(PixArtMS):
                 **kwargs,
             )
 
+            if self.use_lr_mlp_injection and (lr_tokens is not None) and (i in self.lr_inject_on_blocks):
+                norm_x = block.norm2(x)
+                phi_x = block.mlp.fc1(norm_x)
+                norm_l = block.norm2(lr_tokens)
+                eta_l = self.lr_mlp_fc1[i](norm_l)
+                eta_map = eta_l.transpose(1, 2).reshape(bs, eta_l.shape[-1], self.h, self.w)
+                eta_map = self.lr_inject_dwconv[i](eta_map)
+                eta_l_conv = eta_map.flatten(2).transpose(1, 2).contiguous()
+                phi_x = phi_x + self.lr_inject_gamma[i] * eta_l_conv
+                x_mlp_out = block.mlp.fc2(block.mlp.act(phi_x))
+                x = x + x_mlp_out
+
+                l_mid = block.mlp.act(eta_l)
+                l_out = self.lr_mlp_fc2[i](l_mid)
+                lr_tokens = lr_tokens + l_out
+
         if len(sft_scale_means) > 0:
             self._last_sft_stats = {
                 "sft_scale_mean": float(sum(sft_scale_means) / len(sft_scale_means)),
@@ -185,14 +192,26 @@ class PixArtSigmaSR(PixArtMS):
         else:
             self._last_sft_stats = None
 
-        guide_r2 = self._last_guide_r2
-        self._last_guide_stats = {
-            "guide_g64_norm": float(guide_g64_norm),
-            "guide_g32_norm": float(guide_g32_norm),
-            "guide_fuse64_norm": float(self.guide_fuse64.weight.detach().float().norm().item()),
-            "guide_fuse32_norm": float(self.guide_fuse32.weight.detach().float().norm().item()),
-            "guide_r2_l1": float(torch.mean(torch.abs(guide_r2.detach().float())).item()) if torch.is_tensor(guide_r2) else 0.0,
-        }
+        if self.use_lr_mlp_injection:
+            gammas = [float(g.detach().float().mean().item()) for g in self.lr_inject_gamma]
+            dw_norms = [float(m.weight.detach().float().norm().item()) for m in self.lr_inject_dwconv]
+            mlp_delta = 0.0
+            if len(self.lr_mlp_fc1) > 0:
+                delta_vals = []
+                for i, blk in enumerate(self.blocks):
+                    d = (self.lr_mlp_fc1[i].weight.detach().float() - blk.mlp.fc1.weight.detach().float()).norm().item()
+                    delta_vals.append(float(d))
+                mlp_delta = float(sum(delta_vals) / max(1, len(delta_vals)))
+            lr_stream_norm = float(lr_tokens.detach().float().norm().item()) if lr_tokens is not None else 0.0
+            self._last_lr_inject_stats = {
+                "lr_stream_norm": lr_stream_norm,
+                "lr_inject_gamma_mean": float(sum(gammas) / max(1, len(gammas))),
+                "lr_inject_gamma_last": float(gammas[-1]) if len(gammas) > 0 else 0.0,
+                "lr_inject_dwconv_norm_mean": float(sum(dw_norms) / max(1, len(dw_norms))),
+                "lr_mlp_delta_norm": mlp_delta,
+            }
+        else:
+            self._last_lr_inject_stats = None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
