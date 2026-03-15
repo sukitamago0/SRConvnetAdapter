@@ -16,10 +16,10 @@ class SFTLayer(nn.Module):
         shift = self.shift_conv1(self.act(self.shift_conv0(cond)))
         return feat * (1 + scale) + shift, scale, shift
 
+
 from diffusion.model.builder import MODELS
-from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
-from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
+from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer, t2i_modulate
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 
@@ -75,13 +75,60 @@ class PixArtSigmaSR(PixArtMS):
                 fc2.bias.data.copy_(blk.mlp.fc2.bias.data)
             self.lr_mlp_fc1.append(fc1)
             self.lr_mlp_fc2.append(fc2)
-            dw = nn.Conv2d(blk.mlp.fc1.out_features, blk.mlp.fc1.out_features, kernel_size=3, stride=1, padding=1, groups=blk.mlp.fc1.out_features)
+
+            dw = nn.Conv2d(
+                blk.mlp.fc1.out_features,
+                blk.mlp.fc1.out_features,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                groups=blk.mlp.fc1.out_features,
+            )
             nn.init.zeros_(dw.weight)
             if dw.bias is not None:
                 nn.init.zeros_(dw.bias)
             self.lr_inject_dwconv.append(dw)
-            self.lr_inject_gamma.append(nn.Parameter(torch.zeros(1)))
+            self.lr_inject_gamma.append(nn.Parameter(torch.tensor(1e-3)))
+
         self._last_lr_inject_stats = None
+
+    def _forward_block_with_lr_injection(self, block, block_idx, x, lr_tokens, y, t0, y_lens, **kwargs):
+        b, _, _ = x.shape
+        adaln_shift = kwargs.get("adaln_shift", None)
+        adaln_scale = kwargs.get("adaln_scale", None)
+        adaln_alpha = kwargs.get("adaln_alpha", None)
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            block.scale_shift_table[None] + t0.reshape(b, 6, -1)
+        ).chunk(6, dim=1)
+
+        h = block.norm1(x)
+        if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
+            h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
+
+        h_attn = t2i_modulate(h, shift_msa, scale_msa)
+        x = x + block.drop_path(gate_msa * block.attn(h_attn, HW=kwargs.get("HW", None)))
+        x = x + block.cross_attn(x, y, y_lens)
+
+        norm_x = t2i_modulate(block.norm2(x), shift_mlp, scale_mlp)
+        if self.use_lr_mlp_injection and (lr_tokens is not None) and (block_idx in self.lr_inject_on_blocks):
+            phi_x = block.mlp.fc1(norm_x)
+            norm_l = block.norm2(lr_tokens)
+            eta_l = self.lr_mlp_fc1[block_idx](norm_l)
+            eta_map = eta_l.transpose(1, 2).reshape(b, eta_l.shape[-1], self.h, self.w)
+            eta_map = self.lr_inject_dwconv[block_idx](eta_map)
+            eta_l_conv = eta_map.flatten(2).transpose(1, 2).contiguous()
+            phi_x = phi_x + self.lr_inject_gamma[block_idx] * eta_l_conv
+            x_mlp_out = block.mlp.fc2(block.mlp.act(phi_x))
+
+            l_mid = block.mlp.act(eta_l)
+            l_out = self.lr_mlp_fc2[block_idx](l_mid)
+            lr_tokens = lr_tokens + l_out
+        else:
+            x_mlp_out = block.mlp(norm_x)
+
+        x = x + block.drop_path(gate_mlp * x_mlp_out)
+        return x, lr_tokens
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, lr_latent=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
@@ -101,6 +148,7 @@ class PixArtSigmaSR(PixArtMS):
         lr_tokens = None
         if self.use_lr_mlp_injection and (lr_latent is not None):
             lr_tokens = self.x_embedder(lr_latent.to(dtype=x.dtype)) + pos_embed
+
         t = self.t_embedder(timestep)
         if aug_level is not None:
             t = t + self.aug_embedder(aug_level.to(self.dtype))
@@ -154,33 +202,19 @@ class PixArtSigmaSR(PixArtMS):
                 sft_shift_stds.append(float(shift.detach().float().std(unbiased=False).item()))
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
 
-            x = auto_grad_checkpoint(
-                block,
-                x,
-                y,
-                t0,
-                y_lens,
+            x, lr_tokens = self._forward_block_with_lr_injection(
+                block=block,
+                block_idx=i,
+                x=x,
+                lr_tokens=lr_tokens,
+                y=y,
+                t0=t0,
+                y_lens=y_lens,
                 HW=(self.h, self.w),
                 base_size=self.base_size,
                 pe_interpolation=self.pe_interpolation,
                 **kwargs,
             )
-
-            if self.use_lr_mlp_injection and (lr_tokens is not None) and (i in self.lr_inject_on_blocks):
-                norm_x = block.norm2(x)
-                phi_x = block.mlp.fc1(norm_x)
-                norm_l = block.norm2(lr_tokens)
-                eta_l = self.lr_mlp_fc1[i](norm_l)
-                eta_map = eta_l.transpose(1, 2).reshape(bs, eta_l.shape[-1], self.h, self.w)
-                eta_map = self.lr_inject_dwconv[i](eta_map)
-                eta_l_conv = eta_map.flatten(2).transpose(1, 2).contiguous()
-                phi_x = phi_x + self.lr_inject_gamma[i] * eta_l_conv
-                x_mlp_out = block.mlp.fc2(block.mlp.act(phi_x))
-                x = x + x_mlp_out
-
-                l_mid = block.mlp.act(eta_l)
-                l_out = self.lr_mlp_fc2[i](l_mid)
-                lr_tokens = lr_tokens + l_out
 
         if len(sft_scale_means) > 0:
             self._last_sft_stats = {
@@ -208,6 +242,7 @@ class PixArtSigmaSR(PixArtMS):
                 "lr_inject_gamma_mean": float(sum(gammas) / max(1, len(gammas))),
                 "lr_inject_gamma_last": float(gammas[-1]) if len(gammas) > 0 else 0.0,
                 "lr_inject_dwconv_norm_mean": float(sum(dw_norms) / max(1, len(dw_norms))),
+                "lr_inject_dwconv_norm_last": float(dw_norms[-1]) if len(dw_norms) > 0 else 0.0,
                 "lr_mlp_delta_norm": mlp_delta,
             }
         else:

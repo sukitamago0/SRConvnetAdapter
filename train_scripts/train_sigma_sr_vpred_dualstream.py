@@ -1617,7 +1617,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         psnrs, ssims, lpipss = [], [], []; vis_done = False
         cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
-        lr_stream_norms, lr_gamma_means, lr_gamma_lasts, lr_dwconv_norm_means, lr_mlp_delta_norms = [], [], [], [], []
+        lr_stream_norms, lr_gamma_means, lr_gamma_lasts, lr_dwconv_norm_means, lr_dwconv_norm_lasts, lr_mlp_delta_norms = [], [], [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1667,6 +1667,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                         lr_gamma_means.append(float(lstats.get("lr_inject_gamma_mean", 0.0)))
                         lr_gamma_lasts.append(float(lstats.get("lr_inject_gamma_last", 0.0)))
                         lr_dwconv_norm_means.append(float(lstats.get("lr_inject_dwconv_norm_mean", 0.0)))
+                        lr_dwconv_norm_lasts.append(float(lstats.get("lr_inject_dwconv_norm_last", 0.0)))
                         lr_mlp_delta_norms.append(float(lstats.get("lr_mlp_delta_norm", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", None)
@@ -1719,6 +1720,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         lr_gamma_m = float(np.mean(lr_gamma_means)) if len(lr_gamma_means) > 0 else 0.0
         lr_gamma_l = float(np.mean(lr_gamma_lasts)) if len(lr_gamma_lasts) > 0 else 0.0
         lr_dw_n = float(np.mean(lr_dwconv_norm_means)) if len(lr_dwconv_norm_means) > 0 else 0.0
+        lr_dw_last = float(np.mean(lr_dwconv_norm_lasts)) if len(lr_dwconv_norm_lasts) > 0 else 0.0
         lr_delta_n = float(np.mean(lr_mlp_delta_norms)) if len(lr_mlp_delta_norms) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
@@ -1726,7 +1728,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
             f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
             f"lr_stream_norm={lr_stream_n:.4f} | lr_inject_gamma_mean={lr_gamma_m:.4f} | "
-            f"lr_inject_gamma_last={lr_gamma_l:.4f} | lr_inject_dwconv_norm_mean={lr_dw_n:.4f} | lr_mlp_delta_norm={lr_delta_n:.4f}"
+            f"lr_inject_gamma_last={lr_gamma_l:.4f} | lr_inject_dwconv_norm_mean={lr_dw_n:.4f} | lr_inject_dwconv_norm_last={lr_dw_last:.4f} | lr_mlp_delta_norm={lr_delta_n:.4f}"
         )
         if DUALSTREAM_ENABLED:
             msg += f" | dual_gate={dual_m:.4f}±{dual_s:.4f}"
