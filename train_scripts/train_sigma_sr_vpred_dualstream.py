@@ -53,9 +53,14 @@ from diffusion.model.gaussian_diffusion import _extract_into_tensor
 BASE_PIXART_SHA256 = None
 
 # Added "aug_embedder" to required keys
+LR_MLP_INJECT_KEY_FRAGMENTS = (
+    "lr_mlp_fc1", "lr_mlp_fc2", "lr_inject_dwconv", "lr_inject_gamma"
+)
+
 V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
     "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj",
-    "style_fusion_mlp", "aug_embedder", "injection_scales", "sft_cond_reduce", "sft_layers"
+    "style_fusion_mlp", "aug_embedder", "injection_scales", "sft_cond_reduce", "sft_layers",
+    *LR_MLP_INJECT_KEY_FRAGMENTS,
 )
 FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
 INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
@@ -576,7 +581,8 @@ def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = 
     names = (
         "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj", "style_fusion_mlp", "sft_cond_reduce", "sft_layers",
         "aug_embedder", "injection_scales", "csft_dw", "csft_pw", "final_layer", "lora_A", "lora_B", "x_embedder",
-        "lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate"
+        "lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate",
+        "lr_mlp_fc1", "lr_mlp_fc2", "lr_inject_dwconv", "lr_inject_gamma"
     )
     out = []
     for n, p in adapter.named_parameters():
@@ -1141,7 +1147,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = ["final_layer", "input_res_proj", "inject_gate", "sft_cond_reduce", "sft_layers"]
+    always_train_keywords = ["final_layer", "input_res_proj", "inject_gate", "sft_cond_reduce", "sft_layers", *LR_MLP_INJECT_KEY_FRAGMENTS]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
 
@@ -1611,6 +1617,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         psnrs, ssims, lpipss = [], [], []; vis_done = False
         cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
+        lr_stream_norms, lr_gamma_means, lr_gamma_lasts, lr_dwconv_norm_means, lr_dwconv_norm_lasts, lr_mlp_delta_norms = [], [], [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1633,8 +1640,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, lr_latent=z_lr.to(dtype=COMPUTE_DTYPE))
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond, lr_latent=z_lr.to(dtype=COMPUTE_DTYPE))
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
@@ -1653,6 +1660,15 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     gm, gs = _extract_adapter_cond_stats(cond)
                     gate_means.append(gm)
                     gate_stds.append(gs)
+
+                    lstats = getattr(pixart, "_last_lr_inject_stats", None)
+                    if isinstance(lstats, dict) and len(lstats) > 0:
+                        lr_stream_norms.append(float(lstats.get("lr_stream_norm", 0.0)))
+                        lr_gamma_means.append(float(lstats.get("lr_inject_gamma_mean", 0.0)))
+                        lr_gamma_lasts.append(float(lstats.get("lr_inject_gamma_last", 0.0)))
+                        lr_dwconv_norm_means.append(float(lstats.get("lr_inject_dwconv_norm_mean", 0.0)))
+                        lr_dwconv_norm_lasts.append(float(lstats.get("lr_inject_dwconv_norm_last", 0.0)))
+                        lr_mlp_delta_norms.append(float(lstats.get("lr_mlp_delta_norm", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", None)
                     if isinstance(sft_stats, dict):
@@ -1700,11 +1716,19 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         sft_ss = float(np.mean(sft_scale_stds)) if len(sft_scale_stds) > 0 else 0.0
         sft_shm = float(np.mean(sft_shift_means)) if len(sft_shift_means) > 0 else 0.0
         sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
+        lr_stream_n = float(np.mean(lr_stream_norms)) if len(lr_stream_norms) > 0 else 0.0
+        lr_gamma_m = float(np.mean(lr_gamma_means)) if len(lr_gamma_means) > 0 else 0.0
+        lr_gamma_l = float(np.mean(lr_gamma_lasts)) if len(lr_gamma_lasts) > 0 else 0.0
+        lr_dw_n = float(np.mean(lr_dwconv_norm_means)) if len(lr_dwconv_norm_means) > 0 else 0.0
+        lr_dw_last = float(np.mean(lr_dwconv_norm_lasts)) if len(lr_dwconv_norm_lasts) > 0 else 0.0
+        lr_delta_n = float(np.mean(lr_mlp_delta_norms)) if len(lr_mlp_delta_norms) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
             f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
-            f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f}"
+            f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
+            f"lr_stream_norm={lr_stream_n:.4f} | lr_inject_gamma_mean={lr_gamma_m:.4f} | "
+            f"lr_inject_gamma_last={lr_gamma_l:.4f} | lr_inject_dwconv_norm_mean={lr_dw_n:.4f} | lr_inject_dwconv_norm_last={lr_dw_last:.4f} | lr_mlp_delta_norm={lr_delta_n:.4f}"
         )
         if DUALSTREAM_ENABLED:
             msg += f" | dual_gate={dual_m:.4f}±{dual_s:.4f}"
@@ -1875,7 +1899,7 @@ def main():
             hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE); lr_small_b = batch['lr_small']
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
-                zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
+                z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
 
             # [V8 Logic] V-Prediction Training
             t = sample_t(zh.shape[0], DEVICE, step)
@@ -1906,7 +1930,7 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in)
+                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, lr_latent=z_lr.to(dtype=COMPUTE_DTYPE))
                 kwargs["force_drop_ids"] = drop_uncond
 
                 out = pixart(**kwargs)

@@ -36,8 +36,8 @@ class SRConvNetLSAAdapter(nn.Module):
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         return (1.0 + gamma[:, :, None, None]) * feat + beta[:, :, None, None]
 
-    def forward(self, lr_small: torch.Tensor, t_embed: torch.Tensor = None):
-        f1 = self.stage1(self.stem(lr_small))
+    def forward(self, lr_small_struct: torch.Tensor, t_embed: torch.Tensor = None):
+        f1 = self.stage1(self.stem(lr_small_struct))
         f2 = self.stage2(self.down1(f1))
         f3 = self.stage3(self.down2(f2))
         f4 = self.stage4(f3)
