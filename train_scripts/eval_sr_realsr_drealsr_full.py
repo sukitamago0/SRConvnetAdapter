@@ -31,6 +31,56 @@ from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
 
 
+
+_SOBEL_X = torch.tensor([[1, 0, -1],
+                        [2, 0, -2],
+                        [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+_SOBEL_Y = torch.tensor([[1, 2, 1],
+                        [0, 0, 0],
+                        [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+
+
+def _to_luma01(img_m11: torch.Tensor) -> torch.Tensor:
+    img01 = (img_m11.float() + 1.0) * 0.5
+    r = img01[:, 0:1]; g = img01[:, 1:2]; b = img01[:, 2:3]
+    return (0.2989 * r + 0.5870 * g + 0.1140 * b).clamp(0.0, 1.0)
+
+
+def _harris_response(gray01: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    kx = _SOBEL_X.to(device=gray01.device)
+    ky = _SOBEL_Y.to(device=gray01.device)
+    ix = F.conv2d(gray01, kx, padding=1)
+    iy = F.conv2d(gray01, ky, padding=1)
+    ixx = F.avg_pool2d(ix * ix, kernel_size=3, stride=1, padding=1)
+    iyy = F.avg_pool2d(iy * iy, kernel_size=3, stride=1, padding=1)
+    ixy = F.avg_pool2d(ix * iy, kernel_size=3, stride=1, padding=1)
+    det = ixx * iyy - ixy * ixy
+    trace = ixx + iyy
+    r = det - 0.04 * trace * trace
+    r_flat = r.flatten(1)
+    r_min = r_flat.min(dim=1, keepdim=True)[0][:, :, None]
+    r_max = r_flat.max(dim=1, keepdim=True)[0][:, :, None]
+    return ((r - r_min) / (r_max - r_min + eps)).clamp(0.0, 1.0)
+
+
+def build_component_masks_from_hr(hr_m11: torch.Tensor, corner_q: float = 0.95, edge_q: float = 0.80):
+    gray = _to_luma01(hr_m11)
+    harris = _harris_response(gray)
+    grad_x = F.conv2d(gray, _SOBEL_X.to(device=gray.device), padding=1)
+    grad_y = F.conv2d(gray, _SOBEL_Y.to(device=gray.device), padding=1)
+    grad_mag = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-6)
+    b = gray.shape[0]
+    c_th = torch.quantile(harris.flatten(1), corner_q, dim=1, keepdim=True)
+    e_th = torch.quantile(grad_mag.flatten(1), edge_q, dim=1, keepdim=True)
+    m_corner = (harris >= c_th.view(b, 1, 1, 1)).float()
+    m_edge = (grad_mag >= e_th.view(b, 1, 1, 1)).float() * (1.0 - m_corner)
+    m_flat = 1.0 - (m_edge + m_corner).clamp(0.0, 1.0)
+    m_flat = F.avg_pool2d(m_flat, kernel_size=3, stride=1, padding=1)
+    m_edge = F.avg_pool2d(m_edge, kernel_size=3, stride=1, padding=1)
+    m_corner = F.avg_pool2d(m_corner, kernel_size=3, stride=1, padding=1)
+    norm = (m_flat + m_edge + m_corner).clamp_min(1e-6)
+    return m_flat / norm, m_edge / norm, m_corner / norm
+
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
     return (16.0 + 65.481 * r + 128.553 * g + 24.966 * b) / 255.0
@@ -276,6 +326,36 @@ class MetricSuite:
 
         return out
 
+    @torch.no_grad()
+    def compute_component(self, pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask: torch.Tensor):
+        pred_cpu = pred_m11.detach().to("cpu", dtype=torch.float32)
+        hr_cpu = hr_m11.detach().to("cpu", dtype=torch.float32)
+        mask_cpu = mask.detach().to("cpu", dtype=torch.float32).clamp(0.0, 1.0)
+
+        pred01 = (pred_cpu + 1.0) / 2.0
+        hr01 = (hr_cpu + 1.0) / 2.0
+        py = rgb01_to_y01(pred01)[..., 4:-4, 4:-4]
+        hy = rgb01_to_y01(hr01)[..., 4:-4, 4:-4]
+        my = mask_cpu[..., 4:-4, 4:-4]
+
+        mse = ((my * (py - hy)) ** 2).sum() / (my.sum().clamp_min(1e-6))
+        psnr_v = float((-10.0 * torch.log10(mse.clamp_min(1e-12))).item())
+
+        mu_x = (my * py).sum() / my.sum().clamp_min(1e-6)
+        mu_y = (my * hy).sum() / my.sum().clamp_min(1e-6)
+        vx = (my * (py - mu_x) ** 2).sum() / my.sum().clamp_min(1e-6)
+        vy = (my * (hy - mu_y) ** 2).sum() / my.sum().clamp_min(1e-6)
+        cxy = (my * (py - mu_x) * (hy - mu_y)).sum() / my.sum().clamp_min(1e-6)
+        c1 = 0.01 ** 2
+        c2 = 0.03 ** 2
+        ssim_v = float((((2 * mu_x * mu_y + c1) * (2 * cxy + c2)) / ((mu_x * mu_x + mu_y * mu_y + c1) * (vx + vy + c2))).item())
+
+        pred_masked = pred_cpu * mask_cpu
+        hr_masked = hr_cpu * mask_cpu
+        lpips_v = float(self.lpips_fn(pred_masked, hr_masked).mean().item())
+
+        return {"psnr": psnr_v, "ssim": ssim_v, "lpips": lpips_v}
+
 
 def build_model_and_assets(args, device, compute_dtype):
     pixart = PixArtSigmaSR_XL_2(
@@ -360,11 +440,13 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
         "aspect_ratio": torch.tensor([1.0], device=device),
     }
 
+    last_cond = None
     for t in run_timesteps:
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
+            last_cond = cond
             out = pixart(
                 x=latents.to(compute_dtype),
                 timestep=t_b,
@@ -378,7 +460,7 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
     pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
-    return pred, hr, lr
+    return pred, hr, lr, last_cond
 
 
 def tensor_m11_to_pil(x: torch.Tensor):
@@ -395,6 +477,28 @@ def save_triptych(lr_m11, hr_m11, pred_m11, path, steps):
     plt.subplot(1, 3, 1); plt.imshow(lr_img); plt.title("Input LR"); plt.axis("off")
     plt.subplot(1, 3, 2); plt.imshow(hr_img); plt.title("GT"); plt.axis("off")
     plt.subplot(1, 3, 3); plt.imshow(pr_img); plt.title(f"Pred @{steps}"); plt.axis("off")
+    plt.savefig(path, bbox_inches="tight")
+    plt.close()
+
+def save_component_visualization(gt_m11, pred_m11, masks, comp_aux, path, steps):
+    gt_img = tensor_m11_to_pil(gt_m11[0])
+    pred_img = tensor_m11_to_pil(pred_m11[0])
+    m_flat, m_edge, m_corner = masks
+    af = comp_aux.get("flat") if isinstance(comp_aux, dict) else None
+    ae = comp_aux.get("edge") if isinstance(comp_aux, dict) else None
+    ac = comp_aux.get("corner") if isinstance(comp_aux, dict) else None
+    plt.figure(figsize=(18, 8))
+    plt.subplot(2, 4, 1); plt.imshow(gt_img); plt.title("GT"); plt.axis("off")
+    plt.subplot(2, 4, 2); plt.imshow(pred_img); plt.title(f"Pred @{steps}"); plt.axis("off")
+    plt.subplot(2, 4, 3); plt.imshow(m_flat[0, 0].detach().cpu(), cmap='gray'); plt.title("M_flat"); plt.axis("off")
+    plt.subplot(2, 4, 4); plt.imshow(m_edge[0, 0].detach().cpu(), cmap='gray'); plt.title("M_edge"); plt.axis("off")
+    plt.subplot(2, 4, 5); plt.imshow(m_corner[0, 0].detach().cpu(), cmap='gray'); plt.title("M_corner"); plt.axis("off")
+    if af is not None:
+        plt.subplot(2, 4, 6); plt.imshow(tensor_m11_to_pil(af[0])); plt.title("aux_flat"); plt.axis("off")
+    if ae is not None:
+        plt.subplot(2, 4, 7); plt.imshow(tensor_m11_to_pil(ae[0])); plt.title("aux_edge"); plt.axis("off")
+    if ac is not None:
+        plt.subplot(2, 4, 8); plt.imshow(tensor_m11_to_pil(ac[0])); plt.title("aux_corner"); plt.axis("off")
     plt.savefig(path, bbox_inches="tight")
     plt.close()
 
@@ -422,8 +526,12 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.max_samples > 0 and idx >= args.max_samples:
             break
 
-        pred, hr, lr = run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, device, compute_dtype, gen)
+        pred, hr, lr, cond = run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, device, compute_dtype, gen)
         m = metric_suite.compute(pred, hr)
+        m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
+        m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
+        m_edge_c = metric_suite.compute_component(pred, hr, m_edge)
+        m_corner_c = metric_suite.compute_component(pred, hr, m_corner)
 
         hr_path = batch["hr_path"][0] if isinstance(batch["hr_path"], list) else batch["hr_path"]
         lr_path = batch["lr_path"][0] if isinstance(batch["lr_path"], list) else batch["lr_path"]
@@ -437,6 +545,9 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.save_triptychs and (idx % 5 == 0):
             tri_path = trip_dir / f"{idx:04d}_{stem}_steps{args.steps}.png"
             save_triptych(lr, hr, pred, str(tri_path), args.steps)
+            comp_path = trip_dir / f"{idx:04d}_{stem}_comp_steps{args.steps}.png"
+            comp_aux = cond.get("comp_aux", {}) if isinstance(cond, dict) else {}
+            save_component_visualization(hr, pred, (m_flat, m_edge, m_corner), comp_aux, str(comp_path), args.steps)
 
         row = {
             "dataset": dataset_name,
@@ -451,19 +562,31 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "maniqa": m["maniqa"],
             "musiq": m["musiq"],
             "clipiqa": m["clipiqa"],
+            "flat_psnr": m_flat_c["psnr"],
+            "flat_ssim": m_flat_c["ssim"],
+            "flat_lpips": m_flat_c["lpips"],
+            "edge_psnr": m_edge_c["psnr"],
+            "edge_ssim": m_edge_c["ssim"],
+            "edge_lpips": m_edge_c["lpips"],
+            "corner_psnr": m_corner_c["psnr"],
+            "corner_ssim": m_corner_c["ssim"],
+            "corner_lpips": m_corner_c["lpips"],
         }
         rows.append(row)
 
         pbar.set_postfix({
             "psnr": f"{row['psnr']:.2f}",
-            "ssim": f"{row['ssim']:.4f}",
             "lpips": f"{row['lpips']:.4f}",
+            "c_lp": f"{row['corner_lpips']:.4f}",
         })
 
     csv_path = base_out / "per_image_metrics.csv"
     fieldnames = [
         "dataset", "image_name", "hr_path", "lr_path", "pred_path",
-        "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa"
+        "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa",
+        "flat_psnr", "flat_ssim", "flat_lpips",
+        "edge_psnr", "edge_ssim", "edge_lpips",
+        "corner_psnr", "corner_ssim", "corner_lpips"
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -484,6 +607,15 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "maniqa": nanmean([r["maniqa"] for r in rows]),
             "musiq": nanmean([r["musiq"] for r in rows]),
             "clipiqa": nanmean([r["clipiqa"] for r in rows]),
+            "flat_psnr": nanmean([r["flat_psnr"] for r in rows]),
+            "flat_ssim": nanmean([r["flat_ssim"] for r in rows]),
+            "flat_lpips": nanmean([r["flat_lpips"] for r in rows]),
+            "edge_psnr": nanmean([r["edge_psnr"] for r in rows]),
+            "edge_ssim": nanmean([r["edge_ssim"] for r in rows]),
+            "edge_lpips": nanmean([r["edge_lpips"] for r in rows]),
+            "corner_psnr": nanmean([r["corner_psnr"] for r in rows]),
+            "corner_ssim": nanmean([r["corner_ssim"] for r in rows]),
+            "corner_lpips": nanmean([r["corner_lpips"] for r in rows]),
         }
     }
 
