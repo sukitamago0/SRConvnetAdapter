@@ -212,7 +212,7 @@ DUAL_NUM_HEADS = 16
 USE_STYLE_FUSION = False
 
 # Conservative KV-compress to reduce attention memory with minimal quality impact.
-KV_COMPRESS_ENABLE = True
+KV_COMPRESS_ENABLE = False
 KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
