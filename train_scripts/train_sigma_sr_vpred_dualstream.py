@@ -96,7 +96,7 @@ NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth"
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -237,9 +237,7 @@ def get_fixed_loss_weights():
     return {
         "mse": 1.0,
         "latent_l1": 0.10,
-        "lpips": 0.0,
         "lr_cons": 0.05,
-        "comp_is": 0.05,
         "gw": 0.05,
     }
 
@@ -297,7 +295,8 @@ def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
     return (16.0 + 65.481*r + 128.553*g + 24.966*b) / 255.0
 
-# ----------------- CDC-style component guidance losses -----------------
+# ----------------- Edge-guided perceptual regularizers (GT-driven) -----------------
+# Goal: (1) match gradients where GT has edges, (2) suppress high-frequency hallucinations where GT is flat/defocused.
 _SOBEL_X = torch.tensor([[1, 0, -1],
                         [2, 0, -2],
                         [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
@@ -398,8 +397,6 @@ def structure_consistency_loss(pred_m11: torch.Tensor, lr_m11: torch.Tensor) -> 
     return 0.4 * loss_sobel + 0.4 * loss_lap + 0.2 * loss_lowfreq
 
 
-
-
 def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask: torch.Tensor, lpips_fn_cpu: nn.Module):
     pred_cpu = pred_m11.detach().to("cpu", dtype=torch.float32)
     hr_cpu = hr_m11.detach().to("cpu", dtype=torch.float32)
@@ -411,7 +408,6 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
     my = mask_cpu[..., 4:-4, 4:-4]
     mse = ((my * (py - hy)) ** 2).sum() / my.sum().clamp_min(1e-6)
     psnr_v = float((-10.0 * torch.log10(mse.clamp_min(1e-12))).item())
-
     mu_x = (my * py).sum() / my.sum().clamp_min(1e-6)
     mu_y = (my * hy).sum() / my.sum().clamp_min(1e-6)
     vx = (my * (py - mu_x) ** 2).sum() / my.sum().clamp_min(1e-6)
@@ -422,6 +418,7 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
     ssim_v = float((((2 * mu_x * mu_y + c1) * (2 * cxy + c2)) / ((mu_x * mu_x + mu_y * mu_y + c1) * (vx + vy + c2))).item())
     lpips_v = float(lpips_fn_cpu(pred_cpu * mask_cpu, hr_cpu * mask_cpu).mean().item())
     return psnr_v, ssim_v, lpips_v
+
 
 def _extract_adapter_cond_stats(cond):
     gate_mean = 0.0
@@ -656,7 +653,7 @@ def get_config_snapshot():
         "lora_rank": LORA_RANK,
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "loss_weights": "Lv+0.10L1+0.05LRcons+0.05CompIS+0.05GW",
+        "loss_weights": "Lv+0.10L1+0.05LRcons+0.05GW",
         "adapter_type": "SRConvNetLSA",
         "all_block_injection": True,
         "seed": SEED,
@@ -1669,7 +1666,6 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             lr_small = batch["lr_small"].to(DEVICE, dtype=COMPUTE_DTYPE)
             aug_level = torch.zeros((latents.shape[0],), device=DEVICE, dtype=COMPUTE_DTYPE)
             
-            cond = None
             for t in run_timesteps:
                 t_b = torch.tensor([t], device=DEVICE).expand(latents.shape[0])
                 with torch.no_grad():
@@ -1738,32 +1734,17 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                 lr_np = (lr[0].cpu().float().numpy().transpose(1,2,0) + 1) / 2
                 hr_np = (hr[0].cpu().float().numpy().transpose(1,2,0) + 1) / 2
                 pr_np = (pred[0].cpu().float().numpy().transpose(1,2,0) + 1) / 2
-                plt.figure(figsize=(18, 8))
-                plt.subplot(2,4,1); plt.imshow(np.clip(lr_np, 0, 1)); plt.title("Input LR"); plt.axis("off")
-                plt.subplot(2,4,2); plt.imshow(np.clip(hr_np, 0, 1)); plt.title("GT"); plt.axis("off")
-                plt.subplot(2,4,3); plt.imshow(np.clip(pr_np, 0, 1)); plt.title(f"Pred @{steps}"); plt.axis("off")
-                plt.subplot(2,4,4); plt.imshow(m_flat[0,0].detach().cpu(), cmap='gray'); plt.title("M_flat"); plt.axis("off")
-                plt.subplot(2,4,5); plt.imshow(m_edge[0,0].detach().cpu(), cmap='gray'); plt.title("M_edge"); plt.axis("off")
-                plt.subplot(2,4,6); plt.imshow(m_corner[0,0].detach().cpu(), cmap='gray'); plt.title("M_corner"); plt.axis("off")
-                comp_aux = cond.get("comp_aux", {}) if isinstance(cond, dict) else {}
-                af = comp_aux.get("flat", None); ae = comp_aux.get("edge", None); ac = comp_aux.get("corner", None)
-                if af is not None:
-                    plt.subplot(2,4,7); plt.imshow(np.clip(((af[0].detach().cpu().float().numpy().transpose(1,2,0)+1)/2), 0, 1)); plt.title("aux_flat"); plt.axis("off")
-                if ae is not None:
-                    plt.subplot(2,4,8); plt.imshow(np.clip(((ae[0].detach().cpu().float().numpy().transpose(1,2,0)+1)/2), 0, 1)); plt.title("aux_edge"); plt.axis("off")
-                if ac is not None:
-                    aux_corner_path = os.path.join(VIS_DIR, f"epoch{epoch+1:03d}_{tag}_steps{steps}_aux_corner.png")
-                    plt.figure(figsize=(4,4)); plt.imshow(np.clip(((ac[0].detach().cpu().float().numpy().transpose(1,2,0)+1)/2), 0, 1)); plt.title("aux_corner"); plt.axis("off")
-                    plt.savefig(aux_corner_path, bbox_inches="tight"); plt.close()
+                plt.figure(figsize=(18,8))
+                plt.subplot(2,3,1); plt.imshow(np.clip(lr_np, 0, 1)); plt.title("Input LR"); plt.axis("off")
+                plt.subplot(2,3,2); plt.imshow(np.clip(hr_np, 0, 1)); plt.title("GT"); plt.axis("off")
+                plt.subplot(2,3,3); plt.imshow(np.clip(pr_np, 0, 1)); plt.title(f"Pred @{steps}"); plt.axis("off")
+                plt.subplot(2,3,4); plt.imshow(m_flat[0,0].detach().cpu(), cmap='gray'); plt.title("M_flat"); plt.axis("off")
+                plt.subplot(2,3,5); plt.imshow(m_edge[0,0].detach().cpu(), cmap='gray'); plt.title("M_edge"); plt.axis("off")
+                plt.subplot(2,3,6); plt.imshow(m_corner[0,0].detach().cpu(), cmap='gray'); plt.title("M_corner"); plt.axis("off")
                 plt.savefig(save_path, bbox_inches="tight"); plt.close(); vis_done = True
             if FAST_DEV_RUN and len(psnrs) >= FAST_VAL_BATCHES: break
         res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
-        results[int(steps)] = {
-            "global": res,
-            "flat": (float(np.mean(flat_psnrs)), float(np.mean(flat_ssims)), float(np.mean(flat_lpipss))),
-            "edge": (float(np.mean(edge_psnrs)), float(np.mean(edge_ssims)), float(np.mean(edge_lpipss))),
-            "corner": (float(np.mean(corner_psnrs)), float(np.mean(corner_ssims)), float(np.mean(corner_lpipss))),
-        }
+        results[int(steps)] = res
         dual_m, dual_s = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
         am = float(np.mean(alpha_means)) if len(alpha_means) > 0 else 0.0
@@ -1786,7 +1767,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             msg += f" | dual_gate={dual_m:.4f}±{dual_s:.4f}"
         print(msg)
     pixart.train(); adapter.train()
-    return {k: v["global"] for k, v in results.items()}
+    return results
 
 # ================= 10. Main =================
 def main():
@@ -1880,7 +1861,6 @@ def main():
     for p in vae.parameters(): p.requires_grad_(False)
     for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
     print("✅ Validation LPIPS is on CPU.")
-    lpips_fn_train = None  # lazy-init on GPU when/if training LPIPS becomes active
 
     if not os.path.exists(NULL_T5_EMBED_PATH):
         raise FileNotFoundError(f"Null T5 embed not found: {NULL_T5_EMBED_PATH}")
@@ -2018,12 +1998,10 @@ def main():
                 w = get_fixed_loss_weights()
                 
                 # Calculate pixel-space losses
-                loss_lpips = torch.tensor(0.0, device=DEVICE)
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
-                loss_comp_is = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
 
-                need_pixel_loss = (w['lpips'] > 0) or (w.get('lr_cons', 0.0) > 0) or (w.get('comp_is', 0.0) > 0) or (w.get('gw', 0.0) > 0)
+                need_pixel_loss = (w.get('lr_cons', 0.0) > 0) or (w.get('gw', 0.0) > 0)
                 pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
                 allow_by_stage = True
                 pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
@@ -2044,35 +2022,12 @@ def main():
                     y0 = top * 8 + 32; x0 = left * 8 + 32
                     img_t_valid = hr_sel[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
 
-                    if w['lpips'] > 0:
-                        if lpips_fn_train is None:
-                            lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval()
-                            for p in lpips_fn_train.parameters():
-                                p.requires_grad_(False)
-                            print("✅ Training LPIPS initialized on GPU (lazy init).")
-                        loss_lpips = lpips_fn_train(img_p_valid, img_t_valid).mean()
-
                     if w.get('lr_cons', 0.0) > 0:
                         lr_patch = lr_sel[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
                         loss_lr_cons = structure_consistency_loss(img_p_valid, lr_patch)
 
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
-
-                    if w.get('comp_is', 0.0) > 0 and isinstance(cond, dict) and 'comp_aux' in cond:
-                        m_flat, m_edge, m_corner = build_component_masks_from_hr(img_t_valid)
-                        aux = cond.get('comp_aux', {})
-                        aux_flat = aux.get('flat', None)
-                        aux_edge = aux.get('edge', None)
-                        aux_corner = aux.get('corner', None)
-                        if aux_flat is not None and aux_edge is not None and aux_corner is not None:
-                            aux_flat = aux_flat.index_select(0, active_idx)[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
-                            aux_edge = aux_edge.index_select(0, active_idx)[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
-                            aux_corner = aux_corner.index_select(0, active_idx)[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
-                            loss_is_flat = F.l1_loss(m_flat * img_t_valid, m_flat * aux_flat)
-                            loss_is_edge = F.l1_loss(m_edge * img_t_valid, m_edge * aux_edge)
-                            loss_is_corner = F.l1_loss(m_corner * img_t_valid, m_corner * aux_corner)
-                            loss_comp_is = (loss_is_flat + loss_is_edge + loss_is_corner) / 3.0
                 else:
                     pixel_loss_num_samples = 0
 
@@ -2080,9 +2035,7 @@ def main():
                 loss = (
                     loss_v 
                     + w['latent_l1']*loss_latent_l1
-                    + w['lpips']*loss_lpips
                     + w.get('lr_cons', 0.0) * loss_lr_cons
-                    + w.get('comp_is', 0.0) * loss_comp_is
                     + w.get('gw', 0.0) * loss_gw
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
@@ -2114,15 +2067,12 @@ def main():
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
-                    'lp': f"{loss_lpips:.3f}",
-                    'comp_is': f"{loss_comp_is.item():.3f}",
                     'gw': f"{loss_gw.item():.3f}",
+                    'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{pixel_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
-                    'w_is': f"{w.get('comp_is', 0.0):.3f}",
-                    'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),

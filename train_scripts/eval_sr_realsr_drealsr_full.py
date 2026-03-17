@@ -440,13 +440,11 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
         "aspect_ratio": torch.tensor([1.0], device=device),
     }
 
-    last_cond = None
     for t in run_timesteps:
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
-            last_cond = cond
             out = pixart(
                 x=latents.to(compute_dtype),
                 timestep=t_b,
@@ -460,7 +458,7 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
     pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
-    return pred, hr, lr, last_cond
+    return pred, hr, lr
 
 
 def tensor_m11_to_pil(x: torch.Tensor):
@@ -480,25 +478,17 @@ def save_triptych(lr_m11, hr_m11, pred_m11, path, steps):
     plt.savefig(path, bbox_inches="tight")
     plt.close()
 
-def save_component_visualization(gt_m11, pred_m11, masks, comp_aux, path, steps):
+def save_component_visualization(gt_m11, pred_m11, masks, path, steps):
     gt_img = tensor_m11_to_pil(gt_m11[0])
     pred_img = tensor_m11_to_pil(pred_m11[0])
     m_flat, m_edge, m_corner = masks
-    af = comp_aux.get("flat") if isinstance(comp_aux, dict) else None
-    ae = comp_aux.get("edge") if isinstance(comp_aux, dict) else None
-    ac = comp_aux.get("corner") if isinstance(comp_aux, dict) else None
-    plt.figure(figsize=(18, 8))
-    plt.subplot(2, 4, 1); plt.imshow(gt_img); plt.title("GT"); plt.axis("off")
-    plt.subplot(2, 4, 2); plt.imshow(pred_img); plt.title(f"Pred @{steps}"); plt.axis("off")
-    plt.subplot(2, 4, 3); plt.imshow(m_flat[0, 0].detach().cpu(), cmap='gray'); plt.title("M_flat"); plt.axis("off")
-    plt.subplot(2, 4, 4); plt.imshow(m_edge[0, 0].detach().cpu(), cmap='gray'); plt.title("M_edge"); plt.axis("off")
-    plt.subplot(2, 4, 5); plt.imshow(m_corner[0, 0].detach().cpu(), cmap='gray'); plt.title("M_corner"); plt.axis("off")
-    if af is not None:
-        plt.subplot(2, 4, 6); plt.imshow(tensor_m11_to_pil(af[0])); plt.title("aux_flat"); plt.axis("off")
-    if ae is not None:
-        plt.subplot(2, 4, 7); plt.imshow(tensor_m11_to_pil(ae[0])); plt.title("aux_edge"); plt.axis("off")
-    if ac is not None:
-        plt.subplot(2, 4, 8); plt.imshow(tensor_m11_to_pil(ac[0])); plt.title("aux_corner"); plt.axis("off")
+    plt.figure(figsize=(12, 8))
+    plt.subplot(2, 3, 1); plt.imshow(gt_img); plt.title("GT"); plt.axis("off")
+    plt.subplot(2, 3, 2); plt.imshow(pred_img); plt.title(f"Pred @{steps}"); plt.axis("off")
+    plt.subplot(2, 3, 3); plt.axis("off")
+    plt.subplot(2, 3, 4); plt.imshow(m_flat[0, 0].detach().cpu(), cmap='gray'); plt.title("M_flat"); plt.axis("off")
+    plt.subplot(2, 3, 5); plt.imshow(m_edge[0, 0].detach().cpu(), cmap='gray'); plt.title("M_edge"); plt.axis("off")
+    plt.subplot(2, 3, 6); plt.imshow(m_corner[0, 0].detach().cpu(), cmap='gray'); plt.title("M_corner"); plt.axis("off")
     plt.savefig(path, bbox_inches="tight")
     plt.close()
 
@@ -526,7 +516,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.max_samples > 0 and idx >= args.max_samples:
             break
 
-        pred, hr, lr, cond = run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, device, compute_dtype, gen)
+        pred, hr, lr = run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, device, compute_dtype, gen)
         m = metric_suite.compute(pred, hr)
         m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
         m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
@@ -546,8 +536,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             tri_path = trip_dir / f"{idx:04d}_{stem}_steps{args.steps}.png"
             save_triptych(lr, hr, pred, str(tri_path), args.steps)
             comp_path = trip_dir / f"{idx:04d}_{stem}_comp_steps{args.steps}.png"
-            comp_aux = cond.get("comp_aux", {}) if isinstance(cond, dict) else {}
-            save_component_visualization(hr, pred, (m_flat, m_edge, m_corner), comp_aux, str(comp_path), args.steps)
+            save_component_visualization(hr, pred, (m_flat, m_edge, m_corner), str(comp_path), args.steps)
 
         row = {
             "dataset": dataset_name,
