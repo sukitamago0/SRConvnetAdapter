@@ -99,7 +99,7 @@ NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth"
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gw_percep")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gw_percep_only")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -1437,13 +1437,16 @@ def save_smart(
                 "transition_layers": list(TRANSITION_INJECTION_LAYERS),
                 "detail_layers": list(DETAIL_INJECTION_LAYERS),
             },
-            "discriminator": ({k: v.detach().float().cpu() for k, v in discriminator.state_dict().items()} if discriminator is not None else None),
-            "disc_optimizer": (disc_optimizer.state_dict() if disc_optimizer is not None else None),
             "stage2_args": (vars(stage2_args) if stage2_args is not None else None),
             "percep_type": (getattr(stage2_args, 'percep_type', None) if stage2_args is not None else None),
             "percep_weight": (float(getattr(stage2_args, 'percep_weight', 0.0)) if stage2_args is not None else None),
             "gan_weight": (float(getattr(stage2_args, 'gan_weight', 0.0)) if stage2_args is not None else None),
+            "use_gan": (bool(getattr(stage2_args, 'use_gan', False)) if stage2_args is not None else None),
         }
+        if discriminator is not None:
+            state["discriminator"] = {k: v.detach().float().cpu() for k, v in discriminator.state_dict().items()}
+        if disc_optimizer is not None:
+            state["disc_optimizer"] = disc_optimizer.state_dict()
         return state
 
     next_best_records = [current_record] if save_as_best else list(best_records)
@@ -1788,13 +1791,16 @@ def parse_stage2_args():
     parser.add_argument('--percep_type', type=str, default='vgg_preact', choices=['vgg_preact', 'lpips'])
     parser.add_argument('--percep_weight', type=float, default=0.02)
     parser.add_argument('--gan_weight', type=float, default=0.001)
+    parser.add_argument('--disable_gan', action='store_true')
     parser.add_argument('--disc_lr', type=float, default=1e-4)
     parser.add_argument('--gen_lr_scale', type=float, default=0.2)
     parser.add_argument('--disc_updates', type=int, default=1)
     parser.add_argument('--gan_warmup_epochs', type=int, default=1)
     parser.add_argument('--use_color_anchor', action='store_true', default=False)
     parser.add_argument('--color_anchor_weight', type=float, default=0.01)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.use_gan = (not args.disable_gan) and (args.gan_weight > 0)
+    return args
 
 
 def color_anchor_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor) -> torch.Tensor:
@@ -1947,20 +1953,28 @@ def main():
     for group in optimizer.param_groups:
         group['lr'] = float(group['lr']) * float(stage2_args.gen_lr_scale)
     print(f"✅ Optim groups(stage2-generator): {group_counts}; gen_lr_scale={stage2_args.gen_lr_scale}")
-    discriminator = UNetDiscriminatorSN(num_in_ch=3, num_feat=64, skip_connection=True).to(DEVICE).train()
-    disc_optimizer = torch.optim.AdamW(discriminator.parameters(), lr=float(stage2_args.disc_lr), betas=(0.9, 0.99))
+    use_gan = bool(stage2_args.use_gan)
+    discriminator = None
+    disc_optimizer = None
+    if use_gan:
+        discriminator = UNetDiscriminatorSN(num_in_ch=3, num_feat=64, skip_connection=True).to(DEVICE).train()
+        disc_optimizer = torch.optim.AdamW(discriminator.parameters(), lr=float(stage2_args.disc_lr), betas=(0.9, 0.99))
     percep_loss_fn = PerceptualLoss(percep_type=stage2_args.percep_type, loss_weight=1.0).to(DEVICE).eval()
     for p in percep_loss_fn.parameters():
         p.requires_grad_(False)
-    print(f"✅ Stage-2 losses: percep_type={stage2_args.percep_type} percep_weight={stage2_args.percep_weight} gan_weight={stage2_args.gan_weight} disc_lr={stage2_args.disc_lr}")
+    stage2_mode = "perceptual_gan" if use_gan else "perceptual_only"
+    print(f"✅ Stage-2 mode: stage2_mode={stage2_mode} percep_type={stage2_args.percep_type} percep_weight={stage2_args.percep_weight} use_gan={use_gan}")
+    if use_gan:
+        print(f"✅ Stage-2 GAN settings: gan_weight={stage2_args.gan_weight} disc_lr={stage2_args.disc_lr} disc_updates={stage2_args.disc_updates}")
     _maybe_empty_cuda_cache()
 
     ep_start, step, best = 0, 0, []
+    latest_loss_percep = float("nan")
 
     if DUALSTREAM_ENABLED:
         run_phase0_regression_check(pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
 
-    print("🚀 Stage-2 perceptual fine-tune started (SFT+GW+Percep+GAN).")
+    print(f"🚀 Stage-2 perceptual fine-tune started ({stage2_mode}).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
 
     for epoch in range(ep_start, 1000):
@@ -2056,10 +2070,12 @@ def main():
                 allow_by_stage = True
                 pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
                 calc_pixel_loss = need_pixel_loss and allow_by_stage and (pixel_loss_num_samples > 0)
-                curr_gan_weight = float(stage2_args.gan_weight)
-                if int(stage2_args.gan_warmup_epochs) > 0:
-                    warmup = min(1.0, float(epoch + 1) / float(max(1, int(stage2_args.gan_warmup_epochs))))
-                    curr_gan_weight = curr_gan_weight * warmup
+                curr_gan_weight = 0.0
+                if use_gan:
+                    curr_gan_weight = float(stage2_args.gan_weight)
+                    if int(stage2_args.gan_warmup_epochs) > 0:
+                        warmup = min(1.0, float(epoch + 1) / float(max(1, int(stage2_args.gan_warmup_epochs))))
+                        curr_gan_weight = curr_gan_weight * warmup
 
                 if calc_pixel_loss:
                     active_idx = torch.nonzero(pixel_t_mask, as_tuple=False).squeeze(1)
@@ -2088,25 +2104,26 @@ def main():
                     if stage2_args.use_color_anchor:
                         loss_color_anchor = color_anchor_loss(img_p_valid, img_t_valid)
 
-                    for _ in range(max(1, int(stage2_args.disc_updates))):
-                        disc_optimizer.zero_grad(set_to_none=True)
-                        fake_d_pred = discriminator(img_p_valid.detach())
-                        real_d_pred = discriminator(img_t_valid)
-                        l_d_real = gan_loss(real_d_pred - torch.mean(fake_d_pred), True) * 0.5
-                        l_d_fake = gan_loss(fake_d_pred - torch.mean(real_d_pred.detach()), False) * 0.5
-                        loss_d = l_d_real + l_d_fake
-                        loss_d.backward()
-                        disc_optimizer.step()
+                    if use_gan:
+                        for _ in range(max(1, int(stage2_args.disc_updates))):
+                            disc_optimizer.zero_grad(set_to_none=True)
+                            fake_d_pred = discriminator(img_p_valid.detach())
+                            real_d_pred = discriminator(img_t_valid)
+                            l_d_real = gan_loss(real_d_pred - torch.mean(fake_d_pred), True) * 0.5
+                            l_d_fake = gan_loss(fake_d_pred - torch.mean(real_d_pred.detach()), False) * 0.5
+                            loss_d = l_d_real + l_d_fake
+                            loss_d.backward()
+                            disc_optimizer.step()
 
-                    for p in discriminator.parameters():
-                        p.requires_grad_(False)
-                    real_d_pred = discriminator(img_t_valid).detach()
-                    fake_g_pred = discriminator(img_p_valid)
-                    l_g_real = gan_loss(real_d_pred - torch.mean(fake_g_pred), False)
-                    l_g_fake = gan_loss(fake_g_pred - torch.mean(real_d_pred), True)
-                    loss_g_gan = 0.5 * (l_g_real + l_g_fake)
-                    for p in discriminator.parameters():
-                        p.requires_grad_(True)
+                        for p in discriminator.parameters():
+                            p.requires_grad_(False)
+                        real_d_pred = discriminator(img_t_valid).detach()
+                        fake_g_pred = discriminator(img_p_valid)
+                        l_g_real = gan_loss(real_d_pred - torch.mean(fake_g_pred), False)
+                        l_g_fake = gan_loss(fake_g_pred - torch.mean(real_d_pred), True)
+                        loss_g_gan = 0.5 * (l_g_real + l_g_fake)
+                        for p in discriminator.parameters():
+                            p.requires_grad_(True)
                 else:
                     pixel_loss_num_samples = 0
 
@@ -2117,11 +2134,12 @@ def main():
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
                     + float(stage2_args.percep_weight) * loss_percep
-                    + curr_gan_weight * loss_g_gan
+                    + (curr_gan_weight * loss_g_gan if use_gan else 0.0)
                     + (float(stage2_args.color_anchor_weight) * loss_color_anchor if stage2_args.use_color_anchor else 0.0)
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
+            latest_loss_percep = float(loss_percep.detach().item())
             loss.backward()
             accum_micro_steps += 1
 
@@ -2145,17 +2163,14 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
-                pbar.set_postfix({
+                postfix = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'percep': f"{loss_percep.item():.3f}",
-                    'g_gan': f"{loss_g_gan.item():.3f}",
-                    'loss_d': f"{loss_d.item():.3f}",
                     'w_p': f"{float(stage2_args.percep_weight):.3f}",
-                    'w_gan': f"{curr_gan_weight:.4f}",
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{pixel_loss_num_samples}",
@@ -2164,7 +2179,14 @@ def main():
                     **({'color': f"{loss_color_anchor.item():.3f}"} if stage2_args.use_color_anchor else {}),
                     'gate': f"{gate_mean:.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
-                })
+                }
+                if use_gan:
+                    postfix.update({
+                        'g_gan': f"{loss_g_gan.item():.3f}",
+                        'loss_d': f"{loss_d.item():.3f}",
+                        'w_gan': f"{curr_gan_weight:.4f}",
+                    })
+                pbar.set_postfix(postfix)
 
         if accum_micro_steps > 0 and not reached_max_steps:
             log_critical_path_gradients(step + 1, pixart, adapter)
@@ -2178,7 +2200,7 @@ def main():
 
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
         validation_count += 1
-        print(f"🔎 [VAL] Raw weights (validation #{validation_count})")
+        print(f"🔎 [VAL] Raw weights (validation #{validation_count}) | loss_percep={latest_loss_percep:.4f} | percep_type={stage2_args.percep_type} | use_gan={use_gan}")
         val_raw = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu, val_tag="raw")
 
         run_ema_val = (
@@ -2189,7 +2211,7 @@ def main():
         )
         val_ema = None
         if run_ema_val:
-            print(f"🔎 [VAL] EMA weights (validation #{validation_count})")
+            print(f"🔎 [VAL] EMA weights (validation #{validation_count}) | loss_percep={latest_loss_percep:.4f} | percep_type={stage2_args.percep_type} | use_gan={use_gan}")
             ema.apply(ema_named_params)
             val_ema = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu, val_tag="ema")
             ema.restore(ema_named_params)
