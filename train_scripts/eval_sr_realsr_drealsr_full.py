@@ -6,6 +6,7 @@ import math
 import glob
 import random
 import argparse
+import re
 from pathlib import Path
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -143,6 +144,59 @@ def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context
     if len(skipped) > 0:
         print(f"[{context}] skipped examples: {skipped[:5]}")
     return missing, unexpected, skipped
+
+
+
+def _block_id_from_name(name: str):
+    m = re.search(r"blocks\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
+
+
+def _lora_target_kind(module_name: str):
+    if ("attn.qkv" in module_name) or ("attn.proj" in module_name):
+        return "attn"
+    return None
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r: int, alpha: float):
+        super().__init__()
+        self.base = base
+        self.scaling = alpha / r
+        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
+        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
+        self.lora_A.to(base.weight.device)
+        self.lora_B.to(base.weight.device)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+
+    def forward(self, x):
+        out = self.base(x)
+        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
+        return out + delta.to(out.dtype)
+
+
+def apply_lora(model, lora_rank: int = 4, lora_alpha: float = 4.0):
+    cnt = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        block_id = _block_id_from_name(name)
+        if block_id is None:
+            continue
+        kind = _lora_target_kind(name)
+        if kind is None:
+            continue
+        if not (0 <= block_id <= 27):
+            continue
+        parent = model.get_submodule(name.rsplit('.', 1)[0])
+        child = name.rsplit('.', 1)[1]
+        setattr(parent, child, LoRALinear(module, int(lora_rank), alpha=float(lora_alpha)))
+        cnt += 1
+    print(f"✅ Attention LoRA applied to {cnt} layers (rank={int(lora_rank)}, alpha={float(lora_alpha)}).")
 
 
 class RealSRValPairedDataset(Dataset):
@@ -358,14 +412,38 @@ class MetricSuite:
 
 
 def build_model_and_assets(args, device, compute_dtype):
+    ckpt = torch.load(args.ckpt_path, map_location="cpu")
+    if "adapter" not in ckpt:
+        raise KeyError("Checkpoint must contain key: adapter")
+
+    pixart_state = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", None))
+    if pixart_state is None:
+        raise KeyError("Checkpoint must contain pixart_keep or pixart_trainable")
+
+    inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
+    if not isinstance(inj_cfg, dict):
+        inj_cfg = {}
+
+    sparse_inject_ratio = float(ckpt.get("sparse_inject_ratio", 1.0))
+    dualstream_enabled = bool(ckpt.get("dualstream_enabled", False))
+    dual_cross_attn_start = int(ckpt.get("dual_cross_attn_start", 16))
+    dual_num_heads = int(ckpt.get("dual_num_heads", 16))
+    use_style_fusion = bool(ckpt.get("use_style_fusion", False))
+
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
-        sparse_inject_ratio=1.0,
-        dualstream_enabled=False,
-        cross_attn_start_layer=16,
-        dual_num_heads=16,
+        sparse_inject_ratio=sparse_inject_ratio,
+        injection_cutoff_layer=int(inj_cfg.get("injection_cutoff_layer", 28)),
+        injection_strategy=str(inj_cfg.get("injection_strategy", "three_stage_sr")),
+        hard_injection_layers=list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12])),
+        transition_injection_layers=list(inj_cfg.get("transition_layers", [])),
+        detail_injection_layers=list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24])),
+        dualstream_enabled=dualstream_enabled,
+        cross_attn_start_layer=dual_cross_attn_start,
+        dual_num_heads=dual_num_heads,
+        use_style_fusion=use_style_fusion,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -380,17 +458,20 @@ def build_model_and_assets(args, device, compute_dtype):
     else:
         pixart.load_state_dict(base, strict=False)
 
+    has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in pixart_state.keys())
+    lora_rank = int(ckpt.get("lora_rank", 4))
+    lora_alpha = float(ckpt.get("lora_alpha", 4.0))
+    print(f"[Eval-Model] has_lora={has_lora} lora_rank={lora_rank} lora_alpha={lora_alpha}")
+    if has_lora:
+        apply_lora(pixart, lora_rank=lora_rank, lora_alpha=lora_alpha)
+
+    load_state_dict_shape_compatible(pixart, pixart_state, context="eval")
+
     adapter = build_adapter_v7(
         in_channels=4,
         hidden_size=1152,
         injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
     ).to(device).float()
-
-    ckpt = torch.load(args.ckpt_path, map_location="cpu")
-    if "pixart_trainable" not in ckpt or "adapter" not in ckpt:
-        raise KeyError("Checkpoint must contain keys: pixart_trainable and adapter")
-
-    load_state_dict_shape_compatible(pixart, ckpt.get("pixart_keep", ckpt["pixart_trainable"]), context="eval")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
