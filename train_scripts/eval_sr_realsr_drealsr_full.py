@@ -456,7 +456,7 @@ def build_model_and_assets(args, device, compute_dtype):
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
     else:
-        pixart.load_state_dict(base, strict=False)
+        load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in pixart_state.keys())
     lora_rank = int(ckpt.get("lora_rank", 4))
