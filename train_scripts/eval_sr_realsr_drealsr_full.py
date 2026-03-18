@@ -363,7 +363,7 @@ class MetricSuite:
 
         if self.dists_fn is not None:
             try:
-                out["dists"] = float(self.dists_fn(pred_cpu, hr_cpu).mean().item())
+                out["dists"] = float(self.dists_fn(pred01, hr01).mean().item())
             except Exception as e:
                 print(f"⚠️ DISTS compute failed, writing NaN: {e}")
 
@@ -468,7 +468,7 @@ def build_model_and_assets(args, device, compute_dtype):
     load_state_dict_shape_compatible(pixart, pixart_state, context="eval")
 
     adapter = build_adapter_v7(
-        in_channels=4,
+        in_channels=3,
         hidden_size=1152,
         injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
     ).to(device).float()
