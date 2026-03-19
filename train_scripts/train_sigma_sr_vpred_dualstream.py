@@ -482,9 +482,26 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
     return psnr_v, ssim_v, lpips_v
 
 
-def _extract_adapter_cond_stats(cond):
+def _extract_adapter_cond_stats(cond, adapter=None):
     gate_mean = 0.0
     gate_std = 0.0
+    extra = {}
+
+    if isinstance(cond, dict):
+        if "comp_prob" in cond and torch.is_tensor(cond["comp_prob"]):
+            cp = cond["comp_prob"].detach().float()
+            extra["flat_p"] = float(cp[:, 0].mean().item())
+            extra["edge_p"] = float(cp[:, 1].mean().item())
+            extra["corner_p"] = float(cp[:, 2].mean().item())
+
+            ent = -(cp.clamp_min(1e-8) * cp.clamp_min(1e-8).log()).sum(dim=1).mean()
+            extra["comp_ent"] = float(ent.item())
+
+        if adapter is not None and hasattr(adapter, "comp_res_gain"):
+            extra["comp_gain"] = float(adapter.comp_res_gain.detach().float().item())
+
+        return gate_mean, gate_std, extra
+
     if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
         means = []
         spatial_stds = []
@@ -498,7 +515,7 @@ def _extract_adapter_cond_stats(cond):
             gs = torch.stack(spatial_stds, dim=0).mean(dim=0)
             gate_mean = float(gm.mean().item())
             gate_std = float(gs.mean().item())
-    return gate_mean, gate_std
+    return gate_mean, gate_std, extra
 
 
 def _extract_dual_gate_stats(pixart: nn.Module):
@@ -2159,7 +2176,7 @@ def main():
                     alpha_mean = float(np.mean([float(v) for v in a.values()]))
                 else:
                     alpha_mean = 0.0
-                gate_mean, _ = _extract_adapter_cond_stats(cond_in)
+                gate_mean, _, cond_extra = _extract_adapter_cond_stats(cond_in, adapter)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
@@ -2185,6 +2202,11 @@ def main():
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
+                    'comp_gain': f"{cond_extra.get('comp_gain', 0.0):.3f}",
+                    'flat_p': f"{cond_extra.get('flat_p', 0.0):.3f}",
+                    'edge_p': f"{cond_extra.get('edge_p', 0.0):.3f}",
+                    'corner_p': f"{cond_extra.get('corner_p', 0.0):.3f}",
+                    'ent': f"{cond_extra.get('comp_ent', 0.0):.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
