@@ -1773,7 +1773,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                             alpha_means.append(float(np.mean(vals)))
                             alpha_stds.append(float(np.std(vals)))
 
-                    gm, gs = _extract_adapter_cond_stats(cond)
+                    gm, gs, _ = _extract_adapter_cond_stats(cond)
                     gate_means.append(gm)
                     gate_stds.append(gs)
 
