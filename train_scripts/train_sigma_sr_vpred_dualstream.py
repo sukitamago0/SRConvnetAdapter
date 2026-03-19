@@ -239,6 +239,7 @@ def get_fixed_loss_weights():
         "latent_l1": 0.10,
         "lr_cons": 0.05,
         "gw": 0.05,
+        "comp_bal": 0.05,
     }
 
 
@@ -367,6 +368,30 @@ def gradient_weighted_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor, alpha: 
     dy = (gy_p - gy_h).abs()
     dgw = (1.0 + alpha * dx) * (1.0 + alpha * dy)
     return F.l1_loss(dgw * pred_m11.float(), dgw * hr_m11.float())
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def masked_l1_normalized(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6):
+    pred = pred_m11.float()
+    hr = hr_m11.float()
+    m = mask.float().clamp(0.0, 1.0)
+    diff = (pred - hr).abs() * m
+    denom = (m.sum() * pred.shape[1]).clamp_min(eps)
+    return diff.sum() / denom
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def component_balanced_recon_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor):
+    m_flat, m_edge, m_corner = build_component_masks_from_hr(hr_m11)
+    loss_flat = masked_l1_normalized(pred_m11, hr_m11, m_flat)
+    loss_edge = masked_l1_normalized(pred_m11, hr_m11, m_edge)
+    loss_corner = masked_l1_normalized(pred_m11, hr_m11, m_corner)
+    loss_total = (loss_flat + loss_edge + loss_corner) / 3.0
+    return loss_total, {
+        "flat": loss_flat.detach(),
+        "edge": loss_edge.detach(),
+        "corner": loss_corner.detach(),
+    }
 # -------------------------------------------------------------------------------
 
 @torch.cuda.amp.autocast(enabled=False)
@@ -2000,8 +2025,13 @@ def main():
                 # Calculate pixel-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
+                loss_comp_bal = torch.tensor(0.0, device=DEVICE)
 
-                need_pixel_loss = (w.get('lr_cons', 0.0) > 0) or (w.get('gw', 0.0) > 0)
+                comp_flat_dbg = torch.tensor(0.0, device=DEVICE)
+                comp_edge_dbg = torch.tensor(0.0, device=DEVICE)
+                comp_corner_dbg = torch.tensor(0.0, device=DEVICE)
+
+                need_pixel_loss = (w.get('lr_cons', 0.0) > 0) or (w.get('gw', 0.0) > 0) or (w.get('comp_bal', 0.0) > 0)
                 pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
                 allow_by_stage = True
                 pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
@@ -2028,15 +2058,22 @@ def main():
 
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
+
+                    if w.get('comp_bal', 0.0) > 0:
+                        loss_comp_bal, comp_parts = component_balanced_recon_loss(img_p_valid, img_t_valid)
+                        comp_flat_dbg = comp_parts["flat"]
+                        comp_edge_dbg = comp_parts["edge"]
+                        comp_corner_dbg = comp_parts["corner"]
                 else:
                     pixel_loss_num_samples = 0
 
                 inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
                 loss = (
-                    loss_v 
-                    + w['latent_l1']*loss_latent_l1
+                    loss_v
+                    + w['latent_l1'] * loss_latent_l1
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
+                    + w.get('comp_bal', 0.0) * loss_comp_bal
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2068,7 +2105,12 @@ def main():
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
+                    'comp': f"{loss_comp_bal.item():.3f}",
+                    'flat': f"{comp_flat_dbg.item():.3f}",
+                    'edge': f"{comp_edge_dbg.item():.3f}",
+                    'corner': f"{comp_corner_dbg.item():.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
+                    'w_comp': f"{w.get('comp_bal', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{pixel_loss_num_samples}",
