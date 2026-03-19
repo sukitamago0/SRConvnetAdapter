@@ -240,6 +240,8 @@ def get_fixed_loss_weights():
         "lr_cons": 0.05,
         "gw": 0.05,
         "comp_bal": 0.05,
+        "comp_attn": 0.02,
+        "comp_is": 0.05,
     }
 
 
@@ -386,6 +388,41 @@ def component_balanced_recon_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor):
     loss_flat = masked_l1_normalized(pred_m11, hr_m11, m_flat)
     loss_edge = masked_l1_normalized(pred_m11, hr_m11, m_edge)
     loss_corner = masked_l1_normalized(pred_m11, hr_m11, m_corner)
+    loss_total = (loss_flat + loss_edge + loss_corner) / 3.0
+    return loss_total, {
+        "flat": loss_flat.detach(),
+        "edge": loss_edge.detach(),
+        "corner": loss_corner.detach(),
+    }
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def build_component_target_prob(hr_m11: torch.Tensor, size_hw):
+    m_flat, m_edge, m_corner = build_component_masks_from_hr(hr_m11)
+    target = torch.cat([m_flat, m_edge, m_corner], dim=1).float()
+    target = F.interpolate(target, size=size_hw, mode="bilinear", align_corners=False)
+    target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return target
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def soft_component_ce_loss(logits: torch.Tensor, target_prob: torch.Tensor):
+    logp = F.log_softmax(logits.float(), dim=1)
+    return -(target_prob * logp).sum(dim=1).mean()
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def component_intermediate_latent_loss(pred_dict: dict, target_latent: torch.Tensor, target_prob: torch.Tensor):
+    pred_flat = pred_dict["flat"].float()
+    pred_edge = pred_dict["edge"].float()
+    pred_corner = pred_dict["corner"].float()
+    if pred_flat.shape[-2:] != target_latent.shape[-2:]:
+        pred_flat = F.interpolate(pred_flat, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
+        pred_edge = F.interpolate(pred_edge, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
+        pred_corner = F.interpolate(pred_corner, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
+    loss_flat = masked_l1_normalized(pred_flat, target_latent, target_prob[:, 0:1])
+    loss_edge = masked_l1_normalized(pred_edge, target_latent, target_prob[:, 1:2])
+    loss_corner = masked_l1_normalized(pred_corner, target_latent, target_prob[:, 2:3])
     loss_total = (loss_flat + loss_edge + loss_corner) / 3.0
     return loss_total, {
         "flat": loss_flat.detach(),
@@ -2013,6 +2050,28 @@ def main():
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
 
+                loss_comp_attn = torch.tensor(0.0, device=DEVICE)
+                loss_comp_is = torch.tensor(0.0, device=DEVICE)
+                is_flat_dbg = torch.tensor(0.0, device=DEVICE)
+                is_edge_dbg = torch.tensor(0.0, device=DEVICE)
+                is_corner_dbg = torch.tensor(0.0, device=DEVICE)
+                w = get_fixed_loss_weights()
+                if isinstance(cond, dict):
+                    if (w.get("comp_attn", 0.0) > 0) and ("comp_logits" in cond):
+                        target_prob_attn = build_component_target_prob(hr, cond["comp_logits"].shape[-2:])
+                        loss_comp_attn = soft_component_ce_loss(cond["comp_logits"], target_prob_attn)
+
+                    if (w.get("comp_is", 0.0) > 0) and ("comp_latent_preds" in cond):
+                        target_prob_lat = build_component_target_prob(hr, zh.shape[-2:])
+                        loss_comp_is, is_parts = component_intermediate_latent_loss(
+                            cond["comp_latent_preds"],
+                            zh.float(),
+                            target_prob_lat,
+                        )
+                        is_flat_dbg = is_parts["flat"]
+                        is_edge_dbg = is_parts["edge"]
+                        is_corner_dbg = is_parts["corner"]
+
                 latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
                 latent_l1_mask = (t <= int(LATENT_L1_T_MAX)).float()
                 if float(latent_l1_mask.sum().item()) > 0:
@@ -2020,12 +2079,12 @@ def main():
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
-                w = get_fixed_loss_weights()
-                
                 # Calculate pixel-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
                 loss_comp_bal = torch.tensor(0.0, device=DEVICE)
+                loss_comp_attn = loss_comp_attn.to(device=DEVICE)
+                loss_comp_is = loss_comp_is.to(device=DEVICE)
 
                 comp_flat_dbg = torch.tensor(0.0, device=DEVICE)
                 comp_edge_dbg = torch.tensor(0.0, device=DEVICE)
@@ -2074,6 +2133,8 @@ def main():
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
                     + w.get('comp_bal', 0.0) * loss_comp_bal
+                    + w.get('comp_attn', 0.0) * loss_comp_attn
+                    + w.get('comp_is', 0.0) * loss_comp_is
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2106,11 +2167,18 @@ def main():
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
                     'comp': f"{loss_comp_bal.item():.3f}",
+                    'c_attn': f"{loss_comp_attn.item():.3f}",
+                    'c_is': f"{loss_comp_is.item():.3f}",
                     'flat': f"{comp_flat_dbg.item():.3f}",
                     'edge': f"{comp_edge_dbg.item():.3f}",
                     'corner': f"{comp_corner_dbg.item():.3f}",
+                    'is_f': f"{is_flat_dbg.item():.3f}",
+                    'is_e': f"{is_edge_dbg.item():.3f}",
+                    'is_c': f"{is_corner_dbg.item():.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'w_comp': f"{w.get('comp_bal', 0.0):.3f}",
+                    'w_attn': f"{w.get('comp_attn', 0.0):.3f}",
+                    'w_is': f"{w.get('comp_is', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{pixel_loss_num_samples}",
