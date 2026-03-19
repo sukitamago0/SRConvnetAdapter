@@ -6,6 +6,7 @@ import math
 import glob
 import random
 import argparse
+import re
 from pathlib import Path
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -30,6 +31,56 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
 
+
+
+_SOBEL_X = torch.tensor([[1, 0, -1],
+                        [2, 0, -2],
+                        [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+_SOBEL_Y = torch.tensor([[1, 2, 1],
+                        [0, 0, 0],
+                        [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+
+
+def _to_luma01(img_m11: torch.Tensor) -> torch.Tensor:
+    img01 = (img_m11.float() + 1.0) * 0.5
+    r = img01[:, 0:1]; g = img01[:, 1:2]; b = img01[:, 2:3]
+    return (0.2989 * r + 0.5870 * g + 0.1140 * b).clamp(0.0, 1.0)
+
+
+def _harris_response(gray01: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    kx = _SOBEL_X.to(device=gray01.device)
+    ky = _SOBEL_Y.to(device=gray01.device)
+    ix = F.conv2d(gray01, kx, padding=1)
+    iy = F.conv2d(gray01, ky, padding=1)
+    ixx = F.avg_pool2d(ix * ix, kernel_size=3, stride=1, padding=1)
+    iyy = F.avg_pool2d(iy * iy, kernel_size=3, stride=1, padding=1)
+    ixy = F.avg_pool2d(ix * iy, kernel_size=3, stride=1, padding=1)
+    det = ixx * iyy - ixy * ixy
+    trace = ixx + iyy
+    r = det - 0.04 * trace * trace
+    r_flat = r.flatten(1)
+    r_min = r_flat.min(dim=1, keepdim=True)[0][:, :, None]
+    r_max = r_flat.max(dim=1, keepdim=True)[0][:, :, None]
+    return ((r - r_min) / (r_max - r_min + eps)).clamp(0.0, 1.0)
+
+
+def build_component_masks_from_hr(hr_m11: torch.Tensor, corner_q: float = 0.95, edge_q: float = 0.80):
+    gray = _to_luma01(hr_m11)
+    harris = _harris_response(gray)
+    grad_x = F.conv2d(gray, _SOBEL_X.to(device=gray.device), padding=1)
+    grad_y = F.conv2d(gray, _SOBEL_Y.to(device=gray.device), padding=1)
+    grad_mag = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-6)
+    b = gray.shape[0]
+    c_th = torch.quantile(harris.flatten(1), corner_q, dim=1, keepdim=True)
+    e_th = torch.quantile(grad_mag.flatten(1), edge_q, dim=1, keepdim=True)
+    m_corner = (harris >= c_th.view(b, 1, 1, 1)).float()
+    m_edge = (grad_mag >= e_th.view(b, 1, 1, 1)).float() * (1.0 - m_corner)
+    m_flat = 1.0 - (m_edge + m_corner).clamp(0.0, 1.0)
+    m_flat = F.avg_pool2d(m_flat, kernel_size=3, stride=1, padding=1)
+    m_edge = F.avg_pool2d(m_edge, kernel_size=3, stride=1, padding=1)
+    m_corner = F.avg_pool2d(m_corner, kernel_size=3, stride=1, padding=1)
+    norm = (m_flat + m_edge + m_corner).clamp_min(1e-6)
+    return m_flat / norm, m_edge / norm, m_corner / norm
 
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
@@ -93,6 +144,59 @@ def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context
     if len(skipped) > 0:
         print(f"[{context}] skipped examples: {skipped[:5]}")
     return missing, unexpected, skipped
+
+
+
+def _block_id_from_name(name: str):
+    m = re.search(r"blocks\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
+
+
+def _lora_target_kind(module_name: str):
+    if ("attn.qkv" in module_name) or ("attn.proj" in module_name):
+        return "attn"
+    return None
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r: int, alpha: float):
+        super().__init__()
+        self.base = base
+        self.scaling = alpha / r
+        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
+        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
+        self.lora_A.to(base.weight.device)
+        self.lora_B.to(base.weight.device)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        self.base.weight.requires_grad = False
+        if self.base.bias is not None:
+            self.base.bias.requires_grad = False
+
+    def forward(self, x):
+        out = self.base(x)
+        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
+        return out + delta.to(out.dtype)
+
+
+def apply_lora(model, lora_rank: int = 4, lora_alpha: float = 4.0):
+    cnt = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        block_id = _block_id_from_name(name)
+        if block_id is None:
+            continue
+        kind = _lora_target_kind(name)
+        if kind is None:
+            continue
+        if not (0 <= block_id <= 27):
+            continue
+        parent = model.get_submodule(name.rsplit('.', 1)[0])
+        child = name.rsplit('.', 1)[1]
+        setattr(parent, child, LoRALinear(module, int(lora_rank), alpha=float(lora_alpha)))
+        cnt += 1
+    print(f"✅ Attention LoRA applied to {cnt} layers (rank={int(lora_rank)}, alpha={float(lora_alpha)}).")
 
 
 class RealSRValPairedDataset(Dataset):
@@ -259,7 +363,7 @@ class MetricSuite:
 
         if self.dists_fn is not None:
             try:
-                out["dists"] = float(self.dists_fn(pred_cpu, hr_cpu).mean().item())
+                out["dists"] = float(self.dists_fn(pred01, hr01).mean().item())
             except Exception as e:
                 print(f"⚠️ DISTS compute failed, writing NaN: {e}")
 
@@ -276,16 +380,70 @@ class MetricSuite:
 
         return out
 
+    @torch.no_grad()
+    def compute_component(self, pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask: torch.Tensor):
+        pred_cpu = pred_m11.detach().to("cpu", dtype=torch.float32)
+        hr_cpu = hr_m11.detach().to("cpu", dtype=torch.float32)
+        mask_cpu = mask.detach().to("cpu", dtype=torch.float32).clamp(0.0, 1.0)
+
+        pred01 = (pred_cpu + 1.0) / 2.0
+        hr01 = (hr_cpu + 1.0) / 2.0
+        py = rgb01_to_y01(pred01)[..., 4:-4, 4:-4]
+        hy = rgb01_to_y01(hr01)[..., 4:-4, 4:-4]
+        my = mask_cpu[..., 4:-4, 4:-4]
+
+        mse = ((my * (py - hy)) ** 2).sum() / (my.sum().clamp_min(1e-6))
+        psnr_v = float((-10.0 * torch.log10(mse.clamp_min(1e-12))).item())
+
+        mu_x = (my * py).sum() / my.sum().clamp_min(1e-6)
+        mu_y = (my * hy).sum() / my.sum().clamp_min(1e-6)
+        vx = (my * (py - mu_x) ** 2).sum() / my.sum().clamp_min(1e-6)
+        vy = (my * (hy - mu_y) ** 2).sum() / my.sum().clamp_min(1e-6)
+        cxy = (my * (py - mu_x) * (hy - mu_y)).sum() / my.sum().clamp_min(1e-6)
+        c1 = 0.01 ** 2
+        c2 = 0.03 ** 2
+        ssim_v = float((((2 * mu_x * mu_y + c1) * (2 * cxy + c2)) / ((mu_x * mu_x + mu_y * mu_y + c1) * (vx + vy + c2))).item())
+
+        pred_masked = pred_cpu * mask_cpu
+        hr_masked = hr_cpu * mask_cpu
+        lpips_v = float(self.lpips_fn(pred_masked, hr_masked).mean().item())
+
+        return {"psnr": psnr_v, "ssim": ssim_v, "lpips": lpips_v}
+
 
 def build_model_and_assets(args, device, compute_dtype):
+    ckpt = torch.load(args.ckpt_path, map_location="cpu")
+    if "adapter" not in ckpt:
+        raise KeyError("Checkpoint must contain key: adapter")
+
+    pixart_state = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", None))
+    if pixart_state is None:
+        raise KeyError("Checkpoint must contain pixart_keep or pixart_trainable")
+
+    inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
+    if not isinstance(inj_cfg, dict):
+        inj_cfg = {}
+
+    sparse_inject_ratio = float(ckpt.get("sparse_inject_ratio", 1.0))
+    dualstream_enabled = bool(ckpt.get("dualstream_enabled", False))
+    dual_cross_attn_start = int(ckpt.get("dual_cross_attn_start", 16))
+    dual_num_heads = int(ckpt.get("dual_num_heads", 16))
+    use_style_fusion = bool(ckpt.get("use_style_fusion", False))
+
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
-        sparse_inject_ratio=1.0,
-        dualstream_enabled=False,
-        cross_attn_start_layer=16,
-        dual_num_heads=16,
+        sparse_inject_ratio=sparse_inject_ratio,
+        injection_cutoff_layer=int(inj_cfg.get("injection_cutoff_layer", 28)),
+        injection_strategy=str(inj_cfg.get("injection_strategy", "three_stage_sr")),
+        hard_injection_layers=list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12])),
+        transition_injection_layers=list(inj_cfg.get("transition_layers", [])),
+        detail_injection_layers=list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24])),
+        dualstream_enabled=dualstream_enabled,
+        cross_attn_start_layer=dual_cross_attn_start,
+        dual_num_heads=dual_num_heads,
+        use_style_fusion=use_style_fusion,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -298,19 +456,22 @@ def build_model_and_assets(args, device, compute_dtype):
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
     else:
-        pixart.load_state_dict(base, strict=False)
+        load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+
+    has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in pixart_state.keys())
+    lora_rank = int(ckpt.get("lora_rank", 4))
+    lora_alpha = float(ckpt.get("lora_alpha", 4.0))
+    print(f"[Eval-Model] has_lora={has_lora} lora_rank={lora_rank} lora_alpha={lora_alpha}")
+    if has_lora:
+        apply_lora(pixart, lora_rank=lora_rank, lora_alpha=lora_alpha)
+
+    load_state_dict_shape_compatible(pixart, pixart_state, context="eval")
 
     adapter = build_adapter_v7(
-        in_channels=4,
+        in_channels=3,
         hidden_size=1152,
         injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
     ).to(device).float()
-
-    ckpt = torch.load(args.ckpt_path, map_location="cpu")
-    if "pixart_trainable" not in ckpt or "adapter" not in ckpt:
-        raise KeyError("Checkpoint must contain keys: pixart_trainable and adapter")
-
-    load_state_dict_shape_compatible(pixart, ckpt.get("pixart_keep", ckpt["pixart_trainable"]), context="eval")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
@@ -398,6 +559,20 @@ def save_triptych(lr_m11, hr_m11, pred_m11, path, steps):
     plt.savefig(path, bbox_inches="tight")
     plt.close()
 
+def save_component_visualization(gt_m11, pred_m11, masks, path, steps):
+    gt_img = tensor_m11_to_pil(gt_m11[0])
+    pred_img = tensor_m11_to_pil(pred_m11[0])
+    m_flat, m_edge, m_corner = masks
+    plt.figure(figsize=(12, 8))
+    plt.subplot(2, 3, 1); plt.imshow(gt_img); plt.title("GT"); plt.axis("off")
+    plt.subplot(2, 3, 2); plt.imshow(pred_img); plt.title(f"Pred @{steps}"); plt.axis("off")
+    plt.subplot(2, 3, 3); plt.axis("off")
+    plt.subplot(2, 3, 4); plt.imshow(m_flat[0, 0].detach().cpu(), cmap='gray'); plt.title("M_flat"); plt.axis("off")
+    plt.subplot(2, 3, 5); plt.imshow(m_edge[0, 0].detach().cpu(), cmap='gray'); plt.title("M_edge"); plt.axis("off")
+    plt.subplot(2, 3, 6); plt.imshow(m_corner[0, 0].detach().cpu(), cmap='gray'); plt.title("M_corner"); plt.axis("off")
+    plt.savefig(path, bbox_inches="tight")
+    plt.close()
+
 
 def nanmean(xs):
     vals = [float(v) for v in xs if v is not None and not math.isnan(float(v))]
@@ -424,6 +599,10 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
 
         pred, hr, lr = run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, device, compute_dtype, gen)
         m = metric_suite.compute(pred, hr)
+        m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
+        m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
+        m_edge_c = metric_suite.compute_component(pred, hr, m_edge)
+        m_corner_c = metric_suite.compute_component(pred, hr, m_corner)
 
         hr_path = batch["hr_path"][0] if isinstance(batch["hr_path"], list) else batch["hr_path"]
         lr_path = batch["lr_path"][0] if isinstance(batch["lr_path"], list) else batch["lr_path"]
@@ -437,6 +616,8 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.save_triptychs and (idx % 5 == 0):
             tri_path = trip_dir / f"{idx:04d}_{stem}_steps{args.steps}.png"
             save_triptych(lr, hr, pred, str(tri_path), args.steps)
+            comp_path = trip_dir / f"{idx:04d}_{stem}_comp_steps{args.steps}.png"
+            save_component_visualization(hr, pred, (m_flat, m_edge, m_corner), str(comp_path), args.steps)
 
         row = {
             "dataset": dataset_name,
@@ -451,19 +632,31 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "maniqa": m["maniqa"],
             "musiq": m["musiq"],
             "clipiqa": m["clipiqa"],
+            "flat_psnr": m_flat_c["psnr"],
+            "flat_ssim": m_flat_c["ssim"],
+            "flat_lpips": m_flat_c["lpips"],
+            "edge_psnr": m_edge_c["psnr"],
+            "edge_ssim": m_edge_c["ssim"],
+            "edge_lpips": m_edge_c["lpips"],
+            "corner_psnr": m_corner_c["psnr"],
+            "corner_ssim": m_corner_c["ssim"],
+            "corner_lpips": m_corner_c["lpips"],
         }
         rows.append(row)
 
         pbar.set_postfix({
             "psnr": f"{row['psnr']:.2f}",
-            "ssim": f"{row['ssim']:.4f}",
             "lpips": f"{row['lpips']:.4f}",
+            "c_lp": f"{row['corner_lpips']:.4f}",
         })
 
     csv_path = base_out / "per_image_metrics.csv"
     fieldnames = [
         "dataset", "image_name", "hr_path", "lr_path", "pred_path",
-        "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa"
+        "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa",
+        "flat_psnr", "flat_ssim", "flat_lpips",
+        "edge_psnr", "edge_ssim", "edge_lpips",
+        "corner_psnr", "corner_ssim", "corner_lpips"
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -484,6 +677,15 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "maniqa": nanmean([r["maniqa"] for r in rows]),
             "musiq": nanmean([r["musiq"] for r in rows]),
             "clipiqa": nanmean([r["clipiqa"] for r in rows]),
+            "flat_psnr": nanmean([r["flat_psnr"] for r in rows]),
+            "flat_ssim": nanmean([r["flat_ssim"] for r in rows]),
+            "flat_lpips": nanmean([r["flat_lpips"] for r in rows]),
+            "edge_psnr": nanmean([r["edge_psnr"] for r in rows]),
+            "edge_ssim": nanmean([r["edge_ssim"] for r in rows]),
+            "edge_lpips": nanmean([r["edge_lpips"] for r in rows]),
+            "corner_psnr": nanmean([r["corner_psnr"] for r in rows]),
+            "corner_ssim": nanmean([r["corner_ssim"] for r in rows]),
+            "corner_lpips": nanmean([r["corner_lpips"] for r in rows]),
         }
     }
 
