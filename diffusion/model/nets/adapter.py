@@ -27,11 +27,8 @@ class SRConvNetLSAAdapter(nn.Module):
         self.proj3 = nn.Conv2d(256, 256, 1)
         self.proj4 = nn.Conv2d(256, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
-        self.cond_map_low = nn.Conv2d(128, self.hidden_size, 1)
-        self.cond_map_mid = nn.Conv2d(256, self.hidden_size, 1)
-        self.cond_map_high = nn.Conv2d(256, self.hidden_size, 1)
 
-        for m in [self.proj2, self.proj3, self.proj4, self.out_proj, self.cond_map_low, self.cond_map_mid, self.cond_map_high]:
+        for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
 
@@ -63,18 +60,9 @@ class SRConvNetLSAAdapter(nn.Module):
         cond_map = self.out_proj(base)
         cond_tokens = cond_map.flatten(2).transpose(1, 2)
 
-        cond_map_low = self.cond_map_low(f2_32)
-        cond_map_mid = self.cond_map_mid(f3)
-        cond_map_high = self.cond_map_high(f4)
-
         return {
             "cond_map": cond_map,
             "cond_tokens": cond_tokens,
-            "cond_maps": {
-                "low": cond_map_low,
-                "mid": cond_map_mid,
-                "high": cond_map_high,
-            },
         }
 
 

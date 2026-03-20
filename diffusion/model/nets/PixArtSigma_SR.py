@@ -81,11 +81,9 @@ class PixArtSigmaSR(PixArtMS):
 
         cond_tokens = None
         cond_map = None
-        cond_maps = None
         if isinstance(adapter_cond, dict):
             cond_tokens = adapter_cond.get("cond_tokens", None)
             cond_map = adapter_cond.get("cond_map", None)
-            cond_maps = adapter_cond.get("cond_maps", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -104,19 +102,8 @@ class PixArtSigmaSR(PixArtMS):
 
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
         cond_red = None
-        cond_red_low = None
-        cond_red_mid = None
-        cond_red_high = None
         if cond_map is not None:
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
-
-        if isinstance(cond_maps, dict):
-            if cond_maps.get("low", None) is not None:
-                cond_red_low = self.sft_cond_reduce(cond_maps["low"].to(dtype=x.dtype))
-            if cond_maps.get("mid", None) is not None:
-                cond_red_mid = self.sft_cond_reduce(cond_maps["mid"].to(dtype=x.dtype))
-            if cond_maps.get("high", None) is not None:
-                cond_red_high = self.sft_cond_reduce(cond_maps["high"].to(dtype=x.dtype))
 
         for i, block in enumerate(self.blocks):
             if cond_tokens is not None:
@@ -125,21 +112,12 @@ class PixArtSigmaSR(PixArtMS):
                 gate = torch.sigmoid(self.inject_gate[i]).to(dtype=x.dtype)
                 x = x + gate * res
 
-            cond_red_i = cond_red
-            if cond_red_low is not None and cond_red_mid is not None and cond_red_high is not None:
-                if i < self.depth // 3:
-                    cond_red_i = cond_red_low
-                elif i < (2 * self.depth) // 3:
-                    cond_red_i = cond_red_mid
-                else:
-                    cond_red_i = cond_red_high
-
-            if cond_red_i is not None:
+            if cond_red is not None:
                 b, n, c = x.shape
                 if n != self.h * self.w:
                     raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w} from input/patch rule")
                 x_map = x.transpose(1, 2).reshape(b, c, self.h, self.w)
-                x_map, scale, shift = self.sft_layers[i](x_map, cond_red_i)
+                x_map, scale, shift = self.sft_layers[i](x_map, cond_red)
                 sft_scale_means.append(float(scale.detach().float().mean().item()))
                 sft_scale_stds.append(float(scale.detach().float().std(unbiased=False).item()))
                 sft_shift_means.append(float(shift.detach().float().mean().item()))

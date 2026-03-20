@@ -449,32 +449,10 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
 
 
 def _extract_adapter_cond_stats(cond, adapter=None):
+    del cond, adapter
     gate_mean = 0.0
     gate_std = 0.0
     extra = {}
-
-    if isinstance(cond, dict):
-        cond_maps = cond.get("cond_maps", None)
-        if isinstance(cond_maps, dict):
-            for key in ("low", "mid", "high"):
-                if torch.is_tensor(cond_maps.get(key, None)):
-                    extra[f"{key}_abs"] = float(cond_maps[key].detach().float().abs().mean().item())
-
-        return gate_mean, gate_std, extra
-
-    if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
-        means = []
-        spatial_stds = []
-        for v in cond[2].values():
-            if torch.is_tensor(v):
-                flat = v.detach().float().reshape(v.shape[0], -1)
-                means.append(flat.mean(dim=1))
-                spatial_stds.append(flat.std(dim=1, unbiased=False))
-        if len(means) > 0:
-            gm = torch.stack(means, dim=0).mean(dim=0)
-            gs = torch.stack(spatial_stds, dim=0).mean(dim=0)
-            gate_mean = float(gm.mean().item())
-            gate_std = float(gs.mean().item())
     return gate_mean, gate_std, extra
 
 
@@ -738,7 +716,7 @@ def get_config_snapshot():
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights": "Lv+0.10LatL1+0.05LRcons+0.05GW",
-        "adapter_type": "SRConvNetLSAAdapter",
+        "adapter_type": "SRConvNetLSA",
         "seed": SEED,
         "cond_aug_noise_range": tuple(COND_AUG_NOISE_RANGE),
         "cond_aug_blur_prob": float(COND_AUG_BLUR_PROB),
@@ -1741,7 +1719,6 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
         cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
-        cond_low_abs, cond_mid_abs, cond_high_abs = [], [], []
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
@@ -1782,12 +1759,9 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                             alpha_means.append(float(np.mean(vals)))
                             alpha_stds.append(float(np.std(vals)))
 
-                    gm, gs, cond_extra = _extract_adapter_cond_stats(cond)
+                    gm, gs, _ = _extract_adapter_cond_stats(cond)
                     gate_means.append(gm)
                     gate_stds.append(gs)
-                    cond_low_abs.append(float(cond_extra.get('low_abs', 0.0)))
-                    cond_mid_abs.append(float(cond_extra.get('mid_abs', 0.0)))
-                    cond_high_abs.append(float(cond_extra.get('high_abs', 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", None)
                     if isinstance(sft_stats, dict):
@@ -1846,15 +1820,11 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         sft_ss = float(np.mean(sft_scale_stds)) if len(sft_scale_stds) > 0 else 0.0
         sft_shm = float(np.mean(sft_shift_means)) if len(sft_shift_means) > 0 else 0.0
         sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
-        c_low = float(np.mean(cond_low_abs)) if len(cond_low_abs) > 0 else 0.0
-        c_mid = float(np.mean(cond_mid_abs)) if len(cond_mid_abs) > 0 else 0.0
-        c_high = float(np.mean(cond_high_abs)) if len(cond_high_abs) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
             f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
             f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
-            f"c_low={c_low:.4f} | c_mid={c_mid:.4f} | c_high={c_high:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
@@ -2171,9 +2141,6 @@ def main():
                     'gate': f"{gate_mean:.3f}",
                     'sft_scale/std': f"{getattr(pixart, '_last_sft_stats', {}) and getattr(pixart, '_last_sft_stats', {}).get('sft_scale_std', 0.0):.3f}",
                     'sft_shift/std': f"{getattr(pixart, '_last_sft_stats', {}) and getattr(pixart, '_last_sft_stats', {}).get('sft_shift_std', 0.0):.3f}",
-                    'c_low': f"{cond_extra.get('low_abs', 0.0):.3f}",
-                    'c_mid': f"{cond_extra.get('mid_abs', 0.0):.3f}",
-                    'c_high': f"{cond_extra.get('high_abs', 0.0):.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
