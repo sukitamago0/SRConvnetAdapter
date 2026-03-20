@@ -133,8 +133,12 @@ HARD_INJECTION_LAYERS = [2, 4, 6, 8, 10, 12]
 TRANSITION_INJECTION_LAYERS = []
 DETAIL_INJECTION_LAYERS = [14, 16, 18, 20, 22, 24]
 
-# [V8 Augmentation]
-COND_AUG_NOISE_RANGE = (0.0, 0.0) 
+# Conditioning augmentation (Cascaded Diffusion Models style)
+# domain: lr_small in [-1, 1]
+COND_AUG_NOISE_RANGE = (0.0, 0.08)
+COND_AUG_BLUR_PROB = 0.50
+COND_AUG_BLUR_SIGMA_MAX = 1.20
+COND_AUG_BLUR_KERNELS = [3, 5]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -570,6 +574,51 @@ def mask_adapter_cond(cond, keep_mask: torch.Tensor):
 
     return _mask_obj(cond)
 
+
+@torch.cuda.amp.autocast(enabled=False)
+def apply_conditioning_augmentation(lr_small_m11: torch.Tensor, aug_noise_level: torch.Tensor) -> torch.Tensor:
+    """
+    Conditioning augmentation on adapter input only.
+    Input/output domain: [-1, 1]
+    aug_noise_level: shape [B], sampled from COND_AUG_NOISE_RANGE
+    """
+    x = lr_small_m11.float().clamp(-1.0, 1.0)
+    if aug_noise_level.ndim == 0:
+        aug_noise_level = aug_noise_level[None]
+
+    B = x.shape[0]
+    level = aug_noise_level.float().clamp(min=0.0).view(B, 1, 1, 1)
+
+    # 1) Gaussian noise
+    if float(level.max().item()) > 0:
+        noise = torch.randn_like(x)
+        x = x + noise * level
+
+    # 2) Mild Gaussian blur, strength tied to aug level
+    max_noise = float(max(COND_AUG_NOISE_RANGE[1], 1e-6))
+    if COND_AUG_BLUR_PROB > 0.0 and COND_AUG_BLUR_SIGMA_MAX > 0.0:
+        for b in range(B):
+            lv = float(aug_noise_level[b].item())
+            if lv <= 1e-8:
+                continue
+            if torch.rand((), device=x.device).item() < COND_AUG_BLUR_PROB:
+                sigma = (lv / max_noise) * float(COND_AUG_BLUR_SIGMA_MAX)
+                if sigma > 1e-6:
+                    k_idx = int(torch.randint(
+                        low=0,
+                        high=len(COND_AUG_BLUR_KERNELS),
+                        size=(1,),
+                        device=x.device
+                    ).item())
+                    k = int(COND_AUG_BLUR_KERNELS[k_idx])
+                    x[b] = TF.gaussian_blur(
+                        x[b],
+                        kernel_size=[k, k],
+                        sigma=[sigma, sigma]
+                    )
+
+    return x.clamp(-1.0, 1.0).to(dtype=lr_small_m11.dtype)
+
 def file_sha256(path):
     sha = hashlib.sha256()
     with open(path, "rb") as f:
@@ -689,10 +738,12 @@ def get_config_snapshot():
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights": "Lv+0.10LatL1+0.05LRcons+0.05GW",
-        "adapter_type": "SRConvNetLSA",
-        "adapter_mode": "StableSR-style multi-scale time-aware SFT",
-        "all_block_injection": True,
+        "adapter_type": "SRConvNetLSAAdapter",
         "seed": SEED,
+        "cond_aug_noise_range": tuple(COND_AUG_NOISE_RANGE),
+        "cond_aug_blur_prob": float(COND_AUG_BLUR_PROB),
+        "cond_aug_blur_sigma_max": float(COND_AUG_BLUR_SIGMA_MAX),
+        "cond_aug_blur_kernels": list(COND_AUG_BLUR_KERNELS),
     }
 
 
@@ -1982,18 +2033,21 @@ def main():
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             
-            runtime_cfg = {"cond_aug_noise_range": COND_AUG_NOISE_RANGE, "cond_drop_prob": COND_DROP_PROB}
+            runtime_cfg = {
+                "cond_aug_noise_range": COND_AUG_NOISE_RANGE,
+                "cond_drop_prob": COND_DROP_PROB,
+            }
 
-            # [V8 Logic] Conditioning Augmentation
-            # 1. Sample noise level for LR
+            # Conditioning augmentation (Cascaded Diffusion Models style)
             aug_low, aug_high = runtime_cfg["cond_aug_noise_range"]
             aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (aug_high - aug_low) + aug_low
-            # 2. (S2D) keep LR as structural image conditioning; only pass aug level embedding.
-            # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
             aug_level_emb = (aug_noise_level * 1000.0).float()
 
-            adapter_in = lr_small_b.to(DEVICE)
-            adapter_in = adapter_in.to(dtype=COMPUTE_DTYPE)
+            adapter_in = lr_small_b.to(DEVICE, dtype=COMPUTE_DTYPE)
+
+            # IMPORTANT: augment adapter input only
+            if (aug_high > 0.0) or (COND_AUG_BLUR_PROB > 0.0 and COND_AUG_BLUR_SIGMA_MAX > 0.0):
+                adapter_in = apply_conditioning_augmentation(adapter_in, aug_noise_level)
             with torch.no_grad():
                 t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
@@ -2112,6 +2166,7 @@ def main():
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'gw': f"{loss_gw.item():.3f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
+                    'cond_aug': f"{float(aug_noise_level.mean().item()):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                     'sft_scale/std': f"{getattr(pixart, '_last_sft_stats', {}) and getattr(pixart, '_last_sft_stats', {}).get('sft_scale_std', 0.0):.3f}",
