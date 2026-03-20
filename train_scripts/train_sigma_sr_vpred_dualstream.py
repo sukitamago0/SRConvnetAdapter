@@ -239,9 +239,6 @@ def get_fixed_loss_weights():
         "latent_l1": 0.10,
         "lr_cons": 0.05,
         "gw": 0.05,
-        "comp_bal": 0.05,
-        "comp_attn": 0.02,
-        "comp_is": 0.05,
     }
 
 
@@ -397,41 +394,6 @@ def component_balanced_recon_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor):
 
 
 @torch.cuda.amp.autocast(enabled=False)
-def build_component_target_prob(hr_m11: torch.Tensor, size_hw):
-    m_flat, m_edge, m_corner = build_component_masks_from_hr(hr_m11)
-    target = torch.cat([m_flat, m_edge, m_corner], dim=1).float()
-    target = F.interpolate(target, size=size_hw, mode="bilinear", align_corners=False)
-    target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    return target
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def soft_component_ce_loss(logits: torch.Tensor, target_prob: torch.Tensor):
-    logp = F.log_softmax(logits.float(), dim=1)
-    return -(target_prob * logp).sum(dim=1).mean()
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def component_intermediate_latent_loss(pred_dict: dict, target_latent: torch.Tensor, target_prob: torch.Tensor):
-    pred_flat = pred_dict["flat"].float()
-    pred_edge = pred_dict["edge"].float()
-    pred_corner = pred_dict["corner"].float()
-    if pred_flat.shape[-2:] != target_latent.shape[-2:]:
-        pred_flat = F.interpolate(pred_flat, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
-        pred_edge = F.interpolate(pred_edge, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
-        pred_corner = F.interpolate(pred_corner, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
-    loss_flat = masked_l1_normalized(pred_flat, target_latent, target_prob[:, 0:1])
-    loss_edge = masked_l1_normalized(pred_edge, target_latent, target_prob[:, 1:2])
-    loss_corner = masked_l1_normalized(pred_corner, target_latent, target_prob[:, 2:3])
-    loss_total = (loss_flat + loss_edge + loss_corner) / 3.0
-    return loss_total, {
-        "flat": loss_flat.detach(),
-        "edge": loss_edge.detach(),
-        "corner": loss_corner.detach(),
-    }
-# -------------------------------------------------------------------------------
-
-@torch.cuda.amp.autocast(enabled=False)
 def build_adapter_struct_input(lr_small_m11: torch.Tensor) -> torch.Tensor:
     # Keep as real lr_small tensor; no resize/back-projection from lr_up.
     return lr_small_m11.float().clamp(-1.0, 1.0)
@@ -488,17 +450,11 @@ def _extract_adapter_cond_stats(cond, adapter=None):
     extra = {}
 
     if isinstance(cond, dict):
-        if "comp_prob" in cond and torch.is_tensor(cond["comp_prob"]):
-            cp = cond["comp_prob"].detach().float()
-            extra["flat_p"] = float(cp[:, 0].mean().item())
-            extra["edge_p"] = float(cp[:, 1].mean().item())
-            extra["corner_p"] = float(cp[:, 2].mean().item())
-
-            ent = -(cp.clamp_min(1e-8) * cp.clamp_min(1e-8).log()).sum(dim=1).mean()
-            extra["comp_ent"] = float(ent.item())
-
-        if adapter is not None and hasattr(adapter, "comp_res_gain"):
-            extra["comp_gain"] = float(adapter.comp_res_gain.detach().float().item())
+        cond_maps = cond.get("cond_maps", None)
+        if isinstance(cond_maps, dict):
+            for key in ("low", "mid", "high"):
+                if torch.is_tensor(cond_maps.get(key, None)):
+                    extra[f"{key}_abs"] = float(cond_maps[key].detach().float().abs().mean().item())
 
         return gate_mean, gate_std, extra
 
@@ -732,8 +688,9 @@ def get_config_snapshot():
         "lora_rank": LORA_RANK,
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "loss_weights": "Lv+0.10L1+0.05LRcons+0.05GW",
+        "loss_weights": "Lv+0.10LatL1+0.05LRcons+0.05GW",
         "adapter_type": "SRConvNetLSA",
+        "adapter_mode": "StableSR-style multi-scale time-aware SFT",
         "all_block_injection": True,
         "seed": SEED,
     }
@@ -1733,6 +1690,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
         cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
+        cond_low_abs, cond_mid_abs, cond_high_abs = [], [], []
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
@@ -1773,9 +1731,12 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                             alpha_means.append(float(np.mean(vals)))
                             alpha_stds.append(float(np.std(vals)))
 
-                    gm, gs, _ = _extract_adapter_cond_stats(cond)
+                    gm, gs, cond_extra = _extract_adapter_cond_stats(cond)
                     gate_means.append(gm)
                     gate_stds.append(gs)
+                    cond_low_abs.append(float(cond_extra.get('low_abs', 0.0)))
+                    cond_mid_abs.append(float(cond_extra.get('mid_abs', 0.0)))
+                    cond_high_abs.append(float(cond_extra.get('high_abs', 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", None)
                     if isinstance(sft_stats, dict):
@@ -1834,11 +1795,15 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         sft_ss = float(np.mean(sft_scale_stds)) if len(sft_scale_stds) > 0 else 0.0
         sft_shm = float(np.mean(sft_shift_means)) if len(sft_shift_means) > 0 else 0.0
         sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
+        c_low = float(np.mean(cond_low_abs)) if len(cond_low_abs) > 0 else 0.0
+        c_mid = float(np.mean(cond_mid_abs)) if len(cond_mid_abs) > 0 else 0.0
+        c_high = float(np.mean(cond_high_abs)) if len(cond_high_abs) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
             f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
             f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
+            f"c_low={c_low:.4f} | c_mid={c_mid:.4f} | c_high={c_high:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
@@ -2067,27 +2032,7 @@ def main():
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
 
-                loss_comp_attn = torch.tensor(0.0, device=DEVICE)
-                loss_comp_is = torch.tensor(0.0, device=DEVICE)
-                is_flat_dbg = torch.tensor(0.0, device=DEVICE)
-                is_edge_dbg = torch.tensor(0.0, device=DEVICE)
-                is_corner_dbg = torch.tensor(0.0, device=DEVICE)
                 w = get_fixed_loss_weights()
-                if isinstance(cond, dict):
-                    if (w.get("comp_attn", 0.0) > 0) and ("comp_logits" in cond):
-                        target_prob_attn = build_component_target_prob(hr, cond["comp_logits"].shape[-2:])
-                        loss_comp_attn = soft_component_ce_loss(cond["comp_logits"], target_prob_attn)
-
-                    if (w.get("comp_is", 0.0) > 0) and ("comp_latent_preds" in cond):
-                        target_prob_lat = build_component_target_prob(hr, zh.shape[-2:])
-                        loss_comp_is, is_parts = component_intermediate_latent_loss(
-                            cond["comp_latent_preds"],
-                            zh.float(),
-                            target_prob_lat,
-                        )
-                        is_flat_dbg = is_parts["flat"]
-                        is_edge_dbg = is_parts["edge"]
-                        is_corner_dbg = is_parts["corner"]
 
                 latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
                 latent_l1_mask = (t <= int(LATENT_L1_T_MAX)).float()
@@ -2099,15 +2044,7 @@ def main():
                 # Calculate pixel-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
-                loss_comp_bal = torch.tensor(0.0, device=DEVICE)
-                loss_comp_attn = loss_comp_attn.to(device=DEVICE)
-                loss_comp_is = loss_comp_is.to(device=DEVICE)
-
-                comp_flat_dbg = torch.tensor(0.0, device=DEVICE)
-                comp_edge_dbg = torch.tensor(0.0, device=DEVICE)
-                comp_corner_dbg = torch.tensor(0.0, device=DEVICE)
-
-                need_pixel_loss = (w.get('lr_cons', 0.0) > 0) or (w.get('gw', 0.0) > 0) or (w.get('comp_bal', 0.0) > 0)
+                need_pixel_loss = (w.get('lr_cons', 0.0) > 0) or (w.get('gw', 0.0) > 0)
                 pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
                 allow_by_stage = True
                 pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
@@ -2135,11 +2072,6 @@ def main():
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
 
-                    if w.get('comp_bal', 0.0) > 0:
-                        loss_comp_bal, comp_parts = component_balanced_recon_loss(img_p_valid, img_t_valid)
-                        comp_flat_dbg = comp_parts["flat"]
-                        comp_edge_dbg = comp_parts["edge"]
-                        comp_corner_dbg = comp_parts["corner"]
                 else:
                     pixel_loss_num_samples = 0
 
@@ -2149,9 +2081,6 @@ def main():
                     + w['latent_l1'] * loss_latent_l1
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
-                    + w.get('comp_bal', 0.0) * loss_comp_bal
-                    + w.get('comp_attn', 0.0) * loss_comp_attn
-                    + w.get('comp_is', 0.0) * loss_comp_is
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2181,32 +2110,15 @@ def main():
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
-                    'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
-                    'comp': f"{loss_comp_bal.item():.3f}",
-                    'c_attn': f"{loss_comp_attn.item():.3f}",
-                    'c_is': f"{loss_comp_is.item():.3f}",
-                    'flat': f"{comp_flat_dbg.item():.3f}",
-                    'edge': f"{comp_edge_dbg.item():.3f}",
-                    'corner': f"{comp_corner_dbg.item():.3f}",
-                    'is_f': f"{is_flat_dbg.item():.3f}",
-                    'is_e': f"{is_edge_dbg.item():.3f}",
-                    'is_c': f"{is_corner_dbg.item():.3f}",
-                    'w_gw': f"{w.get('gw', 0.0):.3f}",
-                    'w_comp': f"{w.get('comp_bal', 0.0):.3f}",
-                    'w_attn': f"{w.get('comp_attn', 0.0):.3f}",
-                    'w_is': f"{w.get('comp_is', 0.0):.3f}",
-                    'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
-                    'px_n': f"{pixel_loss_num_samples}",
-                    'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
-                    'comp_gain': f"{cond_extra.get('comp_gain', 0.0):.3f}",
-                    'flat_p': f"{cond_extra.get('flat_p', 0.0):.3f}",
-                    'edge_p': f"{cond_extra.get('edge_p', 0.0):.3f}",
-                    'corner_p': f"{cond_extra.get('corner_p', 0.0):.3f}",
-                    'ent': f"{cond_extra.get('comp_ent', 0.0):.3f}",
+                    'sft_scale/std': f"{getattr(pixart, '_last_sft_stats', {}) and getattr(pixart, '_last_sft_stats', {}).get('sft_scale_std', 0.0):.3f}",
+                    'sft_shift/std': f"{getattr(pixart, '_last_sft_stats', {}) and getattr(pixart, '_last_sft_stats', {}).get('sft_shift_std', 0.0):.3f}",
+                    'c_low': f"{cond_extra.get('low_abs', 0.0):.3f}",
+                    'c_mid': f"{cond_extra.get('mid_abs', 0.0):.3f}",
+                    'c_high': f"{cond_extra.get('high_abs', 0.0):.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
