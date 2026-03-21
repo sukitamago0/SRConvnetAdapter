@@ -209,7 +209,7 @@ DUAL_NUM_HEADS = 16
 USE_STYLE_FUSION = False
 
 # Conservative KV-compress to reduce attention memory with minimal quality impact.
-KV_COMPRESS_ENABLE = True
+KV_COMPRESS_ENABLE = False
 KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
@@ -1944,7 +1944,7 @@ def main():
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
             cond_in = cond
-            cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
+            cond_drop_prob = float(COND_DROP_PROB)
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
                 keep = (torch.rand((zt.shape[0],), device=DEVICE) >= cond_drop_prob).float()
                 cond_in = mask_adapter_cond(cond, keep)
