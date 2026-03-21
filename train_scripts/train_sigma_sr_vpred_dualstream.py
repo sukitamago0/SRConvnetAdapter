@@ -96,7 +96,7 @@ NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth"
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss_lora16")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -119,8 +119,8 @@ GRAD_ACCUM_STEPS = 16
 NUM_WORKERS = 8
 
 LR_BASE = 1e-5 
-LORA_RANK = 4
-LORA_ALPHA = 4
+LORA_RANK = 16
+LORA_ALPHA = 16
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
@@ -132,13 +132,6 @@ INJECT_INIT_P = 2.0
 HARD_INJECTION_LAYERS = [2, 4, 6, 8, 10, 12]
 TRANSITION_INJECTION_LAYERS = []
 DETAIL_INJECTION_LAYERS = [14, 16, 18, 20, 22, 24]
-
-# Conditioning augmentation (Cascaded Diffusion Models style)
-# domain: lr_small in [-1, 1]
-COND_AUG_NOISE_RANGE = (0.0, 0.08)
-COND_AUG_BLUR_PROB = 0.50
-COND_AUG_BLUR_SIGMA_MAX = 1.20
-COND_AUG_BLUR_KERNELS = [3, 5]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -216,7 +209,7 @@ DUAL_NUM_HEADS = 16
 USE_STYLE_FUSION = False
 
 # Conservative KV-compress to reduce attention memory with minimal quality impact.
-KV_COMPRESS_ENABLE = False
+KV_COMPRESS_ENABLE = True
 KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
@@ -371,31 +364,7 @@ def gradient_weighted_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor, alpha: 
     dy = (gy_p - gy_h).abs()
     dgw = (1.0 + alpha * dx) * (1.0 + alpha * dy)
     return F.l1_loss(dgw * pred_m11.float(), dgw * hr_m11.float())
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def masked_l1_normalized(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6):
-    pred = pred_m11.float()
-    hr = hr_m11.float()
-    m = mask.float().clamp(0.0, 1.0)
-    diff = (pred - hr).abs() * m
-    denom = (m.sum() * pred.shape[1]).clamp_min(eps)
-    return diff.sum() / denom
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def component_balanced_recon_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor):
-    m_flat, m_edge, m_corner = build_component_masks_from_hr(hr_m11)
-    loss_flat = masked_l1_normalized(pred_m11, hr_m11, m_flat)
-    loss_edge = masked_l1_normalized(pred_m11, hr_m11, m_edge)
-    loss_corner = masked_l1_normalized(pred_m11, hr_m11, m_corner)
-    loss_total = (loss_flat + loss_edge + loss_corner) / 3.0
-    return loss_total, {
-        "flat": loss_flat.detach(),
-        "edge": loss_edge.detach(),
-        "corner": loss_corner.detach(),
-    }
-
+# -------------------------------------------------------------------------------
 
 @torch.cuda.amp.autocast(enabled=False)
 def build_adapter_struct_input(lr_small_m11: torch.Tensor) -> torch.Tensor:
@@ -448,12 +417,23 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
     return psnr_v, ssim_v, lpips_v
 
 
-def _extract_adapter_cond_stats(cond, adapter=None):
-    del cond, adapter
+def _extract_adapter_cond_stats(cond):
     gate_mean = 0.0
     gate_std = 0.0
-    extra = {}
-    return gate_mean, gate_std, extra
+    if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
+        means = []
+        spatial_stds = []
+        for v in cond[2].values():
+            if torch.is_tensor(v):
+                flat = v.detach().float().reshape(v.shape[0], -1)
+                means.append(flat.mean(dim=1))
+                spatial_stds.append(flat.std(dim=1, unbiased=False))
+        if len(means) > 0:
+            gm = torch.stack(means, dim=0).mean(dim=0)
+            gs = torch.stack(spatial_stds, dim=0).mean(dim=0)
+            gate_mean = float(gm.mean().item())
+            gate_std = float(gs.mean().item())
+    return gate_mean, gate_std
 
 
 def _extract_dual_gate_stats(pixart: nn.Module):
@@ -551,51 +531,6 @@ def mask_adapter_cond(cond, keep_mask: torch.Tensor):
         return x
 
     return _mask_obj(cond)
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def apply_conditioning_augmentation(lr_small_m11: torch.Tensor, aug_noise_level: torch.Tensor) -> torch.Tensor:
-    """
-    Conditioning augmentation on adapter input only.
-    Input/output domain: [-1, 1]
-    aug_noise_level: shape [B], sampled from COND_AUG_NOISE_RANGE
-    """
-    x = lr_small_m11.float().clamp(-1.0, 1.0)
-    if aug_noise_level.ndim == 0:
-        aug_noise_level = aug_noise_level[None]
-
-    B = x.shape[0]
-    level = aug_noise_level.float().clamp(min=0.0).view(B, 1, 1, 1)
-
-    # 1) Gaussian noise
-    if float(level.max().item()) > 0:
-        noise = torch.randn_like(x)
-        x = x + noise * level
-
-    # 2) Mild Gaussian blur, strength tied to aug level
-    max_noise = float(max(COND_AUG_NOISE_RANGE[1], 1e-6))
-    if COND_AUG_BLUR_PROB > 0.0 and COND_AUG_BLUR_SIGMA_MAX > 0.0:
-        for b in range(B):
-            lv = float(aug_noise_level[b].item())
-            if lv <= 1e-8:
-                continue
-            if torch.rand((), device=x.device).item() < COND_AUG_BLUR_PROB:
-                sigma = (lv / max_noise) * float(COND_AUG_BLUR_SIGMA_MAX)
-                if sigma > 1e-6:
-                    k_idx = int(torch.randint(
-                        low=0,
-                        high=len(COND_AUG_BLUR_KERNELS),
-                        size=(1,),
-                        device=x.device
-                    ).item())
-                    k = int(COND_AUG_BLUR_KERNELS[k_idx])
-                    x[b] = TF.gaussian_blur(
-                        x[b],
-                        kernel_size=[k, k],
-                        sigma=[sigma, sigma]
-                    )
-
-    return x.clamp(-1.0, 1.0).to(dtype=lr_small_m11.dtype)
 
 def file_sha256(path):
     sha = hashlib.sha256()
@@ -715,13 +650,10 @@ def get_config_snapshot():
         "lora_rank": LORA_RANK,
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "loss_weights": "Lv+0.10LatL1+0.05LRcons+0.05GW",
+        "loss_weights": "Lv+0.10L1+0.05LRcons+0.05GW",
         "adapter_type": "SRConvNetLSA",
+        "all_block_injection": True,
         "seed": SEED,
-        "cond_aug_noise_range": tuple(COND_AUG_NOISE_RANGE),
-        "cond_aug_blur_prob": float(COND_AUG_BLUR_PROB),
-        "cond_aug_blur_sigma_max": float(COND_AUG_BLUR_SIGMA_MAX),
-        "cond_aug_blur_kernels": list(COND_AUG_BLUR_KERNELS),
     }
 
 
@@ -1759,7 +1691,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                             alpha_means.append(float(np.mean(vals)))
                             alpha_stds.append(float(np.std(vals)))
 
-                    gm, gs, _ = _extract_adapter_cond_stats(cond)
+                    gm, gs = _extract_adapter_cond_stats(cond)
                     gate_means.append(gm)
                     gate_stds.append(gs)
 
@@ -2003,21 +1935,10 @@ def main():
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             
-            runtime_cfg = {
-                "cond_aug_noise_range": COND_AUG_NOISE_RANGE,
-                "cond_drop_prob": COND_DROP_PROB,
-            }
+            aug_level_emb = torch.zeros((zh.shape[0],), device=DEVICE, dtype=torch.float32)
 
-            # Conditioning augmentation (Cascaded Diffusion Models style)
-            aug_low, aug_high = runtime_cfg["cond_aug_noise_range"]
-            aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (aug_high - aug_low) + aug_low
-            aug_level_emb = (aug_noise_level * 1000.0).float()
-
-            adapter_in = lr_small_b.to(DEVICE, dtype=COMPUTE_DTYPE)
-
-            # IMPORTANT: augment adapter input only
-            if (aug_high > 0.0) or (COND_AUG_BLUR_PROB > 0.0 and COND_AUG_BLUR_SIGMA_MAX > 0.0):
-                adapter_in = apply_conditioning_augmentation(adapter_in, aug_noise_level)
+            adapter_in = lr_small_b.to(DEVICE)
+            adapter_in = adapter_in.to(dtype=COMPUTE_DTYPE)
             with torch.no_grad():
                 t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
@@ -2056,8 +1977,6 @@ def main():
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
 
-                w = get_fixed_loss_weights()
-
                 latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
                 latent_l1_mask = (t <= int(LATENT_L1_T_MAX)).float()
                 if float(latent_l1_mask.sum().item()) > 0:
@@ -2065,9 +1984,12 @@ def main():
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
+                w = get_fixed_loss_weights()
+                
                 # Calculate pixel-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
+
                 need_pixel_loss = (w.get('lr_cons', 0.0) > 0) or (w.get('gw', 0.0) > 0)
                 pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
                 allow_by_stage = True
@@ -2095,14 +2017,13 @@ def main():
 
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
-
                 else:
                     pixel_loss_num_samples = 0
 
                 inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
                 loss = (
-                    loss_v
-                    + w['latent_l1'] * loss_latent_l1
+                    loss_v 
+                    + w['latent_l1']*loss_latent_l1
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
                     + inject_reg
@@ -2129,18 +2050,20 @@ def main():
                     alpha_mean = float(np.mean([float(v) for v in a.values()]))
                 else:
                     alpha_mean = 0.0
-                gate_mean, _, cond_extra = _extract_adapter_cond_stats(cond_in, adapter)
+                gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
+                    'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
+                    'w_gw': f"{w.get('gw', 0.0):.3f}",
+                    'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
-                    'cond_aug': f"{float(aug_noise_level.mean().item()):.3f}",
+                    'px_n': f"{pixel_loss_num_samples}",
+                    'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
-                    'sft_scale/std': f"{getattr(pixart, '_last_sft_stats', {}) and getattr(pixart, '_last_sft_stats', {}).get('sft_scale_std', 0.0):.3f}",
-                    'sft_shift/std': f"{getattr(pixart, '_last_sft_stats', {}) and getattr(pixart, '_last_sft_stats', {}).get('sft_shift_std', 0.0):.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 

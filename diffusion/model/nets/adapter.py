@@ -55,9 +55,7 @@ class SRConvNetLSAAdapter(nn.Module):
         c2 = self.proj2(f2_32)
         c3 = self.proj3(f3)
         c4 = self.proj4(f4)
-
-        base = torch.cat([c2, c3, c4], dim=1)
-        cond_map = self.out_proj(base)
+        cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
         cond_tokens = cond_map.flatten(2).transpose(1, 2)
 
         return {
