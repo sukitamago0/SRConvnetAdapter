@@ -187,8 +187,9 @@ LR_CONS_WEIGHT_END = 0.02
 GW_WEIGHT_START = 0.05
 GW_WEIGHT_END = 0.02
 
-# For this experiment, choose best checkpoint by LPIPS first, PSNR tie-break
-CKPT_SELECT_MODE = "lpips_first"   # "psnr_first" | "lpips_first"
+# For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
+CKPT_SELECT_MODE = "psnr_gate_lpips"   # "psnr_first" | "lpips_first" | "psnr_gate_lpips"
+CKPT_SELECT_PSNR_GATE = 24.5
 
 USE_LR_CONSISTENCY = True 
 USE_NOISE_CONSISTENCY = False
@@ -711,6 +712,7 @@ def get_config_snapshot():
         "gw_start": GW_WEIGHT_START,
         "gw_end": GW_WEIGHT_END,
         "ckpt_select_mode": CKPT_SELECT_MODE,
+        "ckpt_select_psnr_gate": CKPT_SELECT_PSNR_GATE,
     }
 
 
@@ -1358,6 +1360,20 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
 def should_keep_ckpt(psnr_v, lpips_v):
     psnr_ok = math.isfinite(psnr_v)
     lpips_ok = math.isfinite(lpips_v)
+
+    if CKPT_SELECT_MODE == "psnr_gate_lpips":
+        if not psnr_ok:
+            return (999, float("inf"), float("inf"))
+
+        # before reaching PSNR gate: prioritize PSNR first
+        if float(psnr_v) < float(CKPT_SELECT_PSNR_GATE):
+            lp = float(lpips_v) if lpips_ok else float("inf")
+            return (0, -float(psnr_v), lp)
+
+        # after reaching PSNR gate: prioritize LPIPS first
+        if not lpips_ok:
+            return (999, float("inf"), float("inf"))
+        return (0, float(lpips_v), -float(psnr_v))
 
     if CKPT_SELECT_MODE == "lpips_first":
         if not lpips_ok:
