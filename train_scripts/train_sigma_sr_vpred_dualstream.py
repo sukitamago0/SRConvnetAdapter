@@ -96,7 +96,7 @@ NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth"
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss_lora16")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss_lora16_lpips")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -170,6 +170,26 @@ PIXEL_LOSS_T_MAX = 250
 # Structure-first schedule: start pixel-space supervision at Stage B boundary.
 LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
 
+# LPIPS perceptual curriculum (single-script, no separate stage script)
+USE_LPIPS_PERCEP = True
+LPIPS_START_EPOCH = 18
+LPIPS_RAMP_END_EPOCH = 30
+LPIPS_WEIGHT_MAX = 0.20
+LPIPS_T_MAX = 200
+
+# As LPIPS ramps in, old structure losses ramp down
+LATENT_L1_WEIGHT_START = 0.10
+LATENT_L1_WEIGHT_END = 0.03
+
+LR_CONS_WEIGHT_START = 0.05
+LR_CONS_WEIGHT_END = 0.02
+
+GW_WEIGHT_START = 0.05
+GW_WEIGHT_END = 0.02
+
+# For this experiment, choose best checkpoint by LPIPS first, PSNR tie-break
+CKPT_SELECT_MODE = "lpips_first"   # "psnr_first" | "lpips_first"
+
 USE_LR_CONSISTENCY = True 
 USE_NOISE_CONSISTENCY = False
 
@@ -230,13 +250,33 @@ PHASE0_NUM_SAMPLES = 4
 # ================= 3. Logic Functions =================
 
 
-def get_fixed_loss_weights():
+def _linear_ramp(epoch_1based: int, start_epoch: int, end_epoch: int) -> float:
+    if epoch_1based < start_epoch:
+        return 0.0
+    if epoch_1based >= end_epoch:
+        return 1.0
+    return float(epoch_1based - start_epoch) / float(max(1, end_epoch - start_epoch))
+
+
+def get_loss_weights(epoch_1based: int):
+    p = _linear_ramp(epoch_1based, LPIPS_START_EPOCH, LPIPS_RAMP_END_EPOCH) if USE_LPIPS_PERCEP else 0.0
+
+    latent_l1_w = LATENT_L1_WEIGHT_START + p * (LATENT_L1_WEIGHT_END - LATENT_L1_WEIGHT_START)
+    lr_cons_w = LR_CONS_WEIGHT_START + p * (LR_CONS_WEIGHT_END - LR_CONS_WEIGHT_START)
+    gw_w = GW_WEIGHT_START + p * (GW_WEIGHT_END - GW_WEIGHT_START)
+    lpips_w = p * LPIPS_WEIGHT_MAX if USE_LPIPS_PERCEP else 0.0
+
     return {
         "mse": 1.0,
-        "latent_l1": 0.10,
-        "lr_cons": 0.05,
-        "gw": 0.05,
+        "latent_l1": float(latent_l1_w),
+        "lr_cons": float(lr_cons_w),
+        "gw": float(gw_w),
+        "lpips": float(lpips_w),
     }
+
+
+def get_fixed_loss_weights(epoch_1based: int = 1):
+    return get_loss_weights(epoch_1based)
 
 
 def inject_reg_lambda(step: int) -> float:
@@ -392,6 +432,12 @@ def structure_consistency_loss(pred_m11: torch.Tensor, lr_m11: torch.Tensor) -> 
     l_low = F.avg_pool2d(l, kernel_size=5, stride=1, padding=2)
     loss_lowfreq = F.l1_loss(p_low, l_low)
     return 0.4 * loss_sobel + 0.4 * loss_lap + 0.2 * loss_lowfreq
+
+
+@torch.cuda.amp.autocast(enabled=False)
+def perceptual_lpips_loss(lpips_fn: nn.Module, pred_m11: torch.Tensor, target_m11: torch.Tensor) -> torch.Tensor:
+    # inputs are in [-1, 1]
+    return lpips_fn(pred_m11.float(), target_m11.float()).mean()
 
 
 def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask: torch.Tensor, lpips_fn_cpu: nn.Module):
@@ -651,10 +697,20 @@ def get_config_snapshot():
         "lora_alpha": float(LORA_ALPHA),
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "loss_weights": "Lv+0.10L1+0.05LRcons+0.05GW",
-        "adapter_type": "SRConvNetLSA",
-        "all_block_injection": True,
+        "loss_weights_mode": "epoch_ramp_lpips",
+        "adapter_type": "SRConvNetLSAAdapter",
         "seed": SEED,
+        "lpips_start_epoch": LPIPS_START_EPOCH,
+        "lpips_ramp_end_epoch": LPIPS_RAMP_END_EPOCH,
+        "lpips_weight_max": LPIPS_WEIGHT_MAX,
+        "lpips_t_max": LPIPS_T_MAX,
+        "latent_l1_start": LATENT_L1_WEIGHT_START,
+        "latent_l1_end": LATENT_L1_WEIGHT_END,
+        "lr_cons_start": LR_CONS_WEIGHT_START,
+        "lr_cons_end": LR_CONS_WEIGHT_END,
+        "gw_start": GW_WEIGHT_START,
+        "gw_end": GW_WEIGHT_END,
+        "ckpt_select_mode": CKPT_SELECT_MODE,
     }
 
 
@@ -1300,10 +1356,19 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
 
 # ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
-    # Main SR experiment: select best checkpoints by PSNR first, LPIPS as tie-breaker only.
-    if not math.isfinite(psnr_v):
+    psnr_ok = math.isfinite(psnr_v)
+    lpips_ok = math.isfinite(lpips_v)
+
+    if CKPT_SELECT_MODE == "lpips_first":
+        if not lpips_ok:
+            return (999, float("inf"), float("inf"))
+        ps = -float(psnr_v) if psnr_ok else float("inf")
+        return (0, float(lpips_v), ps)
+
+    # fallback: old behavior
+    if not psnr_ok:
         return (999, float("inf"), float("inf"))
-    lp = float(lpips_v) if math.isfinite(lpips_v) else float("inf")
+    lp = float(lpips_v) if lpips_ok else float("inf")
     return (0, -float(psnr_v), lp)
 
 def atomic_torch_save(state, path):
@@ -1858,8 +1923,11 @@ def main():
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
 
     lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
+    lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval()
     for p in vae.parameters(): p.requires_grad_(False)
     for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
+    for p in lpips_fn_train.parameters():
+        p.requires_grad_(False)
     print("✅ Validation LPIPS is on CPU.")
 
     if not os.path.exists(NULL_T5_EMBED_PATH):
@@ -1987,20 +2055,27 @@ def main():
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
-                w = get_fixed_loss_weights()
+                w = get_loss_weights(epoch + 1)
                 
-                # Calculate pixel-space losses
+                # Calculate patch-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
+                loss_lpips = torch.tensor(0.0, device=DEVICE)
 
-                need_pixel_loss = (w.get('lr_cons', 0.0) > 0) or (w.get('gw', 0.0) > 0)
-                pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
+                need_patch_loss = (
+                    (w.get('lr_cons', 0.0) > 0) or
+                    (w.get('gw', 0.0) > 0) or
+                    (w.get('lpips', 0.0) > 0)
+                )
+
+                PATCH_LOSS_T_MAX = max(int(PIXEL_LOSS_T_MAX), int(LPIPS_T_MAX))
+                patch_t_mask = (t <= PATCH_LOSS_T_MAX)
                 allow_by_stage = True
-                pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
-                calc_pixel_loss = need_pixel_loss and allow_by_stage and (pixel_loss_num_samples > 0)
+                patch_loss_num_samples = int(patch_t_mask.sum().item()) if allow_by_stage else 0
+                calc_patch_loss = need_patch_loss and allow_by_stage and (patch_loss_num_samples > 0)
 
-                if calc_pixel_loss:
-                    active_idx = torch.nonzero(pixel_t_mask, as_tuple=False).squeeze(1)
+                if calc_patch_loss:
+                    active_idx = torch.nonzero(patch_t_mask, as_tuple=False).squeeze(1)
                     top = torch.randint(0, 25, (1,), device=DEVICE).item()
                     left = torch.randint(0, 25, (1,), device=DEVICE).item()
                     z0_sel = z0.index_select(0, active_idx)
@@ -2020,15 +2095,25 @@ def main():
 
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
+
+                    if w.get('lpips', 0.0) > 0:
+                        patch_local_t = t.index_select(0, active_idx)
+                        lpips_keep = (patch_local_t <= int(LPIPS_T_MAX))
+                        if bool(lpips_keep.any().item()):
+                            lpips_idx = torch.nonzero(lpips_keep, as_tuple=False).squeeze(1)
+                            pred_lp = img_p_valid.index_select(0, lpips_idx)
+                            targ_lp = img_t_valid.index_select(0, lpips_idx)
+                            loss_lpips = perceptual_lpips_loss(lpips_fn_train, pred_lp, targ_lp)
                 else:
-                    pixel_loss_num_samples = 0
+                    patch_loss_num_samples = 0
 
                 inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
                 loss = (
-                    loss_v 
-                    + w['latent_l1']*loss_latent_l1
+                    loss_v
+                    + w['latent_l1'] * loss_latent_l1
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
+                    + w.get('lpips', 0.0) * loss_lpips
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2060,10 +2145,13 @@ def main():
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
+                    'lpips_tr': f"{loss_lpips.item():.3f}",
+                    'w_lpips': f"{w.get('lpips', 0.0):.3f}",
+                    'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
-                    'px_n': f"{pixel_loss_num_samples}",
+                    'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
