@@ -647,7 +647,8 @@ def get_config_snapshot():
     return {
         "batch_size": BATCH_SIZE,
         "lr_base": LR_BASE,
-        "lora_rank": LORA_RANK,
+        "lora_rank": int(LORA_RANK),
+        "lora_alpha": float(LORA_ALPHA),
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights": "Lv+0.10L1+0.05LRcons+0.05GW",
@@ -1400,6 +1401,8 @@ def save_smart(
         state = {
             "epoch": epoch,
             "step": global_step,
+            "lora_rank": int(LORA_RANK),
+            "lora_alpha": float(LORA_ALPHA),
             "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
             "optimizer": optimizer.state_dict(),
             "rng_state": {
