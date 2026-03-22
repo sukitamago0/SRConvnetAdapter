@@ -96,7 +96,7 @@ NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth"
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss_lora16_lpips")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -119,8 +119,8 @@ GRAD_ACCUM_STEPS = 16
 NUM_WORKERS = 8
 
 LR_BASE = 1e-5 
-LORA_RANK = 4
-LORA_ALPHA = 4
+LORA_RANK = 16
+LORA_ALPHA = 16
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
@@ -132,9 +132,6 @@ INJECT_INIT_P = 2.0
 HARD_INJECTION_LAYERS = [2, 4, 6, 8, 10, 12]
 TRANSITION_INJECTION_LAYERS = []
 DETAIL_INJECTION_LAYERS = [14, 16, 18, 20, 22, 24]
-
-# [V8 Augmentation]
-COND_AUG_NOISE_RANGE = (0.0, 0.0) 
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -172,6 +169,27 @@ INJECT_SCALE_REG_LAMBDA = 1e-4
 PIXEL_LOSS_T_MAX = 250
 # Structure-first schedule: start pixel-space supervision at Stage B boundary.
 LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
+
+# LPIPS perceptual curriculum (single-script, no separate stage script)
+USE_LPIPS_PERCEP = True
+LPIPS_START_EPOCH = 18
+LPIPS_RAMP_END_EPOCH = 30
+LPIPS_WEIGHT_MAX = 0.20
+LPIPS_T_MAX = 200
+
+# As LPIPS ramps in, old structure losses ramp down
+LATENT_L1_WEIGHT_START = 0.10
+LATENT_L1_WEIGHT_END = 0.03
+
+LR_CONS_WEIGHT_START = 0.05
+LR_CONS_WEIGHT_END = 0.02
+
+GW_WEIGHT_START = 0.05
+GW_WEIGHT_END = 0.02
+
+# For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
+CKPT_SELECT_MODE = "psnr_gate_lpips"   # "psnr_first" | "lpips_first" | "psnr_gate_lpips"
+CKPT_SELECT_PSNR_GATE = 24.5
 
 USE_LR_CONSISTENCY = True 
 USE_NOISE_CONSISTENCY = False
@@ -233,16 +251,33 @@ PHASE0_NUM_SAMPLES = 4
 # ================= 3. Logic Functions =================
 
 
-def get_fixed_loss_weights():
+def _linear_ramp(epoch_1based: int, start_epoch: int, end_epoch: int) -> float:
+    if epoch_1based < start_epoch:
+        return 0.0
+    if epoch_1based >= end_epoch:
+        return 1.0
+    return float(epoch_1based - start_epoch) / float(max(1, end_epoch - start_epoch))
+
+
+def get_loss_weights(epoch_1based: int):
+    p = _linear_ramp(epoch_1based, LPIPS_START_EPOCH, LPIPS_RAMP_END_EPOCH) if USE_LPIPS_PERCEP else 0.0
+
+    latent_l1_w = LATENT_L1_WEIGHT_START + p * (LATENT_L1_WEIGHT_END - LATENT_L1_WEIGHT_START)
+    lr_cons_w = LR_CONS_WEIGHT_START + p * (LR_CONS_WEIGHT_END - LR_CONS_WEIGHT_START)
+    gw_w = GW_WEIGHT_START + p * (GW_WEIGHT_END - GW_WEIGHT_START)
+    lpips_w = p * LPIPS_WEIGHT_MAX if USE_LPIPS_PERCEP else 0.0
+
     return {
         "mse": 1.0,
-        "latent_l1": 0.10,
-        "lr_cons": 0.05,
-        "gw": 0.05,
-        "comp_bal": 0.05,
-        "comp_attn": 0.02,
-        "comp_is": 0.05,
+        "latent_l1": float(latent_l1_w),
+        "lr_cons": float(lr_cons_w),
+        "gw": float(gw_w),
+        "lpips": float(lpips_w),
     }
+
+
+def get_fixed_loss_weights(epoch_1based: int = 1):
+    return get_loss_weights(epoch_1based)
 
 
 def inject_reg_lambda(step: int) -> float:
@@ -370,65 +405,6 @@ def gradient_weighted_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor, alpha: 
     dy = (gy_p - gy_h).abs()
     dgw = (1.0 + alpha * dx) * (1.0 + alpha * dy)
     return F.l1_loss(dgw * pred_m11.float(), dgw * hr_m11.float())
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def masked_l1_normalized(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6):
-    pred = pred_m11.float()
-    hr = hr_m11.float()
-    m = mask.float().clamp(0.0, 1.0)
-    diff = (pred - hr).abs() * m
-    denom = (m.sum() * pred.shape[1]).clamp_min(eps)
-    return diff.sum() / denom
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def component_balanced_recon_loss(pred_m11: torch.Tensor, hr_m11: torch.Tensor):
-    m_flat, m_edge, m_corner = build_component_masks_from_hr(hr_m11)
-    loss_flat = masked_l1_normalized(pred_m11, hr_m11, m_flat)
-    loss_edge = masked_l1_normalized(pred_m11, hr_m11, m_edge)
-    loss_corner = masked_l1_normalized(pred_m11, hr_m11, m_corner)
-    loss_total = (loss_flat + loss_edge + loss_corner) / 3.0
-    return loss_total, {
-        "flat": loss_flat.detach(),
-        "edge": loss_edge.detach(),
-        "corner": loss_corner.detach(),
-    }
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def build_component_target_prob(hr_m11: torch.Tensor, size_hw):
-    m_flat, m_edge, m_corner = build_component_masks_from_hr(hr_m11)
-    target = torch.cat([m_flat, m_edge, m_corner], dim=1).float()
-    target = F.interpolate(target, size=size_hw, mode="bilinear", align_corners=False)
-    target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    return target
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def soft_component_ce_loss(logits: torch.Tensor, target_prob: torch.Tensor):
-    logp = F.log_softmax(logits.float(), dim=1)
-    return -(target_prob * logp).sum(dim=1).mean()
-
-
-@torch.cuda.amp.autocast(enabled=False)
-def component_intermediate_latent_loss(pred_dict: dict, target_latent: torch.Tensor, target_prob: torch.Tensor):
-    pred_flat = pred_dict["flat"].float()
-    pred_edge = pred_dict["edge"].float()
-    pred_corner = pred_dict["corner"].float()
-    if pred_flat.shape[-2:] != target_latent.shape[-2:]:
-        pred_flat = F.interpolate(pred_flat, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
-        pred_edge = F.interpolate(pred_edge, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
-        pred_corner = F.interpolate(pred_corner, size=target_latent.shape[-2:], mode="bilinear", align_corners=False)
-    loss_flat = masked_l1_normalized(pred_flat, target_latent, target_prob[:, 0:1])
-    loss_edge = masked_l1_normalized(pred_edge, target_latent, target_prob[:, 1:2])
-    loss_corner = masked_l1_normalized(pred_corner, target_latent, target_prob[:, 2:3])
-    loss_total = (loss_flat + loss_edge + loss_corner) / 3.0
-    return loss_total, {
-        "flat": loss_flat.detach(),
-        "edge": loss_edge.detach(),
-        "corner": loss_corner.detach(),
-    }
 # -------------------------------------------------------------------------------
 
 @torch.cuda.amp.autocast(enabled=False)
@@ -459,6 +435,12 @@ def structure_consistency_loss(pred_m11: torch.Tensor, lr_m11: torch.Tensor) -> 
     return 0.4 * loss_sobel + 0.4 * loss_lap + 0.2 * loss_lowfreq
 
 
+@torch.cuda.amp.autocast(enabled=False)
+def perceptual_lpips_loss(lpips_fn: nn.Module, pred_m11: torch.Tensor, target_m11: torch.Tensor) -> torch.Tensor:
+    # inputs are in [-1, 1]
+    return lpips_fn(pred_m11.float(), target_m11.float()).mean()
+
+
 def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask: torch.Tensor, lpips_fn_cpu: nn.Module):
     pred_cpu = pred_m11.detach().to("cpu", dtype=torch.float32)
     hr_cpu = hr_m11.detach().to("cpu", dtype=torch.float32)
@@ -482,26 +464,9 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
     return psnr_v, ssim_v, lpips_v
 
 
-def _extract_adapter_cond_stats(cond, adapter=None):
+def _extract_adapter_cond_stats(cond):
     gate_mean = 0.0
     gate_std = 0.0
-    extra = {}
-
-    if isinstance(cond, dict):
-        if "comp_prob" in cond and torch.is_tensor(cond["comp_prob"]):
-            cp = cond["comp_prob"].detach().float()
-            extra["flat_p"] = float(cp[:, 0].mean().item())
-            extra["edge_p"] = float(cp[:, 1].mean().item())
-            extra["corner_p"] = float(cp[:, 2].mean().item())
-
-            ent = -(cp.clamp_min(1e-8) * cp.clamp_min(1e-8).log()).sum(dim=1).mean()
-            extra["comp_ent"] = float(ent.item())
-
-        if adapter is not None and hasattr(adapter, "comp_res_gain"):
-            extra["comp_gain"] = float(adapter.comp_res_gain.detach().float().item())
-
-        return gate_mean, gate_std, extra
-
     if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
         means = []
         spatial_stds = []
@@ -515,7 +480,7 @@ def _extract_adapter_cond_stats(cond, adapter=None):
             gs = torch.stack(spatial_stds, dim=0).mean(dim=0)
             gate_mean = float(gm.mean().item())
             gate_std = float(gs.mean().item())
-    return gate_mean, gate_std, extra
+    return gate_mean, gate_std
 
 
 def _extract_dual_gate_stats(pixart: nn.Module):
@@ -729,13 +694,25 @@ def get_config_snapshot():
     return {
         "batch_size": BATCH_SIZE,
         "lr_base": LR_BASE,
-        "lora_rank": LORA_RANK,
+        "lora_rank": int(LORA_RANK),
+        "lora_alpha": float(LORA_ALPHA),
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "loss_weights": "Lv+0.10L1+0.05LRcons+0.05GW",
-        "adapter_type": "SRConvNetLSA",
-        "all_block_injection": True,
+        "loss_weights_mode": "epoch_ramp_lpips",
+        "adapter_type": "SRConvNetLSAAdapter",
         "seed": SEED,
+        "lpips_start_epoch": LPIPS_START_EPOCH,
+        "lpips_ramp_end_epoch": LPIPS_RAMP_END_EPOCH,
+        "lpips_weight_max": LPIPS_WEIGHT_MAX,
+        "lpips_t_max": LPIPS_T_MAX,
+        "latent_l1_start": LATENT_L1_WEIGHT_START,
+        "latent_l1_end": LATENT_L1_WEIGHT_END,
+        "lr_cons_start": LR_CONS_WEIGHT_START,
+        "lr_cons_end": LR_CONS_WEIGHT_END,
+        "gw_start": GW_WEIGHT_START,
+        "gw_end": GW_WEIGHT_END,
+        "ckpt_select_mode": CKPT_SELECT_MODE,
+        "ckpt_select_psnr_gate": CKPT_SELECT_PSNR_GATE,
     }
 
 
@@ -1381,10 +1358,33 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
 
 # ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
-    # Main SR experiment: select best checkpoints by PSNR first, LPIPS as tie-breaker only.
-    if not math.isfinite(psnr_v):
+    psnr_ok = math.isfinite(psnr_v)
+    lpips_ok = math.isfinite(lpips_v)
+
+    if CKPT_SELECT_MODE == "psnr_gate_lpips":
+        if not psnr_ok:
+            return (999, float("inf"), float("inf"))
+
+        # before reaching PSNR gate: prioritize PSNR first
+        if float(psnr_v) < float(CKPT_SELECT_PSNR_GATE):
+            lp = float(lpips_v) if lpips_ok else float("inf")
+            return (0, -float(psnr_v), lp)
+
+        # after reaching PSNR gate: prioritize LPIPS first
+        if not lpips_ok:
+            return (999, float("inf"), float("inf"))
+        return (0, float(lpips_v), -float(psnr_v))
+
+    if CKPT_SELECT_MODE == "lpips_first":
+        if not lpips_ok:
+            return (999, float("inf"), float("inf"))
+        ps = -float(psnr_v) if psnr_ok else float("inf")
+        return (0, float(lpips_v), ps)
+
+    # fallback: old behavior
+    if not psnr_ok:
         return (999, float("inf"), float("inf"))
-    lp = float(lpips_v) if math.isfinite(lpips_v) else float("inf")
+    lp = float(lpips_v) if lpips_ok else float("inf")
     return (0, -float(psnr_v), lp)
 
 def atomic_torch_save(state, path):
@@ -1482,6 +1482,8 @@ def save_smart(
         state = {
             "epoch": epoch,
             "step": global_step,
+            "lora_rank": int(LORA_RANK),
+            "lora_alpha": float(LORA_ALPHA),
             "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
             "optimizer": optimizer.state_dict(),
             "rng_state": {
@@ -1773,7 +1775,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                             alpha_means.append(float(np.mean(vals)))
                             alpha_stds.append(float(np.std(vals)))
 
-                    gm, gs, _ = _extract_adapter_cond_stats(cond)
+                    gm, gs = _extract_adapter_cond_stats(cond)
                     gate_means.append(gm)
                     gate_stds.append(gs)
 
@@ -1937,8 +1939,11 @@ def main():
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
 
     lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
+    lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval()
     for p in vae.parameters(): p.requires_grad_(False)
     for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
+    for p in lpips_fn_train.parameters():
+        p.requires_grad_(False)
     print("✅ Validation LPIPS is on CPU.")
 
     if not os.path.exists(NULL_T5_EMBED_PATH):
@@ -2017,15 +2022,7 @@ def main():
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
             
-            runtime_cfg = {"cond_aug_noise_range": COND_AUG_NOISE_RANGE, "cond_drop_prob": COND_DROP_PROB}
-
-            # [V8 Logic] Conditioning Augmentation
-            # 1. Sample noise level for LR
-            aug_low, aug_high = runtime_cfg["cond_aug_noise_range"]
-            aug_noise_level = torch.rand(zh.shape[0], device=DEVICE) * (aug_high - aug_low) + aug_low
-            # 2. (S2D) keep LR as structural image conditioning; only pass aug level embedding.
-            # 3. Augmentation Level for embedding (mapped to 0-1000 for embedding)
-            aug_level_emb = (aug_noise_level * 1000.0).float()
+            aug_level_emb = torch.zeros((zh.shape[0],), device=DEVICE, dtype=torch.float32)
 
             adapter_in = lr_small_b.to(DEVICE)
             adapter_in = adapter_in.to(dtype=COMPUTE_DTYPE)
@@ -2034,7 +2031,7 @@ def main():
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
             cond_in = cond
-            cond_drop_prob = float(runtime_cfg["cond_drop_prob"])
+            cond_drop_prob = float(COND_DROP_PROB)
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
                 keep = (torch.rand((zt.shape[0],), device=DEVICE) >= cond_drop_prob).float()
                 cond_in = mask_adapter_cond(cond, keep)
@@ -2067,28 +2064,6 @@ def main():
                 # Reconstruct x0 for other losses (x0 = alpha * zt - sigma * v)
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
 
-                loss_comp_attn = torch.tensor(0.0, device=DEVICE)
-                loss_comp_is = torch.tensor(0.0, device=DEVICE)
-                is_flat_dbg = torch.tensor(0.0, device=DEVICE)
-                is_edge_dbg = torch.tensor(0.0, device=DEVICE)
-                is_corner_dbg = torch.tensor(0.0, device=DEVICE)
-                w = get_fixed_loss_weights()
-                if isinstance(cond, dict):
-                    if (w.get("comp_attn", 0.0) > 0) and ("comp_logits" in cond):
-                        target_prob_attn = build_component_target_prob(hr, cond["comp_logits"].shape[-2:])
-                        loss_comp_attn = soft_component_ce_loss(cond["comp_logits"], target_prob_attn)
-
-                    if (w.get("comp_is", 0.0) > 0) and ("comp_latent_preds" in cond):
-                        target_prob_lat = build_component_target_prob(hr, zh.shape[-2:])
-                        loss_comp_is, is_parts = component_intermediate_latent_loss(
-                            cond["comp_latent_preds"],
-                            zh.float(),
-                            target_prob_lat,
-                        )
-                        is_flat_dbg = is_parts["flat"]
-                        is_edge_dbg = is_parts["edge"]
-                        is_corner_dbg = is_parts["corner"]
-
                 latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
                 latent_l1_mask = (t <= int(LATENT_L1_T_MAX)).float()
                 if float(latent_l1_mask.sum().item()) > 0:
@@ -2096,25 +2071,27 @@ def main():
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
-                # Calculate pixel-space losses
+                w = get_loss_weights(epoch + 1)
+                
+                # Calculate patch-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
-                loss_comp_bal = torch.tensor(0.0, device=DEVICE)
-                loss_comp_attn = loss_comp_attn.to(device=DEVICE)
-                loss_comp_is = loss_comp_is.to(device=DEVICE)
+                loss_lpips = torch.tensor(0.0, device=DEVICE)
 
-                comp_flat_dbg = torch.tensor(0.0, device=DEVICE)
-                comp_edge_dbg = torch.tensor(0.0, device=DEVICE)
-                comp_corner_dbg = torch.tensor(0.0, device=DEVICE)
+                need_patch_loss = (
+                    (w.get('lr_cons', 0.0) > 0) or
+                    (w.get('gw', 0.0) > 0) or
+                    (w.get('lpips', 0.0) > 0)
+                )
 
-                need_pixel_loss = (w.get('lr_cons', 0.0) > 0) or (w.get('gw', 0.0) > 0) or (w.get('comp_bal', 0.0) > 0)
-                pixel_t_mask = (t <= int(PIXEL_LOSS_T_MAX))
+                PATCH_LOSS_T_MAX = max(int(PIXEL_LOSS_T_MAX), int(LPIPS_T_MAX))
+                patch_t_mask = (t <= PATCH_LOSS_T_MAX)
                 allow_by_stage = True
-                pixel_loss_num_samples = int(pixel_t_mask.sum().item()) if allow_by_stage else 0
-                calc_pixel_loss = need_pixel_loss and allow_by_stage and (pixel_loss_num_samples > 0)
+                patch_loss_num_samples = int(patch_t_mask.sum().item()) if allow_by_stage else 0
+                calc_patch_loss = need_patch_loss and allow_by_stage and (patch_loss_num_samples > 0)
 
-                if calc_pixel_loss:
-                    active_idx = torch.nonzero(pixel_t_mask, as_tuple=False).squeeze(1)
+                if calc_patch_loss:
+                    active_idx = torch.nonzero(patch_t_mask, as_tuple=False).squeeze(1)
                     top = torch.randint(0, 25, (1,), device=DEVICE).item()
                     left = torch.randint(0, 25, (1,), device=DEVICE).item()
                     z0_sel = z0.index_select(0, active_idx)
@@ -2135,13 +2112,16 @@ def main():
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
 
-                    if w.get('comp_bal', 0.0) > 0:
-                        loss_comp_bal, comp_parts = component_balanced_recon_loss(img_p_valid, img_t_valid)
-                        comp_flat_dbg = comp_parts["flat"]
-                        comp_edge_dbg = comp_parts["edge"]
-                        comp_corner_dbg = comp_parts["corner"]
+                    if w.get('lpips', 0.0) > 0:
+                        patch_local_t = t.index_select(0, active_idx)
+                        lpips_keep = (patch_local_t <= int(LPIPS_T_MAX))
+                        if bool(lpips_keep.any().item()):
+                            lpips_idx = torch.nonzero(lpips_keep, as_tuple=False).squeeze(1)
+                            pred_lp = img_p_valid.index_select(0, lpips_idx)
+                            targ_lp = img_t_valid.index_select(0, lpips_idx)
+                            loss_lpips = perceptual_lpips_loss(lpips_fn_train, pred_lp, targ_lp)
                 else:
-                    pixel_loss_num_samples = 0
+                    patch_loss_num_samples = 0
 
                 inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
                 loss = (
@@ -2149,9 +2129,7 @@ def main():
                     + w['latent_l1'] * loss_latent_l1
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
-                    + w.get('comp_bal', 0.0) * loss_comp_bal
-                    + w.get('comp_attn', 0.0) * loss_comp_attn
-                    + w.get('comp_is', 0.0) * loss_comp_is
+                    + w.get('lpips', 0.0) * loss_lpips
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2176,37 +2154,23 @@ def main():
                     alpha_mean = float(np.mean([float(v) for v in a.values()]))
                 else:
                     alpha_mean = 0.0
-                gate_mean, _, cond_extra = _extract_adapter_cond_stats(cond_in, adapter)
+                gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
-                    'comp': f"{loss_comp_bal.item():.3f}",
-                    'c_attn': f"{loss_comp_attn.item():.3f}",
-                    'c_is': f"{loss_comp_is.item():.3f}",
-                    'flat': f"{comp_flat_dbg.item():.3f}",
-                    'edge': f"{comp_edge_dbg.item():.3f}",
-                    'corner': f"{comp_corner_dbg.item():.3f}",
-                    'is_f': f"{is_flat_dbg.item():.3f}",
-                    'is_e': f"{is_edge_dbg.item():.3f}",
-                    'is_c': f"{is_corner_dbg.item():.3f}",
+                    'lpips_tr': f"{loss_lpips.item():.3f}",
+                    'w_lpips': f"{w.get('lpips', 0.0):.3f}",
+                    'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
-                    'w_comp': f"{w.get('comp_bal', 0.0):.3f}",
-                    'w_attn': f"{w.get('comp_attn', 0.0):.3f}",
-                    'w_is': f"{w.get('comp_is', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
-                    'px_n': f"{pixel_loss_num_samples}",
+                    'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
-                    'comp_gain': f"{cond_extra.get('comp_gain', 0.0):.3f}",
-                    'flat_p': f"{cond_extra.get('flat_p', 0.0):.3f}",
-                    'edge_p': f"{cond_extra.get('edge_p', 0.0):.3f}",
-                    'corner_p': f"{cond_extra.get('corner_p', 0.0):.3f}",
-                    'ent': f"{cond_extra.get('comp_ent', 0.0):.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 

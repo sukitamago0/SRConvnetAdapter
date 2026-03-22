@@ -146,6 +146,24 @@ def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context
     return missing, unexpected, skipped
 
 
+def infer_lora_rank_from_state_dict(state_dict: dict):
+    """
+    Infer LoRA rank from saved lora_A / lora_B tensors.
+    Returns int or None.
+    """
+    if not isinstance(state_dict, dict):
+        return None
+
+    for k, v in state_dict.items():
+        if not torch.is_tensor(v):
+            continue
+        if "lora_A" in k and v.ndim == 2:
+            return int(v.shape[0])
+        if "lora_B" in k and v.ndim == 2:
+            return int(v.shape[1])
+    return None
+
+
 
 def _block_id_from_name(name: str):
     m = re.search(r"blocks\.(\d+)\.", name)
@@ -458,14 +476,56 @@ def build_model_and_assets(args, device, compute_dtype):
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
+    cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
+
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in pixart_state.keys())
-    lora_rank = int(ckpt.get("lora_rank", 4))
-    lora_alpha = float(ckpt.get("lora_alpha", 4.0))
+
+    lora_rank = ckpt.get("lora_rank", None)
+    if lora_rank is None:
+        lora_rank = cfg.get("lora_rank", None)
+    if lora_rank is None and has_lora:
+        lora_rank = infer_lora_rank_from_state_dict(pixart_state)
+    if lora_rank is None:
+        lora_rank = 4
+    lora_rank = int(lora_rank)
+
+    lora_alpha = ckpt.get("lora_alpha", None)
+    if lora_alpha is None:
+        lora_alpha = cfg.get("lora_alpha", None)
+    if lora_alpha is None and has_lora:
+        lora_alpha = float(lora_rank)
+    if lora_alpha is None:
+        lora_alpha = 4.0
+    lora_alpha = float(lora_alpha)
+
     print(f"[Eval-Model] has_lora={has_lora} lora_rank={lora_rank} lora_alpha={lora_alpha}")
     if has_lora:
         apply_lora(pixart, lora_rank=lora_rank, lora_alpha=lora_alpha)
 
     load_state_dict_shape_compatible(pixart, pixart_state, context="eval")
+
+    loaded_lora_keys = []
+    skipped_lora_keys = []
+
+    for k, v in pixart_state.items():
+        if ("lora_A" in k) or ("lora_B" in k):
+            curr = pixart.state_dict()
+            if k in curr and tuple(curr[k].shape) == tuple(v.shape):
+                loaded_lora_keys.append(k)
+            else:
+                skipped_lora_keys.append(k)
+
+    print(
+        f"[LoRA Eval] requested rank={lora_rank}, alpha={lora_alpha}, "
+        f"saved_lora_tensors={len([k for k in pixart_state if ('lora_A' in k) or ('lora_B' in k)])}, "
+        f"shape_compatible={len(loaded_lora_keys)}, skipped={len(skipped_lora_keys)}"
+    )
+
+    if has_lora and len(loaded_lora_keys) == 0:
+        raise RuntimeError(
+            "Checkpoint contains LoRA weights, but none of them are shape-compatible with the eval model. "
+            "This usually means the eval script rebuilt LoRA with the wrong rank/alpha."
+        )
 
     adapter = build_adapter_v7(
         in_channels=3,

@@ -28,35 +28,7 @@ class SRConvNetLSAAdapter(nn.Module):
         self.proj4 = nn.Conv2d(256, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
 
-        self.comp_mask_head = nn.Sequential(
-            nn.Conv2d(768, 128, 3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(128, 3, 1),
-        )
-
-        self.comp_cond_flat = nn.Conv2d(768, self.hidden_size, 1)
-        self.comp_cond_edge = nn.Conv2d(768, self.hidden_size, 1)
-        self.comp_cond_corner = nn.Conv2d(768, self.hidden_size, 1)
-
-        self.comp_latent_flat = nn.Conv2d(768, 4, 1)
-        self.comp_latent_edge = nn.Conv2d(768, 4, 1)
-        self.comp_latent_corner = nn.Conv2d(768, 4, 1)
-
-        self.comp_res_gain = nn.Parameter(torch.tensor(0.0))
-
         for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
-            nn.init.normal_(m.weight, mean=0.0, std=1e-3)
-            nn.init.zeros_(m.bias)
-
-        nn.init.kaiming_normal_(self.comp_mask_head[0].weight, a=0.1, mode="fan_in", nonlinearity="leaky_relu")
-        nn.init.zeros_(self.comp_mask_head[0].bias)
-        nn.init.zeros_(self.comp_mask_head[2].weight)
-        nn.init.zeros_(self.comp_mask_head[2].bias)
-
-        for m in [
-            self.comp_cond_flat, self.comp_cond_edge, self.comp_cond_corner,
-            self.comp_latent_flat, self.comp_latent_edge, self.comp_latent_corner,
-        ]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
 
@@ -83,42 +55,12 @@ class SRConvNetLSAAdapter(nn.Module):
         c2 = self.proj2(f2_32)
         c3 = self.proj3(f3)
         c4 = self.proj4(f4)
-
-        base = torch.cat([c2, c3, c4], dim=1)
-        base_cond = self.out_proj(base)
-
-        comp_logits = self.comp_mask_head(base)
-        comp_prob = torch.softmax(comp_logits, dim=1)
-
-        m_flat = comp_prob[:, 0:1]
-        m_edge = comp_prob[:, 1:2]
-        m_corner = comp_prob[:, 2:3]
-
-        base_flat = base * m_flat
-        base_edge = base * m_edge
-        base_corner = base * m_corner
-
-        comp_cond_res = (
-            self.comp_cond_flat(base_flat)
-            + self.comp_cond_edge(base_edge)
-            + self.comp_cond_corner(base_corner)
-        )
-
-        cond_map = base_cond + self.comp_res_gain.to(dtype=base_cond.dtype) * comp_cond_res
+        cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
         cond_tokens = cond_map.flatten(2).transpose(1, 2)
-
-        comp_latent_preds = {
-            "flat": self.comp_latent_flat(base_flat),
-            "edge": self.comp_latent_edge(base_edge),
-            "corner": self.comp_latent_corner(base_corner),
-        }
 
         return {
             "cond_map": cond_map,
             "cond_tokens": cond_tokens,
-            "comp_logits": comp_logits,
-            "comp_prob": comp_prob,
-            "comp_latent_preds": comp_latent_preds,
         }
 
 
