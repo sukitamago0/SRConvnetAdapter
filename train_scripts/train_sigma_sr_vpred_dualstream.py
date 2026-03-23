@@ -196,12 +196,14 @@ BEST_PSNR_PATH = os.path.join(CKPT_DIR, "best_psnr.pth")
 BEST_LPIPS_GATE_PATH = os.path.join(CKPT_DIR, "best_lpips_gate.pth")
 
 USE_SED_GAN = True
-SED_GAN_WEIGHT = 0.01
+SED_GAN_WEIGHT_MAX = 0.01
+SED_GAN_RAMP_STEPS = 2000
+ADV_PSNR_GATE = 25.5
 SED_D_UPDATE_RATIO = 1
-SED_WARMUP_STEPS = 500
 SED_PATCH_GRID = 25
 SED_PATCH_LATENT = 40
 SED_PATCH_VALID = 256
+SED_PATCH_CANDIDATES = 4
 
 USE_LR_CONSISTENCY = True 
 USE_NOISE_CONSISTENCY = False
@@ -296,18 +298,38 @@ def gan_bce_loss(logits: torch.Tensor, target_is_real: bool) -> torch.Tensor:
 
 
 @torch.no_grad()
-def sample_hard_patch_coords(hr_m11: torch.Tensor):
+def sample_hard_patch_coords(hr_m11: torch.Tensor, pred_valid: torch.Tensor, gt_valid: torch.Tensor, num_candidates: int = SED_PATCH_CANDIDATES):
     gray = _to_luma01(hr_m11)
     gx = F.conv2d(gray, _SOBEL_X.to(device=gray.device), padding=1)
     gy = F.conv2d(gray, _SOBEL_Y.to(device=gray.device), padding=1)
-    hard_map = torch.sqrt(gx * gx + gy * gy + 1e-6)
-    pooled = F.avg_pool2d(hard_map, kernel_size=SED_PATCH_VALID, stride=8)
-    flat = pooled.flatten(1)
-    idx = flat.argmax(dim=1)
-    grid_w = pooled.shape[-1]
-    top = (idx // grid_w).tolist()
-    left = (idx % grid_w).tolist()
-    return top, left
+    grad_map = torch.sqrt(gx * gx + gy * gy + 1e-6)
+    corner_map = _harris_response(gray)
+    residual_map = (pred_valid.float() - gt_valid.float()).abs().mean(dim=1, keepdim=True)
+
+    grad_score = F.avg_pool2d(grad_map, kernel_size=SED_PATCH_VALID, stride=8)
+    corner_score = F.avg_pool2d(corner_map, kernel_size=SED_PATCH_VALID, stride=8)
+    residual_score = F.avg_pool2d(residual_map, kernel_size=1, stride=1)
+    score = 0.5 * grad_score + 0.2 * corner_score + 0.3 * residual_score
+
+    b, _, gh, gw = score.shape
+    flat = score.flatten(1)
+    k = min(max(1, int(num_candidates)), flat.shape[1])
+    topk_idx = torch.topk(flat, k=k, dim=1).indices
+    choice = torch.randint(0, k, (b,), device=score.device)
+    candidate_idx = topk_idx[torch.arange(b, device=score.device), choice]
+    candidate_scores = flat.gather(1, topk_idx)
+    best_within = candidate_scores.argmax(dim=1)
+    final_idx = topk_idx[torch.arange(b, device=score.device), best_within]
+    top = (final_idx // gw).tolist()
+    left = (final_idx % gw).tolist()
+    return top, left, score
+
+
+def get_adv_weight(step: int, adv_gate_opened: bool, adv_gate_open_step):
+    if (not adv_gate_opened) or (adv_gate_open_step is None):
+        return 0.0
+    p = min(1.0, max(0.0, float(step - adv_gate_open_step) / float(max(1, SED_GAN_RAMP_STEPS))))
+    return p * float(SED_GAN_WEIGHT_MAX)
 
 
 def decode_valid_patch_from_latent(vae, z0_latent: torch.Tensor, top: int, left: int) -> torch.Tensor:
@@ -734,13 +756,10 @@ def get_config_snapshot():
         "lora_alpha": float(LORA_ALPHA),
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "loss_weights_mode": "epoch_ramp_lpips",
+        "loss_weights_mode": "fixed_sft_gw_sed_gate",
         "adapter_type": "SRConvNetLSAAdapter",
         "seed": SEED,
-        "lpips_start_epoch": LPIPS_START_EPOCH,
-        "lpips_ramp_end_epoch": LPIPS_RAMP_END_EPOCH,
-        "lpips_weight_max": LPIPS_WEIGHT_MAX,
-        "lpips_t_max": LPIPS_T_MAX,
+        "lpips_enabled": bool(USE_LPIPS_PERCEP),
         "latent_l1_start": LATENT_L1_WEIGHT_START,
         "latent_l1_end": LATENT_L1_WEIGHT_END,
         "lr_cons_start": LR_CONS_WEIGHT_START,
@@ -749,6 +768,9 @@ def get_config_snapshot():
         "gw_end": GW_WEIGHT_END,
         "ckpt_select_mode": CKPT_SELECT_MODE,
         "ckpt_select_psnr_gate": CKPT_SELECT_PSNR_GATE,
+        "adv_psnr_gate": ADV_PSNR_GATE,
+        "sed_gan_weight_max": SED_GAN_WEIGHT_MAX,
+        "sed_gan_ramp_steps": SED_GAN_RAMP_STEPS,
     }
 
 
@@ -1563,7 +1585,23 @@ def save_smart(
         }
         return state
 
-    next_best_records = [current_record] if save_as_best else list(best_records)
+    best_meta = dict(best_records[0]) if best_records else {}
+    best_psnr = float(best_meta.get("best_psnr", -float("inf")))
+    best_lpips = float(best_meta.get("best_lpips_gate", float("inf")))
+    if math.isfinite(psnr_v) and psnr_v > best_psnr:
+        best_psnr = float(psnr_v)
+        current_record["best_psnr_step"] = int(global_step)
+    else:
+        current_record["best_psnr_step"] = int(best_meta.get("best_psnr_step", global_step if best_psnr > -float("inf") else -1))
+    if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v < best_lpips:
+        best_lpips = float(lpips_v)
+        current_record["best_lpips_gate_step"] = int(global_step)
+    else:
+        current_record["best_lpips_gate_step"] = int(best_meta.get("best_lpips_gate_step", global_step if math.isfinite(best_lpips) else -1))
+    current_record["best_psnr"] = float(best_psnr)
+    current_record["best_lpips_gate"] = float(best_lpips)
+
+    next_best_records = [current_record] if save_as_best else [dict(best_meta, **current_record)] if best_records else [current_record]
 
     # Always save full training-state checkpoint for resume
     state_last = _build_state_dict_snapshot(checkpoint_role="last")
@@ -1577,7 +1615,6 @@ def save_smart(
 
     best_saved = False
     if save_as_best:
-        # best: full training-state archive (resume-capable)
         state_best_train = _build_state_dict_snapshot(checkpoint_role="best")
         state_best_train["best_records"] = next_best_records
         ok_train, msg_train = atomic_torch_save(state_best_train, best_ckpt_path)
@@ -1587,22 +1624,14 @@ def save_smart(
         else:
             print(f"❌ Failed to save best checkpoint: {msg_train}")
 
-    best_psnr = best_records[0].get("best_psnr", -float("inf")) if best_records else -float("inf")
-    best_lpips = best_records[0].get("best_lpips_gate", float("inf")) if best_records else float("inf")
-    if math.isfinite(psnr_v) and psnr_v > best_psnr:
+    if math.isfinite(psnr_v) and psnr_v >= current_record["best_psnr"]:
         state_psnr = _build_state_dict_snapshot(checkpoint_role="best_psnr")
         state_psnr["best_records"] = next_best_records
         atomic_torch_save(state_psnr, BEST_PSNR_PATH)
-        current_record["best_psnr"] = float(psnr_v)
-    else:
-        current_record["best_psnr"] = float(best_psnr)
-    if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v < best_lpips:
+    if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v <= current_record["best_lpips_gate"]:
         state_lp = _build_state_dict_snapshot(checkpoint_role="best_lpips_gate")
         state_lp["best_records"] = next_best_records
         atomic_torch_save(state_lp, BEST_LPIPS_GATE_PATH)
-        current_record["best_lpips_gate"] = float(lpips_v)
-    else:
-        current_record["best_lpips_gate"] = float(best_lpips)
 
     # remove legacy rolling-best artifacts from older runs to keep CKPT_DIR clean
     if best_saved:
@@ -2081,6 +2110,9 @@ def main():
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
+    adv_gate_opened = False
+    adv_gate_open_step = None
+    last_val_psnr = -1.0
 
     for epoch in range(ep_start, 1000):
         if max_steps is not None and step >= max_steps: break
@@ -2161,6 +2193,7 @@ def main():
                 loss_g_adv = torch.tensor(0.0, device=DEVICE)
                 loss_d_real = torch.tensor(0.0, device=DEVICE)
                 loss_d_fake = torch.tensor(0.0, device=DEVICE)
+                w_adv = 0.0
 
                 need_patch_loss = (
                     (w.get('lr_cons', 0.0) > 0) or
@@ -2179,17 +2212,41 @@ def main():
                     z0_sel = z0.index_select(0, active_idx)
                     hr_sel = hr.index_select(0, active_idx)
                     lr_sel = lr.index_select(0, active_idx)
-                    tops, lefts = sample_hard_patch_coords(hr_sel)
-                    img_p_valid = torch.cat([decode_valid_patch_from_latent(vae, z0_sel[bi:bi+1], int(top), int(left))
-                                             for bi, (top, left) in enumerate(zip(tops, lefts))], dim=0)
-                    img_t_valid = torch.cat([
-                        hr_sel[bi:bi+1, ..., int(top) * 8 + 32:int(top) * 8 + 32 + 256, int(left) * 8 + 32:int(left) * 8 + 32 + 256].clamp(-1, 1)
-                        for bi, (top, left) in enumerate(zip(tops, lefts))
-                    ], dim=0)
-                    lr_patch = torch.cat([
-                        lr_sel[bi:bi+1, ..., int(top) * 8 + 32:int(top) * 8 + 32 + 256, int(left) * 8 + 32:int(left) * 8 + 32 + 256].clamp(-1, 1)
-                        for bi, (top, left) in enumerate(zip(tops, lefts))
-                    ], dim=0)
+                    candidate_tops = []
+                    candidate_lefts = []
+                    candidate_pred = []
+                    candidate_gt = []
+                    candidate_lr = []
+                    for _ in range(SED_PATCH_CANDIDATES):
+                        rand_top = torch.randint(0, SED_PATCH_GRID, (z0_sel.shape[0],), device=DEVICE)
+                        rand_left = torch.randint(0, SED_PATCH_GRID, (z0_sel.shape[0],), device=DEVICE)
+                        pred_k = torch.cat([decode_valid_patch_from_latent(vae, z0_sel[bi:bi+1], int(rand_top[bi]), int(rand_left[bi])) for bi in range(z0_sel.shape[0])], dim=0)
+                        gt_k = torch.cat([
+                            hr_sel[bi:bi+1, ..., int(rand_top[bi]) * 8 + 32:int(rand_top[bi]) * 8 + 32 + 256, int(rand_left[bi]) * 8 + 32:int(rand_left[bi]) * 8 + 32 + 256].clamp(-1, 1)
+                            for bi in range(z0_sel.shape[0])
+                        ], dim=0)
+                        lr_k = torch.cat([
+                            lr_sel[bi:bi+1, ..., int(rand_top[bi]) * 8 + 32:int(rand_top[bi]) * 8 + 32 + 256, int(rand_left[bi]) * 8 + 32:int(rand_left[bi]) * 8 + 32 + 256].clamp(-1, 1)
+                            for bi in range(z0_sel.shape[0])
+                        ], dim=0)
+                        candidate_tops.append(rand_top)
+                        candidate_lefts.append(rand_left)
+                        candidate_pred.append(pred_k)
+                        candidate_gt.append(gt_k)
+                        candidate_lr.append(lr_k)
+                    stacked_pred = torch.stack(candidate_pred, dim=1)
+                    stacked_gt = torch.stack(candidate_gt, dim=1)
+                    stacked_lr = torch.stack(candidate_lr, dim=1)
+                    score_list = []
+                    for k in range(SED_PATCH_CANDIDATES):
+                        _, _, score_map = sample_hard_patch_coords(hr_sel, stacked_pred[:, k], stacked_gt[:, k], num_candidates=1)
+                        sel_score = score_map[torch.arange(score_map.shape[0], device=DEVICE), :, candidate_tops[k], candidate_lefts[k]].view(-1)
+                        score_list.append(sel_score)
+                    score_stack = torch.stack(score_list, dim=1)
+                    best_k = score_stack.argmax(dim=1)
+                    img_p_valid = stacked_pred[torch.arange(stacked_pred.shape[0], device=DEVICE), best_k]
+                    img_t_valid = stacked_gt[torch.arange(stacked_gt.shape[0], device=DEVICE), best_k]
+                    lr_patch = stacked_lr[torch.arange(stacked_lr.shape[0], device=DEVICE), best_k]
 
                     if w.get('lr_cons', 0.0) > 0:
                         loss_lr_cons = structure_consistency_loss(img_p_valid, lr_patch)
@@ -2206,7 +2263,8 @@ def main():
                             targ_lp = img_t_valid.index_select(0, lpips_idx)
                             loss_lpips = perceptual_lpips_loss(lpips_fn_train, pred_lp, targ_lp)
 
-                    if USE_SED_GAN and discriminator is not None and optimizer_d is not None and step >= SED_WARMUP_STEPS:
+                    w_adv = get_adv_weight(step, adv_gate_opened, adv_gate_open_step)
+                    if USE_SED_GAN and discriminator is not None and optimizer_d is not None and adv_gate_opened and w_adv > 0.0:
                         with torch.no_grad():
                             hr_semantic = semantic_extractor((img_t_valid.float() + 1.0) * 0.5)
                         for p in discriminator.parameters():
@@ -2232,7 +2290,7 @@ def main():
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
                     + w.get('lpips', 0.0) * loss_lpips
-                    + (SED_GAN_WEIGHT * loss_g_adv if USE_SED_GAN else 0.0)
+                    + (w_adv * loss_g_adv if USE_SED_GAN else 0.0)
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2277,6 +2335,9 @@ def main():
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
+                    'gate_on': f"{int(adv_gate_opened)}",
+                    'w_adv': f"{w_adv:.4f}",
+                    'val_psnr': f"{last_val_psnr:.2f}",
                     'g_adv': f"{loss_g_adv.item():.3f}",
                     'd_r': f"{loss_d_real.item():.3f}",
                     'd_f': f"{loss_d_fake.item():.3f}",
@@ -2340,6 +2401,11 @@ def main():
         )
 
         print(f"[SingleStage] val_psnr={float(best_eval_metrics_this_round[0]):.3f}")
+        last_val_psnr = float(raw_metrics[0])
+        if (not adv_gate_opened) and (last_val_psnr >= float(ADV_PSNR_GATE)):
+            adv_gate_opened = True
+            adv_gate_open_step = int(step)
+            print(f"[ADV_GATE] opened at step={step}, psnr={last_val_psnr:.4f}")
 
         best = save_smart(
             epoch,
