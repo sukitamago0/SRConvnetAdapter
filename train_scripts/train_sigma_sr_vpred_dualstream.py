@@ -1487,6 +1487,9 @@ def save_smart(
     eval_tag: str = "",
     export_eval_weights: bool = True,
     ema_named_params=None,
+    adv_gate_opened: bool = False,
+    adv_gate_open_step=None,
+    last_val_psnr: float = -1.0,
 ):
     global BASE_PIXART_SHA256
     eval_source = str(eval_source).lower()
@@ -1571,6 +1574,9 @@ def save_smart(
             "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
             "checkpoint_role": str(checkpoint_role),
             "discriminator": ({k: v.detach().float().cpu() for k, v in discriminator.state_dict().items()} if discriminator is not None else None),
+            "adv_gate_opened": bool(adv_gate_opened),
+            "adv_gate_open_step": (None if adv_gate_open_step is None else int(adv_gate_open_step)),
+            "last_val_psnr": float(last_val_psnr),
             "best_eval_source": source_tag,
             "best_eval_steps": int(eval_steps),
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
@@ -1601,7 +1607,9 @@ def save_smart(
     current_record["best_psnr"] = float(best_psnr)
     current_record["best_lpips_gate"] = float(best_lpips)
 
-    next_best_records = [current_record] if save_as_best else [dict(best_meta, **current_record)] if best_records else [current_record]
+    merged_record = dict(best_meta)
+    merged_record.update(current_record)
+    next_best_records = [current_record] if save_as_best else [merged_record]
 
     # Always save full training-state checkpoint for resume
     state_last = _build_state_dict_snapshot(checkpoint_role="last")
@@ -1643,7 +1651,7 @@ def save_smart(
                         os.remove(stale)
                     except Exception:
                         pass
-    return next_best_records if save_as_best else best_records
+    return next_best_records
 
 
 
@@ -1712,7 +1720,7 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
 
 def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None, discriminator=None, optimizer_d=None):
     if not os.path.exists(LAST_CKPT_PATH):
-        return 0, 0, [], None
+        return 0, 0, [], None, False, None, -1.0
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
     ckpt_role = str(ckpt.get("checkpoint_role", "last"))
@@ -1775,7 +1783,11 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None, 
             print(f"✅ EMA restored: {len(ema.shadow)} tensors")
         else:
             print("ℹ️ EMA state not found in checkpoint; proceeding without EMA restore.")
-    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), None
+    adv_gate_opened = bool(ckpt.get("adv_gate_opened", False))
+    adv_gate_open_step = ckpt.get("adv_gate_open_step", None)
+    adv_gate_open_step = None if adv_gate_open_step is None else int(adv_gate_open_step)
+    last_val_psnr = float(ckpt.get("last_val_psnr", -1.0))
+    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), None, adv_gate_opened, adv_gate_open_step, last_val_psnr
 
 # ================= 9. Validation =================
 def run_phase0_regression_check(pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu):
@@ -2036,7 +2048,16 @@ def main():
     pixart.train()
 
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
-    semantic_extractor = CLIPSemanticExtractor(pretrained=True).to(DEVICE).eval()
+    # SeD GAN depends on OpenAI CLIP (`pip install git+https://github.com/openai/CLIP.git`).
+    if USE_SED_GAN:
+        try:
+            import clip as _clip_dep  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "USE_SED_GAN=True requires the OpenAI CLIP package. "
+                "Install it with: pip install git+https://github.com/openai/CLIP.git"
+            ) from exc
+    semantic_extractor = CLIPSemanticExtractor(pretrained=True).to(DEVICE).eval() if USE_SED_GAN else None
     discriminator = SeDPatchDiscriminator().to(DEVICE).train() if USE_SED_GAN else None
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
@@ -2047,7 +2068,8 @@ def main():
     lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
     lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval()
     for p in vae.parameters(): p.requires_grad_(False)
-    for p in semantic_extractor.parameters(): p.requires_grad_(False)
+    if semantic_extractor is not None:
+        for p in semantic_extractor.parameters(): p.requires_grad_(False)
     for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
     for p in lpips_fn_train.parameters():
         p.requires_grad_(False)
@@ -2097,7 +2119,7 @@ def main():
     print(f"✅ Optim groups(single-stage): {group_counts}")
     _maybe_empty_cuda_cache()
 
-    ep_start, step, best, _ = resume(
+    ep_start, step, best, _, adv_gate_opened, adv_gate_open_step, last_val_psnr = resume(
         pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params,
         discriminator=discriminator, optimizer_d=optimizer_d
     )
@@ -2110,10 +2132,6 @@ def main():
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
-    adv_gate_opened = False
-    adv_gate_open_step = None
-    last_val_psnr = -1.0
-
     for epoch in range(ep_start, 1000):
         if max_steps is not None and step >= max_steps: break
         train_ds.set_epoch(epoch)
@@ -2425,6 +2443,9 @@ def main():
             eval_tag=f"val{validation_count}",
             export_eval_weights=True,
             ema_named_params=ema_named_params,
+            adv_gate_opened=adv_gate_opened,
+            adv_gate_open_step=adv_gate_open_step,
+            last_val_psnr=last_val_psnr,
         )
 
 if __name__ == "__main__":
