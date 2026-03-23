@@ -46,8 +46,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
-from diffusion.model.nets.sed_discriminator import SeDPatchDiscriminator
-from diffusion.model.nets.vision_semantic_extractor import CLIPSemanticExtractor
+from diffusion.model.nets.sed import CLIPSemanticExtractor, SeDPatchDiscriminator
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -298,31 +297,14 @@ def gan_bce_loss(logits: torch.Tensor, target_is_real: bool) -> torch.Tensor:
 
 
 @torch.no_grad()
-def sample_hard_patch_coords(hr_m11: torch.Tensor, pred_valid: torch.Tensor, gt_valid: torch.Tensor, num_candidates: int = SED_PATCH_CANDIDATES):
-    gray = _to_luma01(hr_m11)
-    gx = F.conv2d(gray, _SOBEL_X.to(device=gray.device), padding=1)
-    gy = F.conv2d(gray, _SOBEL_Y.to(device=gray.device), padding=1)
-    grad_map = torch.sqrt(gx * gx + gy * gy + 1e-6)
-    corner_map = _harris_response(gray)
-    residual_map = (pred_valid.float() - gt_valid.float()).abs().mean(dim=1, keepdim=True)
-
-    grad_score = F.avg_pool2d(grad_map, kernel_size=SED_PATCH_VALID, stride=8)
-    corner_score = F.avg_pool2d(corner_map, kernel_size=SED_PATCH_VALID, stride=8)
-    residual_score = F.avg_pool2d(residual_map, kernel_size=1, stride=1)
-    score = 0.5 * grad_score + 0.2 * corner_score + 0.3 * residual_score
-
-    b, _, gh, gw = score.shape
-    flat = score.flatten(1)
-    k = min(max(1, int(num_candidates)), flat.shape[1])
-    topk_idx = torch.topk(flat, k=k, dim=1).indices
-    choice = torch.randint(0, k, (b,), device=score.device)
-    candidate_idx = topk_idx[torch.arange(b, device=score.device), choice]
-    candidate_scores = flat.gather(1, topk_idx)
-    best_within = candidate_scores.argmax(dim=1)
-    final_idx = topk_idx[torch.arange(b, device=score.device), best_within]
-    top = (final_idx // gw).tolist()
-    left = (final_idx % gw).tolist()
-    return top, left, score
+def score_patch_hardness(gt_patch_m11: torch.Tensor, pred_patch_m11: torch.Tensor) -> torch.Tensor:
+    gt_gray = _to_luma01(gt_patch_m11)
+    gx = F.conv2d(gt_gray, _SOBEL_X.to(device=gt_gray.device), padding=1)
+    gy = F.conv2d(gt_gray, _SOBEL_Y.to(device=gt_gray.device), padding=1)
+    grad_score = torch.sqrt(gx * gx + gy * gy + 1e-6).mean(dim=[1, 2, 3])
+    corner_score = _harris_response(gt_gray).mean(dim=[1, 2, 3])
+    residual_score = (pred_patch_m11.float() - gt_patch_m11.float()).abs().mean(dim=[1, 2, 3])
+    return 0.5 * grad_score + 0.2 * corner_score + 0.3 * residual_score
 
 
 def get_adv_weight(step: int, adv_gate_opened: bool, adv_gate_open_step):
@@ -2254,8 +2236,6 @@ def main():
                     z0_sel = z0.index_select(0, active_idx)
                     hr_sel = hr.index_select(0, active_idx)
                     lr_sel = lr.index_select(0, active_idx)
-                    candidate_tops = []
-                    candidate_lefts = []
                     candidate_pred = []
                     candidate_gt = []
                     candidate_lr = []
@@ -2271,19 +2251,13 @@ def main():
                             lr_sel[bi:bi+1, ..., int(rand_top[bi]) * 8 + 32:int(rand_top[bi]) * 8 + 32 + 256, int(rand_left[bi]) * 8 + 32:int(rand_left[bi]) * 8 + 32 + 256].clamp(-1, 1)
                             for bi in range(z0_sel.shape[0])
                         ], dim=0)
-                        candidate_tops.append(rand_top)
-                        candidate_lefts.append(rand_left)
                         candidate_pred.append(pred_k)
                         candidate_gt.append(gt_k)
                         candidate_lr.append(lr_k)
                     stacked_pred = torch.stack(candidate_pred, dim=1)
                     stacked_gt = torch.stack(candidate_gt, dim=1)
                     stacked_lr = torch.stack(candidate_lr, dim=1)
-                    score_list = []
-                    for k in range(SED_PATCH_CANDIDATES):
-                        _, _, score_map = sample_hard_patch_coords(hr_sel, stacked_pred[:, k], stacked_gt[:, k], num_candidates=1)
-                        sel_score = score_map[torch.arange(score_map.shape[0], device=DEVICE), :, candidate_tops[k], candidate_lefts[k]].view(-1)
-                        score_list.append(sel_score)
+                    score_list = [score_patch_hardness(stacked_gt[:, k], stacked_pred[:, k]) for k in range(SED_PATCH_CANDIDATES)]
                     score_stack = torch.stack(score_list, dim=1)
                     best_k = score_stack.argmax(dim=1)
                     img_p_valid = stacked_pred[torch.arange(stacked_pred.shape[0], device=DEVICE), best_k]
