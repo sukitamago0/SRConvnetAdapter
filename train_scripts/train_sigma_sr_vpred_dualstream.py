@@ -1511,8 +1511,24 @@ def save_smart(
         "eval_steps": int(eval_steps),
     }
 
+    prev_entry = best_records[0] if len(best_records) > 0 else None
+    if isinstance(prev_entry, dict) and "global_best_record" in prev_entry:
+        prev_global_best = prev_entry.get("global_best_record", None)
+        prev_aux = dict(prev_entry.get("best_aux_meta", {}))
+    elif isinstance(prev_entry, dict):
+        prev_global_best = dict(prev_entry)
+        prev_aux = {
+            "best_psnr": float(prev_entry.get("best_psnr", -float("inf"))),
+            "best_psnr_step": int(prev_entry.get("best_psnr_step", -1)),
+            "best_lpips_gate": float(prev_entry.get("best_lpips_gate", float("inf"))),
+            "best_lpips_gate_step": int(prev_entry.get("best_lpips_gate_step", -1)),
+        }
+    else:
+        prev_global_best = None
+        prev_aux = {}
+
     # keep a single global best by should_keep_ckpt rule (PSNR-first).
-    prev_best = best_records[0] if len(best_records) > 0 else None
+    prev_best = prev_global_best
     prev_priority = int(prev_best['priority']) if prev_best is not None and 'priority' in prev_best else None
     prev_score = prev_best.get('score', (float("inf"),)) if prev_best is not None else None
     if not isinstance(prev_score, tuple):
@@ -1591,25 +1607,31 @@ def save_smart(
         }
         return state
 
-    best_meta = dict(best_records[0]) if best_records else {}
-    best_psnr = float(best_meta.get("best_psnr", -float("inf")))
-    best_lpips = float(best_meta.get("best_lpips_gate", float("inf")))
+    new_global_best = dict(current_record) if save_as_best else (dict(prev_global_best) if prev_global_best is not None else dict(current_record))
+
+    best_psnr = float(prev_aux.get("best_psnr", -float("inf")))
+    best_lpips = float(prev_aux.get("best_lpips_gate", float("inf")))
     if math.isfinite(psnr_v) and psnr_v > best_psnr:
         best_psnr = float(psnr_v)
-        current_record["best_psnr_step"] = int(global_step)
+        best_psnr_step = int(global_step)
     else:
-        current_record["best_psnr_step"] = int(best_meta.get("best_psnr_step", global_step if best_psnr > -float("inf") else -1))
+        best_psnr_step = int(prev_aux.get("best_psnr_step", global_step if best_psnr > -float("inf") else -1))
     if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v < best_lpips:
         best_lpips = float(lpips_v)
-        current_record["best_lpips_gate_step"] = int(global_step)
+        best_lpips_step = int(global_step)
     else:
-        current_record["best_lpips_gate_step"] = int(best_meta.get("best_lpips_gate_step", global_step if math.isfinite(best_lpips) else -1))
-    current_record["best_psnr"] = float(best_psnr)
-    current_record["best_lpips_gate"] = float(best_lpips)
+        best_lpips_step = int(prev_aux.get("best_lpips_gate_step", global_step if math.isfinite(best_lpips) else -1))
 
-    merged_record = dict(best_meta)
-    merged_record.update(current_record)
-    next_best_records = [current_record] if save_as_best else [merged_record]
+    new_aux_meta = {
+        "best_psnr": float(best_psnr),
+        "best_psnr_step": int(best_psnr_step),
+        "best_lpips_gate": float(best_lpips),
+        "best_lpips_gate_step": int(best_lpips_step),
+    }
+    next_best_records = [{
+        "global_best_record": new_global_best,
+        "best_aux_meta": new_aux_meta,
+    }]
 
     # Always save full training-state checkpoint for resume
     state_last = _build_state_dict_snapshot(checkpoint_role="last")
@@ -1632,11 +1654,11 @@ def save_smart(
         else:
             print(f"❌ Failed to save best checkpoint: {msg_train}")
 
-    if math.isfinite(psnr_v) and psnr_v >= current_record["best_psnr"]:
+    if math.isfinite(psnr_v) and psnr_v >= new_aux_meta["best_psnr"]:
         state_psnr = _build_state_dict_snapshot(checkpoint_role="best_psnr")
         state_psnr["best_records"] = next_best_records
         atomic_torch_save(state_psnr, BEST_PSNR_PATH)
-    if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v <= current_record["best_lpips_gate"]:
+    if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v <= new_aux_meta["best_lpips_gate"]:
         state_lp = _build_state_dict_snapshot(checkpoint_role="best_lpips_gate")
         state_lp["best_records"] = next_best_records
         atomic_torch_save(state_lp, BEST_LPIPS_GATE_PATH)
