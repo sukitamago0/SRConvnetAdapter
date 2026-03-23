@@ -1,3 +1,10 @@
+"""
+Local SeD discriminator adapted from the official SeD `models/sed.py`.
+
+The stage layout, constructor signature, and semantic-injection call chain follow the official
+SeD_P design, while the module lives as a compatibility-oriented in-repo reimplementation.
+"""
+
 import math
 
 import torch

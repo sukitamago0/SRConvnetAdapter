@@ -191,7 +191,7 @@ GW_WEIGHT_END = 0.02
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
 CKPT_SELECT_MODE = "psnr_gate_lpips"   # "psnr_first" | "lpips_first" | "psnr_gate_lpips"
-CKPT_SELECT_PSNR_GATE = 24.5
+CKPT_SELECT_PSNR_GATE = 25.5
 BEST_PSNR_PATH = os.path.join(CKPT_DIR, "best_psnr.pth")
 BEST_LPIPS_GATE_PATH = os.path.join(CKPT_DIR, "best_lpips_gate.pth")
 
@@ -2159,6 +2159,8 @@ def main():
         train_ds.set_epoch(epoch)
         pbar = tqdm(train_loader, dynamic_ncols=True, desc=f"Ep{epoch+1}")
         accum_micro_steps = 0
+        if optimizer_d is not None:
+            optimizer_d.zero_grad(set_to_none=True)
         reached_max_steps = False
         for i, batch in enumerate(pbar):
             if max_steps is not None and step >= max_steps:
@@ -2314,7 +2316,6 @@ def main():
 
                         for p in discriminator.parameters():
                             p.requires_grad_(True)
-                        optimizer_d.zero_grad(set_to_none=True)
                         real_d_pred = discriminator((img_t_valid.float() + 1.0) * 0.5, hr_semantic.detach())
                         fake_d_pred = discriminator((img_p_valid.detach().float() + 1.0) * 0.5, hr_semantic.detach())
                         loss_d_real = gan_bce_loss(real_d_pred, True)

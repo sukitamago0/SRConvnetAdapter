@@ -1,5 +1,8 @@
 """
-Minimal transplant of SeD's `models/module_attention.py` with only import-path cleanup.
+Local SeD-inspired attention module adapted from the official SeD `models/module_attention.py`.
+
+This file preserves the official class/function names and high-level call chain, but it is
+an in-repo compatibility reimplementation rather than a verbatim file transplant.
 """
 
 from inspect import isfunction
