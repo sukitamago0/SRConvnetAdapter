@@ -46,6 +46,8 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.nets.sed_discriminator import SeDPatchDiscriminator
+from diffusion.model.nets.vision_semantic_extractor import CLIPSemanticExtractor
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -96,7 +98,7 @@ NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth"
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss_lora16_lpips")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss_lora16_sed")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -171,10 +173,10 @@ PIXEL_LOSS_T_MAX = 250
 LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
 
 # LPIPS perceptual curriculum (single-script, no separate stage script)
-USE_LPIPS_PERCEP = True
-LPIPS_START_EPOCH = 18
-LPIPS_RAMP_END_EPOCH = 30
-LPIPS_WEIGHT_MAX = 0.20
+USE_LPIPS_PERCEP = False
+LPIPS_START_EPOCH = 999999
+LPIPS_RAMP_END_EPOCH = 999999
+LPIPS_WEIGHT_MAX = 0.0
 LPIPS_T_MAX = 200
 
 # As LPIPS ramps in, old structure losses ramp down
@@ -190,6 +192,16 @@ GW_WEIGHT_END = 0.02
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
 CKPT_SELECT_MODE = "psnr_gate_lpips"   # "psnr_first" | "lpips_first" | "psnr_gate_lpips"
 CKPT_SELECT_PSNR_GATE = 24.5
+BEST_PSNR_PATH = os.path.join(CKPT_DIR, "best_psnr.pth")
+BEST_LPIPS_GATE_PATH = os.path.join(CKPT_DIR, "best_lpips_gate.pth")
+
+USE_SED_GAN = True
+SED_GAN_WEIGHT = 0.01
+SED_D_UPDATE_RATIO = 1
+SED_WARMUP_STEPS = 500
+SED_PATCH_GRID = 25
+SED_PATCH_LATENT = 40
+SED_PATCH_VALID = 256
 
 USE_LR_CONSISTENCY = True 
 USE_NOISE_CONSISTENCY = False
@@ -260,12 +272,10 @@ def _linear_ramp(epoch_1based: int, start_epoch: int, end_epoch: int) -> float:
 
 
 def get_loss_weights(epoch_1based: int):
-    p = _linear_ramp(epoch_1based, LPIPS_START_EPOCH, LPIPS_RAMP_END_EPOCH) if USE_LPIPS_PERCEP else 0.0
-
-    latent_l1_w = LATENT_L1_WEIGHT_START + p * (LATENT_L1_WEIGHT_END - LATENT_L1_WEIGHT_START)
-    lr_cons_w = LR_CONS_WEIGHT_START + p * (LR_CONS_WEIGHT_END - LR_CONS_WEIGHT_START)
-    gw_w = GW_WEIGHT_START + p * (GW_WEIGHT_END - GW_WEIGHT_START)
-    lpips_w = p * LPIPS_WEIGHT_MAX if USE_LPIPS_PERCEP else 0.0
+    latent_l1_w = LATENT_L1_WEIGHT_START
+    lr_cons_w = LR_CONS_WEIGHT_START
+    gw_w = GW_WEIGHT_START
+    lpips_w = 0.0
 
     return {
         "mse": 1.0,
@@ -278,6 +288,32 @@ def get_loss_weights(epoch_1based: int):
 
 def get_fixed_loss_weights(epoch_1based: int = 1):
     return get_loss_weights(epoch_1based)
+
+
+def gan_bce_loss(logits: torch.Tensor, target_is_real: bool) -> torch.Tensor:
+    target = torch.ones_like(logits) if target_is_real else torch.zeros_like(logits)
+    return F.binary_cross_entropy_with_logits(logits, target)
+
+
+@torch.no_grad()
+def sample_hard_patch_coords(hr_m11: torch.Tensor):
+    gray = _to_luma01(hr_m11)
+    gx = F.conv2d(gray, _SOBEL_X.to(device=gray.device), padding=1)
+    gy = F.conv2d(gray, _SOBEL_Y.to(device=gray.device), padding=1)
+    hard_map = torch.sqrt(gx * gx + gy * gy + 1e-6)
+    pooled = F.avg_pool2d(hard_map, kernel_size=SED_PATCH_VALID, stride=8)
+    flat = pooled.flatten(1)
+    idx = flat.argmax(dim=1)
+    grid_w = pooled.shape[-1]
+    top = (idx // grid_w).tolist()
+    left = (idx % grid_w).tolist()
+    return top, left
+
+
+def decode_valid_patch_from_latent(vae, z0_latent: torch.Tensor, top: int, left: int) -> torch.Tensor:
+    z0_crop = z0_latent[..., top:top + SED_PATCH_LATENT, left:left + SED_PATCH_LATENT]
+    img_p_raw = _decode_vae_sample_checkpointed(vae, z0_crop / vae.config.scaling_factor).clamp(-1, 1)
+    return img_p_raw[..., 32:-32, 32:-32]
 
 
 def inject_reg_lambda(step: int) -> float:
@@ -1279,7 +1315,7 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
     return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
 
 
-def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, discriminator: nn.Module = None):
     inject_gate_keys = INJECT_GATE_KEYWORDS
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
 
@@ -1325,7 +1361,15 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
     }
-    return optimizer, params_to_clip, group_counts
+    optimizer_d = None
+    d_params_to_clip = []
+    if discriminator is not None:
+        d_params = [p for p in discriminator.parameters() if p.requires_grad]
+        if d_params:
+            optimizer_d = torch.optim.AdamW([{"params": d_params, "lr": 1e-4, "weight_decay": 0.0}], betas=(0.9, 0.99))
+            d_params_to_clip = d_params
+            group_counts["discriminator"] = len(d_params)
+    return optimizer, params_to_clip, group_counts, optimizer_d, d_params_to_clip
 
 
 def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module):
@@ -1413,6 +1457,8 @@ def save_smart(
     metrics,
     dl_gen,
     ema=None,
+    discriminator=None,
+    optimizer_d=None,
     keep_keys=None,
     eval_source: str = "raw",
     eval_steps: int = 50,
@@ -1486,6 +1532,7 @@ def save_smart(
             "lora_alpha": float(LORA_ALPHA),
             "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
             "optimizer": optimizer.state_dict(),
+            "optimizer_d": optimizer_d.state_dict() if optimizer_d is not None else None,
             "rng_state": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -1501,6 +1548,7 @@ def save_smart(
             "env_info": {"torch": torch.__version__, "numpy": np.__version__},
             "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
             "checkpoint_role": str(checkpoint_role),
+            "discriminator": ({k: v.detach().float().cpu() for k, v in discriminator.state_dict().items()} if discriminator is not None else None),
             "best_eval_source": source_tag,
             "best_eval_steps": int(eval_steps),
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
@@ -1538,6 +1586,23 @@ def save_smart(
             best_saved = True
         else:
             print(f"❌ Failed to save best checkpoint: {msg_train}")
+
+    best_psnr = best_records[0].get("best_psnr", -float("inf")) if best_records else -float("inf")
+    best_lpips = best_records[0].get("best_lpips_gate", float("inf")) if best_records else float("inf")
+    if math.isfinite(psnr_v) and psnr_v > best_psnr:
+        state_psnr = _build_state_dict_snapshot(checkpoint_role="best_psnr")
+        state_psnr["best_records"] = next_best_records
+        atomic_torch_save(state_psnr, BEST_PSNR_PATH)
+        current_record["best_psnr"] = float(psnr_v)
+    else:
+        current_record["best_psnr"] = float(best_psnr)
+    if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v < best_lpips:
+        state_lp = _build_state_dict_snapshot(checkpoint_role="best_lpips_gate")
+        state_lp["best_records"] = next_best_records
+        atomic_torch_save(state_lp, BEST_LPIPS_GATE_PATH)
+        current_record["best_lpips_gate"] = float(lpips_v)
+    else:
+        current_record["best_lpips_gate"] = float(best_lpips)
 
     # remove legacy rolling-best artifacts from older runs to keep CKPT_DIR clean
     if best_saved:
@@ -1616,7 +1681,7 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
     return True
 
 
-def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
+def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None, discriminator=None, optimizer_d=None):
     if not os.path.exists(LAST_CKPT_PATH):
         return 0, 0, [], None
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
@@ -1644,6 +1709,16 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
         optimizer.load_state_dict(ckpt["optimizer"])
     except Exception as e:
         print(f"⚠️ Optimizer state restore skipped due to mismatch: {e}")
+    if discriminator is not None and isinstance(ckpt.get("discriminator", None), dict):
+        try:
+            discriminator.load_state_dict(ckpt["discriminator"], strict=True)
+        except Exception as e:
+            print(f"⚠️ Discriminator restore skipped due to mismatch: {e}")
+    if optimizer_d is not None and ckpt.get("optimizer_d", None) is not None:
+        try:
+            optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        except Exception as e:
+            print(f"⚠️ Discriminator optimizer restore skipped due to mismatch: {e}")
     rs = ckpt.get("rng_state", None)
     if rs is not None:
         try:
@@ -1932,6 +2007,8 @@ def main():
     pixart.train()
 
     adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
+    semantic_extractor = CLIPSemanticExtractor(pretrained=True).to(DEVICE).eval()
+    discriminator = SeDPatchDiscriminator().to(DEVICE).train() if USE_SED_GAN else None
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
@@ -1941,6 +2018,7 @@ def main():
     lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
     lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval()
     for p in vae.parameters(): p.requires_grad_(False)
+    for p in semantic_extractor.parameters(): p.requires_grad_(False)
     for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
     for p in lpips_fn_train.parameters():
         p.requires_grad_(False)
@@ -1986,11 +2064,14 @@ def main():
         p.requires_grad_(True)
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
-    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
+    optimizer, params_to_clip, group_counts, optimizer_d, d_params_to_clip = build_optimizer_and_clippables(pixart, adapter, discriminator)
     print(f"✅ Optim groups(single-stage): {group_counts}")
     _maybe_empty_cuda_cache()
 
-    ep_start, step, best, _ = resume(pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params)
+    ep_start, step, best, _ = resume(
+        pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params,
+        discriminator=discriminator, optimizer_d=optimizer_d
+    )
     if ema is not None:
         ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
         ema.register(ema_named_params)
@@ -2077,6 +2158,9 @@ def main():
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
+                loss_g_adv = torch.tensor(0.0, device=DEVICE)
+                loss_d_real = torch.tensor(0.0, device=DEVICE)
+                loss_d_fake = torch.tensor(0.0, device=DEVICE)
 
                 need_patch_loss = (
                     (w.get('lr_cons', 0.0) > 0) or
@@ -2092,21 +2176,22 @@ def main():
 
                 if calc_patch_loss:
                     active_idx = torch.nonzero(patch_t_mask, as_tuple=False).squeeze(1)
-                    top = torch.randint(0, 25, (1,), device=DEVICE).item()
-                    left = torch.randint(0, 25, (1,), device=DEVICE).item()
                     z0_sel = z0.index_select(0, active_idx)
                     hr_sel = hr.index_select(0, active_idx)
                     lr_sel = lr.index_select(0, active_idx)
-                    z0_crop = z0_sel[..., top:top+40, left:left+40]
-                    img_p_raw = _decode_vae_sample_checkpointed(vae, z0_crop / vae.config.scaling_factor)
-                    img_p_raw = img_p_raw.clamp(-1, 1)
-                    img_p_valid = img_p_raw[..., 32:-32, 32:-32]
-                    del img_p_raw
-                    y0 = top * 8 + 32; x0 = left * 8 + 32
-                    img_t_valid = hr_sel[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
+                    tops, lefts = sample_hard_patch_coords(hr_sel)
+                    img_p_valid = torch.cat([decode_valid_patch_from_latent(vae, z0_sel[bi:bi+1], int(top), int(left))
+                                             for bi, (top, left) in enumerate(zip(tops, lefts))], dim=0)
+                    img_t_valid = torch.cat([
+                        hr_sel[bi:bi+1, ..., int(top) * 8 + 32:int(top) * 8 + 32 + 256, int(left) * 8 + 32:int(left) * 8 + 32 + 256].clamp(-1, 1)
+                        for bi, (top, left) in enumerate(zip(tops, lefts))
+                    ], dim=0)
+                    lr_patch = torch.cat([
+                        lr_sel[bi:bi+1, ..., int(top) * 8 + 32:int(top) * 8 + 32 + 256, int(left) * 8 + 32:int(left) * 8 + 32 + 256].clamp(-1, 1)
+                        for bi, (top, left) in enumerate(zip(tops, lefts))
+                    ], dim=0)
 
                     if w.get('lr_cons', 0.0) > 0:
-                        lr_patch = lr_sel[..., y0:y0+256, x0:x0+256].clamp(-1, 1)
                         loss_lr_cons = structure_consistency_loss(img_p_valid, lr_patch)
 
                     if w.get('gw', 0.0) > 0:
@@ -2120,6 +2205,23 @@ def main():
                             pred_lp = img_p_valid.index_select(0, lpips_idx)
                             targ_lp = img_t_valid.index_select(0, lpips_idx)
                             loss_lpips = perceptual_lpips_loss(lpips_fn_train, pred_lp, targ_lp)
+
+                    if USE_SED_GAN and discriminator is not None and optimizer_d is not None and step >= SED_WARMUP_STEPS:
+                        with torch.no_grad():
+                            hr_semantic = semantic_extractor((img_t_valid.float() + 1.0) * 0.5)
+                        for p in discriminator.parameters():
+                            p.requires_grad_(False)
+                        fake_g_pred = discriminator((img_p_valid.float() + 1.0) * 0.5, hr_semantic)
+                        loss_g_adv = gan_bce_loss(fake_g_pred, True)
+
+                        for p in discriminator.parameters():
+                            p.requires_grad_(True)
+                        optimizer_d.zero_grad(set_to_none=True)
+                        real_d_pred = discriminator((img_t_valid.float() + 1.0) * 0.5, hr_semantic.detach())
+                        fake_d_pred = discriminator((img_p_valid.detach().float() + 1.0) * 0.5, hr_semantic.detach())
+                        loss_d_real = gan_bce_loss(real_d_pred, True)
+                        loss_d_fake = gan_bce_loss(fake_d_pred, False)
+                        ((loss_d_real + loss_d_fake) * 0.5 / GRAD_ACCUM_STEPS).backward(retain_graph=True)
                 else:
                     patch_loss_num_samples = 0
 
@@ -2130,6 +2232,7 @@ def main():
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
                     + w.get('lpips', 0.0) * loss_lpips
+                    + (SED_GAN_WEIGHT * loss_g_adv if USE_SED_GAN else 0.0)
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2140,7 +2243,12 @@ def main():
                 log_critical_path_gradients(step + 1, pixart, adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
+                if optimizer_d is not None and d_params_to_clip:
+                    torch.nn.utils.clip_grad_norm_(d_params_to_clip, 1.0)
+                    optimizer_d.step()
                 optimizer.zero_grad()
+                if optimizer_d is not None:
+                    optimizer_d.zero_grad(set_to_none=True)
                 step += 1
                 if ema is not None:
                     ema.update(ema_named_params)
@@ -2169,6 +2277,9 @@ def main():
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
+                    'g_adv': f"{loss_g_adv.item():.3f}",
+                    'd_r': f"{loss_d_real.item():.3f}",
+                    'd_f': f"{loss_d_fake.item():.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
@@ -2178,7 +2289,12 @@ def main():
             log_critical_path_gradients(step + 1, pixart, adapter)
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
+            if optimizer_d is not None and d_params_to_clip:
+                torch.nn.utils.clip_grad_norm_(d_params_to_clip, 1.0)
+                optimizer_d.step()
             optimizer.zero_grad()
+            if optimizer_d is not None:
+                optimizer_d.zero_grad(set_to_none=True)
             step += 1
             if ema is not None:
                 ema.update(ema_named_params)
@@ -2235,6 +2351,8 @@ def main():
             best_eval_metrics_this_round,
             dl_gen,
             ema=ema,
+            discriminator=discriminator,
+            optimizer_d=optimizer_d,
             keep_keys=ever_keys,
             eval_source=best_eval_source_this_round,
             eval_steps=int(BEST_VAL_STEPS),
