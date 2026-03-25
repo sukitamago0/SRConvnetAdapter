@@ -443,26 +443,13 @@ def build_model_and_assets(args, device, compute_dtype):
         inj_cfg = {}
 
     cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
-    sparse_inject_ratio = float(cfg.get("sparse_inject_ratio", ckpt.get("sparse_inject_ratio", 1.0)))
-    dualstream_enabled = bool(ckpt.get("dualstream_enabled", False))
-    dual_cross_attn_start = int(ckpt.get("dual_cross_attn_start", 16))
-    dual_num_heads = int(ckpt.get("dual_num_heads", 16))
-    use_style_fusion = bool(ckpt.get("use_style_fusion", False))
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
-        sparse_inject_ratio=sparse_inject_ratio,
-        injection_cutoff_layer=int(inj_cfg.get("injection_cutoff_layer", 28)),
-        injection_strategy=str(inj_cfg.get("injection_strategy", "three_stage_sr")),
         hard_injection_layers=list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12])),
-        transition_injection_layers=list(inj_cfg.get("transition_layers", [])),
         detail_injection_layers=list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24])),
-        dualstream_enabled=dualstream_enabled,
-        cross_attn_start_layer=dual_cross_attn_start,
-        dual_num_heads=dual_num_heads,
-        use_style_fusion=use_style_fusion,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -529,7 +516,8 @@ def build_model_and_assets(args, device, compute_dtype):
     adapter = build_adapter_v8(
         in_channels=3,
         hidden_size=1152,
-        injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
+        injection_layers_map=getattr(pixart, "injection_layer_to_level", None),
+        ref_token_hw=32,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
 

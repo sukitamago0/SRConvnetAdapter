@@ -77,12 +77,13 @@ class DegradationCleanStem(nn.Module):
 
 
 class SRConvNetLSAAdapterV8(nn.Module):
-    def __init__(self, hidden_size: int = 1152, ref_token_hw: int = 32):
+    def __init__(self, in_channels: int = 3, hidden_size: int = 1152, ref_token_hw: int = 32):
         super().__init__()
+        self.in_channels = int(in_channels)
         self.hidden_size = int(hidden_size)
         self.ref_token_hw = int(ref_token_hw)
 
-        self.stem = nn.Conv2d(3, 64, 3, padding=1)
+        self.stem = nn.Conv2d(self.in_channels, 64, 3, padding=1)
         self.stage1 = nn.Sequential(SRConvNetBlock(64), SRConvNetBlock(64))
         self.down1 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
         self.stage2 = nn.Sequential(SRConvNetBlock(128), SRConvNetBlock(128))
@@ -168,9 +169,9 @@ class SRConvNetLSAAdapterV8(nn.Module):
         }
 
 
-def build_adapter_v8(in_channels=3, hidden_size=1152, injection_layers_map=None):
-    del in_channels, injection_layers_map
-    return SRConvNetLSAAdapterV8(hidden_size=hidden_size, ref_token_hw=32)
+def build_adapter_v8(in_channels=3, hidden_size=1152, injection_layers_map=None, ref_token_hw=32):
+    del injection_layers_map
+    return SRConvNetLSAAdapterV8(in_channels=in_channels, hidden_size=hidden_size, ref_token_hw=ref_token_hw)
 
 
 def build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=None):

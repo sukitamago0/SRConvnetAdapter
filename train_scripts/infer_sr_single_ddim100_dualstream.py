@@ -152,25 +152,15 @@ def run(args):
 
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
     inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
-    injection_strategy = str(inj_cfg.get("injection_strategy", "three_stage_sr"))
-    injection_cutoff_layer = int(inj_cfg.get("injection_cutoff_layer", 28))
     hard_layers = list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12]))
-    transition_layers = list(inj_cfg.get("transition_layers", []))
     detail_layers = list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24]))
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
-        sparse_inject_ratio=float(ckpt.get("config_snapshot", {}).get("sparse_inject_ratio", 1.0)),
-        injection_cutoff_layer=injection_cutoff_layer,
-        injection_strategy=injection_strategy,
         hard_injection_layers=hard_layers,
-        transition_injection_layers=transition_layers,
         detail_injection_layers=detail_layers,
-        dualstream_enabled=False,
-        cross_attn_start_layer=16,
-        dual_num_heads=16,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -186,9 +176,10 @@ def run(args):
         pixart.load_state_dict(base, strict=False)
 
     adapter = build_adapter_v8(
-        in_channels=4,
+        in_channels=3,
         hidden_size=1152,
-        injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
+        injection_layers_map=getattr(pixart, "injection_layer_to_level", None),
+        ref_token_hw=32,
     ).to(device).float()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))

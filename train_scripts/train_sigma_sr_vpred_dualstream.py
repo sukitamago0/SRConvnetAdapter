@@ -188,7 +188,7 @@ GW_WEIGHT_START = 0.05
 GW_WEIGHT_END = 0.02
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
-CKPT_SELECT_MODE = "psnr_gate_lpips"   # "psnr_first" | "lpips_first" | "psnr_gate_lpips"
+CKPT_SELECT_MODE = "psnr_first"
 CKPT_SELECT_PSNR_GATE = 25.5
 BEST_PSNR_PATH = os.path.join(CKPT_DIR, "best_psnr.pth")
 START_FROM_BASE_ONLY = True
@@ -225,11 +225,6 @@ INJECT_REG_RAMP_END = 12000
 LR_CONSIST_WEIGHT_MAX = 0.1
 LR_CONSIST_WARMUP = 0
 LR_CONSIST_RAMP = 2400
-
-DUALSTREAM_ENABLED = False
-DUAL_CROSS_ATTN_START = 22
-DUAL_NUM_HEADS = 16
-USE_STYLE_FUSION = False
 
 # Conservative KV-compress to reduce attention memory with minimal quality impact.
 KV_COMPRESS_ENABLE = False
@@ -286,22 +281,6 @@ def gan_bce_loss(logits: torch.Tensor, target_is_real: bool) -> torch.Tensor:
 
 
 @torch.no_grad()
-def score_patch_hardness(gt_patch_m11: torch.Tensor, pred_patch_m11: torch.Tensor) -> torch.Tensor:
-    gt_gray = _to_luma01(gt_patch_m11)
-    gx = F.conv2d(gt_gray, _SOBEL_X.to(device=gt_gray.device), padding=1)
-    gy = F.conv2d(gt_gray, _SOBEL_Y.to(device=gt_gray.device), padding=1)
-    grad_score = torch.sqrt(gx * gx + gy * gy + 1e-6).mean(dim=[1, 2, 3])
-    corner_score = _harris_response(gt_gray).mean(dim=[1, 2, 3])
-    residual_score = (pred_patch_m11.float() - gt_patch_m11.float()).abs().mean(dim=[1, 2, 3])
-    return 0.5 * grad_score + 0.2 * corner_score + 0.3 * residual_score
-
-
-def decode_valid_patch_from_latent(vae, z0_latent: torch.Tensor, top: int, left: int) -> torch.Tensor:
-    z0_crop = z0_latent[..., top:top + SED_PATCH_LATENT, left:left + SED_PATCH_LATENT]
-    img_p_raw = _decode_vae_sample_checkpointed(vae, z0_crop / vae.config.scaling_factor).clamp(-1, 1)
-    return img_p_raw[..., 32:-32, 32:-32]
-
-
 def inject_reg_lambda(step: int) -> float:
     if step < INJECT_REG_WARMUP_END:
         return INJECT_SCALE_REG_LAMBDA
@@ -505,17 +484,6 @@ def _extract_adapter_cond_stats(cond):
     return gate_mean, gate_std
 
 
-def _extract_dual_gate_stats(pixart: nn.Module):
-    if not hasattr(pixart, "dual_gate"):
-        return 0.0, 0.0
-    gs = []
-    for _, p in pixart.dual_gate.items():
-        gs.append(torch.sigmoid(p.detach().float().view(-1)))
-    if len(gs) == 0:
-        return 0.0, 0.0
-    g = torch.cat(gs, dim=0)
-    return float(g.mean().item()), float(g.std(unbiased=False).item()) if g.numel() > 1 else 0.0
-
 def seed_everything(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
@@ -718,7 +686,6 @@ def get_config_snapshot():
         "lr_base": LR_BASE,
         "lora_rank": int(LORA_RANK),
         "lora_alpha": float(LORA_ALPHA),
-        "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV8",
@@ -741,9 +708,7 @@ def validate_schedule_alignment():
 
 
 def validate_s2d_decoupling():
-    if DUALSTREAM_ENABLED:
-        raise ValueError("S2D requires DUALSTREAM_ENABLED=False (no LR direct late-stream injection).")
-
+    return
 def load_resume_injection_config(default_cfg: dict):
     cfg = dict(default_cfg)
     if not os.path.exists(LAST_CKPT_PATH):
@@ -753,10 +718,7 @@ def load_resume_injection_config(default_cfg: dict):
         inj = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
         if not isinstance(inj, dict) or len(inj) == 0:
             return cfg
-        cfg["injection_strategy"] = str(inj.get("injection_strategy", cfg["injection_strategy"]))
-        cfg["injection_cutoff_layer"] = int(inj.get("injection_cutoff_layer", cfg["injection_cutoff_layer"]))
         cfg["hard_layers"] = list(inj.get("hard_layers", cfg["hard_layers"]))
-        cfg["transition_layers"] = list(inj.get("transition_layers", cfg["transition_layers"]))
         cfg["detail_layers"] = list(inj.get("detail_layers", cfg["detail_layers"]))
         print("[ResumeConfig] injection_config loaded from LAST_CKPT_PATH")
     except Exception as e:
@@ -1257,7 +1219,15 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = ["final_layer", "input_res_proj", "inject_gate", "sft_cond_reduce", "sft_layers"]
+    always_train_keywords = [
+        "final_layer",
+        "sft_cond_reduce",
+        "sft_layers",
+        "detail_ref_attn",
+        "detail_lr_attn",
+        "detail_ref_gate",
+        "detail_lr_gate",
+    ]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
 
@@ -1354,7 +1324,7 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     ad_named = dict(adapter.named_parameters())
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("pixart.input_res_proj.0.weight", pix_named.get("input_res_proj.0.weight", None)),
+        ("pixart.detail_ref_attn.14.out_proj.weight", pix_named.get("detail_ref_attn.14.out_proj.weight", None)),
         ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
         ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
@@ -1378,31 +1348,9 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
 # ================= 8. Checkpointing =================
 def should_keep_ckpt(psnr_v, lpips_v):
     psnr_ok = math.isfinite(psnr_v)
-    lpips_ok = math.isfinite(lpips_v)
-
-    if CKPT_SELECT_MODE == "psnr_gate_lpips":
-        if not psnr_ok:
-            return (999, float("inf"), float("inf"))
-
-        # before reaching PSNR gate: prioritize PSNR first
-        if float(psnr_v) < float(CKPT_SELECT_PSNR_GATE):
-            lp = float(lpips_v) if lpips_ok else float("inf")
-            return (0, -float(psnr_v), lp)
-
-        # after reaching PSNR gate: prioritize LPIPS first
-        if not lpips_ok:
-            return (999, float("inf"), float("inf"))
-        return (0, float(lpips_v), -float(psnr_v))
-
-    if CKPT_SELECT_MODE == "lpips_first":
-        if not lpips_ok:
-            return (999, float("inf"), float("inf"))
-        ps = -float(psnr_v) if psnr_ok else float("inf")
-        return (0, float(lpips_v), ps)
-
-    # fallback: old behavior
     if not psnr_ok:
         return (999, float("inf"), float("inf"))
+    lpips_ok = math.isfinite(lpips_v)
     lp = float(lpips_v) if lpips_ok else float("inf")
     return (0, -float(psnr_v), lp)
 
@@ -1432,16 +1380,12 @@ def save_smart(
     metrics,
     dl_gen,
     ema=None,
-    discriminator=None,
-    optimizer_d=None,
     keep_keys=None,
     eval_source: str = "raw",
     eval_steps: int = 50,
     eval_tag: str = "",
     export_eval_weights: bool = True,
     ema_named_params=None,
-    adv_gate_opened: bool = False,
-    adv_gate_open_step=None,
     last_val_psnr: float = -1.0,
 ):
     global BASE_PIXART_SHA256
@@ -1539,18 +1483,13 @@ def save_smart(
             "env_info": {"torch": torch.__version__, "numpy": np.__version__},
             "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
             "checkpoint_role": str(checkpoint_role),
-            "adv_gate_opened": bool(adv_gate_opened),
-            "adv_gate_open_step": (None if adv_gate_open_step is None else int(adv_gate_open_step)),
             "last_val_psnr": float(last_val_psnr),
             "best_eval_source": source_tag,
             "best_eval_steps": int(eval_steps),
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
             "best_eval_tag": str(eval_tag),
             "injection_config": {
-                "injection_strategy": str(INJECTION_STRATEGY),
-                "injection_cutoff_layer": int(INJECTION_CUTOFF_LAYER),
                 "hard_layers": list(HARD_INJECTION_LAYERS),
-                "transition_layers": list(TRANSITION_INJECTION_LAYERS),
                 "detail_layers": list(DETAIL_INJECTION_LAYERS),
             },
         }
@@ -1677,7 +1616,7 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
     return True
 
 
-def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None, discriminator=None, optimizer_d=None):
+def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH):
         return 0, 0, [], None, False, None, -1.0
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
@@ -1705,16 +1644,6 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None, 
         optimizer.load_state_dict(ckpt["optimizer"])
     except Exception as e:
         print(f"⚠️ Optimizer state restore skipped due to mismatch: {e}")
-    if discriminator is not None and isinstance(ckpt.get("discriminator", None), dict):
-        try:
-            discriminator.load_state_dict(ckpt["discriminator"], strict=True)
-        except Exception as e:
-            print(f"⚠️ Discriminator restore skipped due to mismatch: {e}")
-    if optimizer_d is not None and ckpt.get("optimizer_d", None) is not None:
-        try:
-            optimizer_d.load_state_dict(ckpt["optimizer_d"])
-        except Exception as e:
-            print(f"⚠️ Discriminator optimizer restore skipped due to mismatch: {e}")
     rs = ckpt.get("rng_state", None)
     if rs is not None:
         try:
@@ -1742,44 +1671,10 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None, 
             print(f"✅ EMA restored: {len(ema.shadow)} tensors")
         else:
             print("ℹ️ EMA state not found in checkpoint; proceeding without EMA restore.")
-    adv_gate_opened = bool(ckpt.get("adv_gate_opened", False))
-    adv_gate_open_step = ckpt.get("adv_gate_open_step", None)
-    adv_gate_open_step = None if adv_gate_open_step is None else int(adv_gate_open_step)
     last_val_psnr = float(ckpt.get("last_val_psnr", -1.0))
-    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), None, adv_gate_opened, adv_gate_open_step, last_val_psnr
+    return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), None, last_val_psnr
 
 # ================= 9. Validation =================
-def run_phase0_regression_check(pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu):
-    if not RUN_PHASE0_REGRESSION_TEST:
-        return
-    if not hasattr(pixart, "dualstream_enabled"):
-        print("ℹ️ Phase0 check skipped: model has no dualstream toggle.")
-        return
-
-    limited_loader = _build_limited_val_loader(val_loader, PHASE0_NUM_SAMPLES)
-    prev_flag = bool(getattr(pixart, "dualstream_enabled"))
-
-    print(f"🧪 Running Phase0 zero-impact check on {len(limited_loader.dataset)} samples...")
-    pixart.dualstream_enabled = False
-    val_off = validate(-1, pixart, adapter, vae, limited_loader, y_embed, data_info, lpips_fn_val_cpu)
-
-    pixart.dualstream_enabled = True
-    val_on = validate(-1, pixart, adapter, vae, limited_loader, y_embed, data_info, lpips_fn_val_cpu)
-    pixart.dualstream_enabled = prev_flag
-
-    key = int(BEST_VAL_STEPS) if int(BEST_VAL_STEPS) in val_off and int(BEST_VAL_STEPS) in val_on else next(iter(val_off.keys()))
-    a = val_off[key]
-    b = val_on[key]
-    psnr_drop = float(a[0] - b[0])
-    lpips_rise = float(b[2] - a[2])
-    print(f"[Phase0] dual_off@{key}: PSNR={a[0]:.4f}, LPIPS={a[2]:.4f} | dual_on@{key}: PSNR={b[0]:.4f}, LPIPS={b[2]:.4f}")
-    if psnr_drop > PHASE0_MAX_PSNR_DROP or lpips_rise > PHASE0_MAX_LPIPS_RISE:
-        raise RuntimeError(
-            f"Phase0 regression failed: psnr_drop={psnr_drop:.4f} (max {PHASE0_MAX_PSNR_DROP}), "
-            f"lpips_rise={lpips_rise:.4f} (max {PHASE0_MAX_LPIPS_RISE})"
-        )
-
-
 @torch.no_grad()
 def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
     tag = str(val_tag).lower()
@@ -1901,7 +1796,6 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             if FAST_DEV_RUN and len(psnrs) >= FAST_VAL_BATCHES: break
         res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
         results[int(steps)] = res
-        dual_m, dual_s = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
         am = float(np.mean(alpha_means)) if len(alpha_means) > 0 else 0.0
         ast = float(np.mean(alpha_stds)) if len(alpha_stds) > 0 else 0.0
@@ -1919,8 +1813,6 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
-        if DUALSTREAM_ENABLED:
-            msg += f" | dual_gate={dual_m:.4f}±{dual_s:.4f}"
         print(msg)
     pixart.train(); adapter.train()
     return results
@@ -1962,21 +1854,14 @@ def main():
     } if KV_COMPRESS_ENABLE else None
 
     inj_cfg = load_resume_injection_config({
-        "injection_strategy": INJECTION_STRATEGY,
-        "injection_cutoff_layer": INJECTION_CUTOFF_LAYER,
         "hard_layers": list(HARD_INJECTION_LAYERS),
-        "transition_layers": list(TRANSITION_INJECTION_LAYERS),
         "detail_layers": list(DETAIL_INJECTION_LAYERS),
     })
 
     pixart = PixArtSigmaSR_XL_2(
-        input_size=64, in_channels=4, out_channels=4, sparse_inject_ratio=SPARSE_INJECT_RATIO,
-        injection_cutoff_layer=int(inj_cfg["injection_cutoff_layer"]), injection_strategy=str(inj_cfg["injection_strategy"]),
+        input_size=64, in_channels=4, out_channels=4,
         hard_injection_layers=list(inj_cfg["hard_layers"]),
-        transition_injection_layers=list(inj_cfg["transition_layers"]),
         detail_injection_layers=list(inj_cfg["detail_layers"]),
-        dualstream_enabled=DUALSTREAM_ENABLED, cross_attn_start_layer=DUAL_CROSS_ATTN_START, dual_num_heads=DUAL_NUM_HEADS,
-        use_style_fusion=USE_STYLE_FUSION,
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
     set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
@@ -1984,12 +1869,6 @@ def main():
         print(f"[KV-Compress] enabled scale={KV_COMPRESS_SCALE} layers={KV_COMPRESS_LAYERS}")
     else:
         print("[KV-Compress] disabled")
-    overlap_start = int(max(0, DUAL_CROSS_ATTN_START))
-    overlap_end = int(min(int(inj_cfg["injection_cutoff_layer"]) - 1, pixart.depth - 1))
-    if overlap_end >= overlap_start:
-        print(f"[Inject×Dual overlap] layers {overlap_start}..{overlap_end}")
-    else:
-        print(f"[Inject×Dual overlap] none (inject< {int(inj_cfg['injection_cutoff_layer'])}, dual>= {DUAL_CROSS_ATTN_START})")
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
@@ -2006,7 +1885,12 @@ def main():
         print("ℹ️ LoRA disabled.")
     pixart.train()
 
-    adapter = build_adapter_v8(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
+    adapter = build_adapter_v8(
+        in_channels=3,
+        hidden_size=1152,
+        injection_layers_map=getattr(pixart, "injection_layer_to_level", None),
+        ref_token_hw=32,
+    ).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
@@ -2065,18 +1949,13 @@ def main():
 
     if START_FROM_BASE_ONLY:
         ep_start, step, best, last_val_psnr = 0, 0, [], -1.0
-        adv_gate_opened, adv_gate_open_step = False, None
     else:
-        ep_start, step, best, _, adv_gate_opened, adv_gate_open_step, last_val_psnr = resume(
-            pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params,
-            discriminator=None, optimizer_d=None
+        ep_start, step, best, _, last_val_psnr = resume(
+            pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params
         )
     if ema is not None:
         ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
         ema.register(ema_named_params)
-
-    if DUALSTREAM_ENABLED:
-        run_phase0_regression_check(pixart, adapter, vae, val_loader, y, d_info, None)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
@@ -2170,35 +2049,9 @@ def main():
                 if calc_patch_loss:
                     active_idx = torch.nonzero(patch_t_mask, as_tuple=False).squeeze(1)
                     z0_sel = z0.index_select(0, active_idx)
-                    hr_sel = hr.index_select(0, active_idx)
-                    lr_sel = lr.index_select(0, active_idx)
-                    candidate_pred = []
-                    candidate_gt = []
-                    candidate_lr = []
-                    for _ in range(SED_PATCH_CANDIDATES):
-                        rand_top = torch.randint(0, SED_PATCH_GRID, (z0_sel.shape[0],), device=DEVICE)
-                        rand_left = torch.randint(0, SED_PATCH_GRID, (z0_sel.shape[0],), device=DEVICE)
-                        pred_k = torch.cat([decode_valid_patch_from_latent(vae, z0_sel[bi:bi+1], int(rand_top[bi]), int(rand_left[bi])) for bi in range(z0_sel.shape[0])], dim=0)
-                        gt_k = torch.cat([
-                            hr_sel[bi:bi+1, ..., int(rand_top[bi]) * 8 + 32:int(rand_top[bi]) * 8 + 32 + 256, int(rand_left[bi]) * 8 + 32:int(rand_left[bi]) * 8 + 32 + 256].clamp(-1, 1)
-                            for bi in range(z0_sel.shape[0])
-                        ], dim=0)
-                        lr_k = torch.cat([
-                            lr_sel[bi:bi+1, ..., int(rand_top[bi]) * 8 + 32:int(rand_top[bi]) * 8 + 32 + 256, int(rand_left[bi]) * 8 + 32:int(rand_left[bi]) * 8 + 32 + 256].clamp(-1, 1)
-                            for bi in range(z0_sel.shape[0])
-                        ], dim=0)
-                        candidate_pred.append(pred_k)
-                        candidate_gt.append(gt_k)
-                        candidate_lr.append(lr_k)
-                    stacked_pred = torch.stack(candidate_pred, dim=1)
-                    stacked_gt = torch.stack(candidate_gt, dim=1)
-                    stacked_lr = torch.stack(candidate_lr, dim=1)
-                    score_list = [score_patch_hardness(stacked_gt[:, k], stacked_pred[:, k]) for k in range(SED_PATCH_CANDIDATES)]
-                    score_stack = torch.stack(score_list, dim=1)
-                    best_k = score_stack.argmax(dim=1)
-                    img_p_valid = stacked_pred[torch.arange(stacked_pred.shape[0], device=DEVICE), best_k]
-                    img_t_valid = stacked_gt[torch.arange(stacked_gt.shape[0], device=DEVICE), best_k]
-                    lr_patch = stacked_lr[torch.arange(stacked_lr.shape[0], device=DEVICE), best_k]
+                    img_p_valid = _decode_vae_sample_checkpointed(vae, z0_sel / vae.config.scaling_factor).clamp(-1, 1)
+                    img_t_valid = hr.index_select(0, active_idx).clamp(-1, 1)
+                    lr_patch = lr.index_select(0, active_idx).clamp(-1, 1)
 
                     if w.get('lr_cons', 0.0) > 0:
                         loss_lr_cons = structure_consistency_loss(img_p_valid, lr_patch)
@@ -2241,7 +2094,6 @@ def main():
                 else:
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
-                dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
                 detail_stats = getattr(pixart, "_last_detail_attn_stats", {}) or {}
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
@@ -2263,7 +2115,6 @@ def main():
                     'l_gs': f"{float(detail_stats.get('detail_lr_gate_std', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
-                    **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
                 })
 
         if accum_micro_steps > 0 and not reached_max_steps:
@@ -2328,16 +2179,12 @@ def main():
             best_eval_metrics_this_round,
             dl_gen,
             ema=ema,
-            discriminator=None,
-            optimizer_d=None,
             keep_keys=ever_keys,
             eval_source=best_eval_source_this_round,
             eval_steps=int(BEST_VAL_STEPS),
             eval_tag=f"val{validation_count}",
             export_eval_weights=True,
             ema_named_params=ema_named_params,
-            adv_gate_opened=False,
-            adv_gate_open_step=None,
             last_val_psnr=last_val_psnr,
         )
 

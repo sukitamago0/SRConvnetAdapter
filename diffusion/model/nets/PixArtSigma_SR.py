@@ -29,7 +29,7 @@ class ReferenceCrossAttention(nn.Module):
         q = self.query_ln(query)
         kv = self.context_ln(context)
         out, _ = self.mha(q, kv, kv, need_weights=False)
-        return query + self.out_proj(out)
+        return self.out_proj(out)
 
 
 class LRAttention(nn.Module):
@@ -44,7 +44,7 @@ class LRAttention(nn.Module):
         q = self.query_ln(query)
         kv = self.context_ln(context)
         out, _ = self.mha(q, kv, kv, need_weights=False)
-        return query + self.out_proj(out)
+        return self.out_proj(out)
 
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint
@@ -59,7 +59,6 @@ class PixArtSigmaSR(PixArtMS):
         self,
         force_null_caption: bool = True,
         hard_injection_layers=None,
-        transition_injection_layers=None,
         detail_injection_layers=None,
         injection_layer_to_level=None,
         **kwargs
@@ -82,16 +81,12 @@ class PixArtSigmaSR(PixArtMS):
         self.force_null_caption = bool(force_null_caption)
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
-        self.injection_layers = list(range(self.depth))
-        self.input_res_proj = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size, bias=True) for _ in range(self.depth)])
-        self.inject_gate = nn.Parameter(torch.full((self.depth,), -4.0))
         self.sft_cond_reduce = nn.Sequential(
             nn.Conv2d(self.hidden_size, 64, 1),
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
         self.hard_injection_layers = set(hard_injection_layers or [2, 4, 6, 8, 10, 12])
-        self.transition_injection_layers = set(transition_injection_layers or [])
         self.detail_injection_layers = list(detail_injection_layers or [14, 16, 18, 20, 22, 24])
         self.injection_layer_to_level = dict(injection_layer_to_level or {})
         self.detail_ref_attn = nn.ModuleDict()
@@ -101,15 +96,12 @@ class PixArtSigmaSR(PixArtMS):
         self._last_sft_stats = None
         self._last_detail_attn_stats = None
 
-        for lin in self.input_res_proj:
-            nn.init.normal_(lin.weight, mean=0.0, std=1e-3)
-            nn.init.zeros_(lin.bias)
         for layer_id in self.detail_injection_layers:
             k = str(layer_id)
             self.detail_ref_attn[k] = ReferenceCrossAttention(self.hidden_size, self.num_heads)
             self.detail_lr_attn[k] = LRAttention(self.hidden_size, self.num_heads)
-            self.detail_ref_gate[k] = nn.Parameter(torch.zeros(1))
-            self.detail_lr_gate[k] = nn.Parameter(torch.zeros(1))
+            self.detail_ref_gate[k] = nn.Parameter(torch.full((1,), -8.0))
+            self.detail_lr_gate[k] = nn.Parameter(torch.full((1,), -8.0))
 
     def _resolve_detail_level(self, layer_idx: int) -> str:
         mapped = self.injection_layer_to_level.get(layer_idx, None)
@@ -144,12 +136,10 @@ class PixArtSigmaSR(PixArtMS):
             c_size, ar = data_info['img_hw'].to(self.dtype), data_info['aspect_ratio'].to(self.dtype)
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
-        cond_tokens = None
         cond_map = None
         ref_feats = {}
         lr_feats = {}
         if isinstance(adapter_cond, dict):
-            cond_tokens = adapter_cond.get("cond_tokens", None)
             cond_map = adapter_cond.get("cond_map", None)
             ref_feats = {
                 "low": adapter_cond.get("ref_low", None),
@@ -184,12 +174,6 @@ class PixArtSigmaSR(PixArtMS):
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
 
         for i, block in enumerate(self.blocks):
-            if cond_tokens is not None:
-                feat = cond_tokens.to(dtype=torch.float32)
-                res = self.input_res_proj[i](feat).to(dtype=x.dtype)
-                gate = torch.sigmoid(self.inject_gate[i]).to(dtype=x.dtype)
-                x = x + gate * res
-
             if cond_red is not None and i in self.hard_injection_layers:
                 b, n, c = x.shape
                 if n != self.h * self.w:
@@ -220,14 +204,14 @@ class PixArtSigmaSR(PixArtMS):
                 k = str(i)
                 if ref_ctx is not None and k in self.detail_ref_attn:
                     ref_tokens = ref_ctx.flatten(2).transpose(1, 2).to(dtype=x.dtype)
-                    ref_out = self.detail_ref_attn[k](x, ref_tokens) - x
+                    ref_out = self.detail_ref_attn[k](x, ref_tokens)
                     ref_gate = torch.sigmoid(self.detail_ref_gate[k]).to(dtype=x.dtype).view(1, 1, 1)
                     x = x + ref_gate * ref_out
                     denom = x.detach().float().norm(dim=-1).mean() + 1e-6
                     ref_res_ratio_vals.append(float((ref_gate.detach().float() * ref_out.detach().float().norm(dim=-1).mean() / denom).item()))
                 if lr_ctx is not None and k in self.detail_lr_attn:
                     lr_tokens = lr_ctx.flatten(2).transpose(1, 2).to(dtype=x.dtype)
-                    lr_out = self.detail_lr_attn[k](x, lr_tokens) - x
+                    lr_out = self.detail_lr_attn[k](x, lr_tokens)
                     lr_gate = torch.sigmoid(self.detail_lr_gate[k]).to(dtype=x.dtype).view(1, 1, 1)
                     x = x + lr_gate * lr_out
                     denom = x.detach().float().norm(dim=-1).mean() + 1e-6
