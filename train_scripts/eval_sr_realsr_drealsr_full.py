@@ -29,7 +29,7 @@ from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.nets.adapter import build_adapter_v8
 
 
 
@@ -441,27 +441,18 @@ def build_model_and_assets(args, device, compute_dtype):
     inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
     if not isinstance(inj_cfg, dict):
         inj_cfg = {}
+    injection_layer_to_level = dict(inj_cfg.get("injection_layer_to_level", {}))
+    ref_token_hw = int(inj_cfg.get("ref_token_hw", 32))
 
-    sparse_inject_ratio = float(ckpt.get("sparse_inject_ratio", 1.0))
-    dualstream_enabled = bool(ckpt.get("dualstream_enabled", False))
-    dual_cross_attn_start = int(ckpt.get("dual_cross_attn_start", 16))
-    dual_num_heads = int(ckpt.get("dual_num_heads", 16))
-    use_style_fusion = bool(ckpt.get("use_style_fusion", False))
+    cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
-        sparse_inject_ratio=sparse_inject_ratio,
-        injection_cutoff_layer=int(inj_cfg.get("injection_cutoff_layer", 28)),
-        injection_strategy=str(inj_cfg.get("injection_strategy", "three_stage_sr")),
         hard_injection_layers=list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12])),
-        transition_injection_layers=list(inj_cfg.get("transition_layers", [])),
         detail_injection_layers=list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24])),
-        dualstream_enabled=dualstream_enabled,
-        cross_attn_start_layer=dual_cross_attn_start,
-        dual_num_heads=dual_num_heads,
-        use_style_fusion=use_style_fusion,
+        injection_layer_to_level=injection_layer_to_level,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -475,8 +466,6 @@ def build_model_and_assets(args, device, compute_dtype):
             pixart.init_lr_embedder_from_x_embedder()
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
-
-    cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
 
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in pixart_state.keys())
 
@@ -527,10 +516,10 @@ def build_model_and_assets(args, device, compute_dtype):
             "This usually means the eval script rebuilt LoRA with the wrong rank/alpha."
         )
 
-    adapter = build_adapter_v7(
+    adapter = build_adapter_v8(
         in_channels=3,
         hidden_size=1152,
-        injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
+        ref_token_hw=ref_token_hw,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
 

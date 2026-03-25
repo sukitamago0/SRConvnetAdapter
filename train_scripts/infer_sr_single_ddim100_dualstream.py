@@ -16,7 +16,7 @@ from PIL import Image
 from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.nets.adapter import build_adapter_v8
 
 
 def randn_like_with_generator(tensor, generator):
@@ -152,29 +152,18 @@ def run(args):
 
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
     inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
-    injection_strategy = str(inj_cfg.get("injection_strategy", "three_stage_sr"))
-    injection_cutoff_layer = int(inj_cfg.get("injection_cutoff_layer", 28))
     hard_layers = list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12]))
-    transition_layers = list(inj_cfg.get("transition_layers", []))
     detail_layers = list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24]))
+    injection_layer_to_level = dict(inj_cfg.get("injection_layer_to_level", {}))
+    ref_token_hw = int(inj_cfg.get("ref_token_hw", 32))
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
-        sparse_inject_ratio=1.0,
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        dualstream_enabled=False,
-        cross_attn_start_layer=16,
-        dual_num_heads=16,
+        hard_injection_layers=hard_layers,
+        detail_injection_layers=detail_layers,
+        injection_layer_to_level=injection_layer_to_level,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -189,10 +178,10 @@ def run(args):
     else:
         pixart.load_state_dict(base, strict=False)
 
-    adapter = build_adapter_v7(
-        in_channels=4,
+    adapter = build_adapter_v8(
+        in_channels=3,
         hidden_size=1152,
-        injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),
+        ref_token_hw=ref_token_hw,
     ).to(device).float()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
