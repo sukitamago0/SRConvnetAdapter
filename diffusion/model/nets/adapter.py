@@ -64,16 +64,62 @@ class SRConvNetLSAAdapter(nn.Module):
         }
 
 
-class DegradationCleanStem(nn.Module):
-    def __init__(self, channels: int):
+class LayerNorm2d(nn.Module):
+    def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
-        self.dw = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
-        self.pw = nn.Conv2d(channels, channels, 1)
-        self.act = nn.GELU()
-        self.out = nn.Conv2d(channels, channels, 3, padding=1)
+        self.weight = nn.Parameter(torch.ones(1, num_channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+        self.eps = float(eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.out(self.act(self.pw(self.dw(x))))
+        var = x.var(dim=1, keepdim=True, unbiased=False)
+        mean = x.mean(dim=1, keepdim=True)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        return x * self.weight + self.bias
+
+
+class SimpleGate(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+
+class NAFBlock(nn.Module):
+    def __init__(self, channels: int, dw_expand: int = 2, ffn_expand: int = 2):
+        super().__init__()
+        dw_channel = channels * dw_expand
+        ffn_channel = channels * ffn_expand
+
+        self.norm1 = LayerNorm2d(channels)
+        self.conv1 = nn.Conv2d(channels, dw_channel, kernel_size=1, stride=1, padding=0)
+        self.conv2 = nn.Conv2d(dw_channel, dw_channel, kernel_size=3, stride=1, padding=1, groups=dw_channel)
+        self.sg = SimpleGate()
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dw_channel // 2, dw_channel // 2, kernel_size=1, stride=1, padding=0),
+        )
+        self.conv3 = nn.Conv2d(dw_channel // 2, channels, kernel_size=1, stride=1, padding=0)
+        self.beta = nn.Parameter(torch.zeros((1, channels, 1, 1)))
+
+        self.norm2 = LayerNorm2d(channels)
+        self.conv4 = nn.Conv2d(channels, ffn_channel, kernel_size=1, stride=1, padding=0)
+        self.conv5 = nn.Conv2d(ffn_channel // 2, channels, kernel_size=1, stride=1, padding=0)
+        self.gamma = nn.Parameter(torch.zeros((1, channels, 1, 1)))
+
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        x = self.norm1(inp)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.sg(x)
+        x = x * self.sca(x)
+        x = self.conv3(x)
+        y = inp + x * self.beta
+
+        x = self.norm2(y)
+        x = self.conv4(x)
+        x = self.sg(x)
+        x = self.conv5(x)
+        return y + x * self.gamma
 
 
 class SRConvNetLSAAdapterV8(nn.Module):
@@ -101,9 +147,13 @@ class SRConvNetLSAAdapterV8(nn.Module):
         self.proj4 = nn.Conv2d(256, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
 
-        self.ref_low_stem = DegradationCleanStem(128)
-        self.ref_mid_stem = DegradationCleanStem(256)
-        self.ref_high_stem = DegradationCleanStem(256)
+        # NOTE:
+        # - 当前 ref_* path 使用 NAFBlock 作为成熟恢复模块，替代原自创 clean stem。
+        # - 目的仅是提高 reference feature refinement 的先验可靠性。
+        # - 不是完整的 CasSR stage-1 reproduction。
+        self.ref_low_refiner = nn.Sequential(NAFBlock(128))
+        self.ref_mid_refiner = nn.Sequential(NAFBlock(256))
+        self.ref_high_refiner = nn.Sequential(NAFBlock(256))
         self.ref_low_proj = nn.Conv2d(128, self.hidden_size, 1)
         self.ref_mid_proj = nn.Conv2d(256, self.hidden_size, 1)
         self.ref_high_proj = nn.Conv2d(256, self.hidden_size, 1)
@@ -151,9 +201,9 @@ class SRConvNetLSAAdapterV8(nn.Module):
         # They are kept only for interface compatibility with older experiments.
         cond_tokens = fused_cond_map.flatten(2).transpose(1, 2)
 
-        ref_low = self.ref_low_proj(self.ref_low_stem(self._to_ref_token_hw(f2)))
-        ref_mid = self.ref_mid_proj(self.ref_mid_stem(self._to_ref_token_hw(f3)))
-        ref_high = self.ref_high_proj(self.ref_high_stem(self._to_ref_token_hw(f4)))
+        ref_low = self.ref_low_proj(self.ref_low_refiner(self._to_ref_token_hw(f2)))
+        ref_mid = self.ref_mid_proj(self.ref_mid_refiner(self._to_ref_token_hw(f3)))
+        ref_high = self.ref_high_proj(self.ref_high_refiner(self._to_ref_token_hw(f4)))
 
         lr_low = self.lr_low_proj(self._to_ref_token_hw(f2))
         lr_mid = self.lr_mid_proj(self._to_ref_token_hw(f3))
