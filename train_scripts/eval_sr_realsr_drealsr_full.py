@@ -29,7 +29,7 @@ from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v7
+from diffusion.model.nets.adapter import build_adapter_v8
 
 
 
@@ -442,7 +442,8 @@ def build_model_and_assets(args, device, compute_dtype):
     if not isinstance(inj_cfg, dict):
         inj_cfg = {}
 
-    sparse_inject_ratio = float(ckpt.get("sparse_inject_ratio", 1.0))
+    cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
+    sparse_inject_ratio = float(cfg.get("sparse_inject_ratio", ckpt.get("sparse_inject_ratio", 1.0)))
     dualstream_enabled = bool(ckpt.get("dualstream_enabled", False))
     dual_cross_attn_start = int(ckpt.get("dual_cross_attn_start", 16))
     dual_num_heads = int(ckpt.get("dual_num_heads", 16))
@@ -475,8 +476,6 @@ def build_model_and_assets(args, device, compute_dtype):
             pixart.init_lr_embedder_from_x_embedder()
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
-
-    cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
 
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in pixart_state.keys())
 
@@ -527,7 +526,7 @@ def build_model_and_assets(args, device, compute_dtype):
             "This usually means the eval script rebuilt LoRA with the wrong rank/alpha."
         )
 
-    adapter = build_adapter_v7(
+    adapter = build_adapter_v8(
         in_channels=3,
         hidden_size=1152,
         injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None)),

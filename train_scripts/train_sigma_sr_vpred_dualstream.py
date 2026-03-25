@@ -45,8 +45,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v7
-from diffusion.model.nets.sed import CLIPSemanticExtractor, SeDPatchDiscriminator
+from diffusion.model.nets.adapter import build_adapter_v8
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -97,7 +96,7 @@ NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth"
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_sft_gwloss_lora16_sed")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_lora16_cassr_like")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -192,17 +191,7 @@ GW_WEIGHT_END = 0.02
 CKPT_SELECT_MODE = "psnr_gate_lpips"   # "psnr_first" | "lpips_first" | "psnr_gate_lpips"
 CKPT_SELECT_PSNR_GATE = 25.5
 BEST_PSNR_PATH = os.path.join(CKPT_DIR, "best_psnr.pth")
-BEST_LPIPS_GATE_PATH = os.path.join(CKPT_DIR, "best_lpips_gate.pth")
-
-USE_SED_GAN = True
-SED_GAN_WEIGHT_MAX = 0.01
-SED_GAN_RAMP_STEPS = 2000
-ADV_PSNR_GATE = 25.5
-SED_D_UPDATE_RATIO = 1
-SED_PATCH_GRID = 25
-SED_PATCH_LATENT = 40
-SED_PATCH_VALID = 256
-SED_PATCH_CANDIDATES = 4
+START_FROM_BASE_ONLY = True
 
 USE_LR_CONSISTENCY = True 
 USE_NOISE_CONSISTENCY = False
@@ -305,13 +294,6 @@ def score_patch_hardness(gt_patch_m11: torch.Tensor, pred_patch_m11: torch.Tenso
     corner_score = _harris_response(gt_gray).mean(dim=[1, 2, 3])
     residual_score = (pred_patch_m11.float() - gt_patch_m11.float()).abs().mean(dim=[1, 2, 3])
     return 0.5 * grad_score + 0.2 * corner_score + 0.3 * residual_score
-
-
-def get_adv_weight(step: int, adv_gate_opened: bool, adv_gate_open_step):
-    if (not adv_gate_opened) or (adv_gate_open_step is None):
-        return 0.0
-    p = min(1.0, max(0.0, float(step - adv_gate_open_step) / float(max(1, SED_GAN_RAMP_STEPS))))
-    return p * float(SED_GAN_WEIGHT_MAX)
 
 
 def decode_valid_patch_from_latent(vae, z0_latent: torch.Tensor, top: int, left: int) -> torch.Tensor:
@@ -738,8 +720,8 @@ def get_config_snapshot():
         "lora_alpha": float(LORA_ALPHA),
         "sparse_inject_ratio": SPARSE_INJECT_RATIO,
         "lr_latent_noise_std": INIT_NOISE_STD,
-        "loss_weights_mode": "fixed_sft_gw_sed_gate",
-        "adapter_type": "SRConvNetLSAAdapter",
+        "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
+        "adapter_type": "SRConvNetLSAAdapterV8",
         "seed": SEED,
         "lpips_enabled": bool(USE_LPIPS_PERCEP),
         "latent_l1_start": LATENT_L1_WEIGHT_START,
@@ -750,9 +732,6 @@ def get_config_snapshot():
         "gw_end": GW_WEIGHT_END,
         "ckpt_select_mode": CKPT_SELECT_MODE,
         "ckpt_select_psnr_gate": CKPT_SELECT_PSNR_GATE,
-        "adv_psnr_gate": ADV_PSNR_GATE,
-        "sed_gan_weight_max": SED_GAN_WEIGHT_MAX,
-        "sed_gan_ramp_steps": SED_GAN_RAMP_STEPS,
     }
 
 
@@ -1319,7 +1298,7 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
     return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
 
 
-def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, discriminator: nn.Module = None):
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     inject_gate_keys = INJECT_GATE_KEYWORDS
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
 
@@ -1365,15 +1344,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, discri
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
     }
-    optimizer_d = None
-    d_params_to_clip = []
-    if discriminator is not None:
-        d_params = [p for p in discriminator.parameters() if p.requires_grad]
-        if d_params:
-            optimizer_d = torch.optim.AdamW([{"params": d_params, "lr": 1e-4, "weight_decay": 0.0}], betas=(0.9, 0.99))
-            d_params_to_clip = d_params
-            group_counts["discriminator"] = len(d_params)
-    return optimizer, params_to_clip, group_counts, optimizer_d, d_params_to_clip
+    return optimizer, params_to_clip, group_counts
 
 
 def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module):
@@ -1502,8 +1473,6 @@ def save_smart(
         prev_aux = {
             "best_psnr": float(prev_entry.get("best_psnr", -float("inf"))),
             "best_psnr_step": int(prev_entry.get("best_psnr_step", -1)),
-            "best_lpips_gate": float(prev_entry.get("best_lpips_gate", float("inf"))),
-            "best_lpips_gate_step": int(prev_entry.get("best_lpips_gate_step", -1)),
         }
     else:
         prev_global_best = None
@@ -1555,7 +1524,6 @@ def save_smart(
             "lora_alpha": float(LORA_ALPHA),
             "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
             "optimizer": optimizer.state_dict(),
-            "optimizer_d": optimizer_d.state_dict() if optimizer_d is not None else None,
             "rng_state": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -1571,7 +1539,6 @@ def save_smart(
             "env_info": {"torch": torch.__version__, "numpy": np.__version__},
             "ema_state": ({k: v.detach().cpu().float() for k, v in ema.shadow.items()} if ema is not None else None),
             "checkpoint_role": str(checkpoint_role),
-            "discriminator": ({k: v.detach().float().cpu() for k, v in discriminator.state_dict().items()} if discriminator is not None else None),
             "adv_gate_opened": bool(adv_gate_opened),
             "adv_gate_open_step": (None if adv_gate_open_step is None else int(adv_gate_open_step)),
             "last_val_psnr": float(last_val_psnr),
@@ -1592,23 +1559,15 @@ def save_smart(
     new_global_best = dict(current_record) if save_as_best else (dict(prev_global_best) if prev_global_best is not None else dict(current_record))
 
     best_psnr = float(prev_aux.get("best_psnr", -float("inf")))
-    best_lpips = float(prev_aux.get("best_lpips_gate", float("inf")))
     if math.isfinite(psnr_v) and psnr_v > best_psnr:
         best_psnr = float(psnr_v)
         best_psnr_step = int(global_step)
     else:
         best_psnr_step = int(prev_aux.get("best_psnr_step", global_step if best_psnr > -float("inf") else -1))
-    if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v < best_lpips:
-        best_lpips = float(lpips_v)
-        best_lpips_step = int(global_step)
-    else:
-        best_lpips_step = int(prev_aux.get("best_lpips_gate_step", global_step if math.isfinite(best_lpips) else -1))
 
     new_aux_meta = {
         "best_psnr": float(best_psnr),
         "best_psnr_step": int(best_psnr_step),
-        "best_lpips_gate": float(best_lpips),
-        "best_lpips_gate_step": int(best_lpips_step),
     }
     next_best_records = [{
         "global_best_record": new_global_best,
@@ -1640,10 +1599,6 @@ def save_smart(
         state_psnr = _build_state_dict_snapshot(checkpoint_role="best_psnr")
         state_psnr["best_records"] = next_best_records
         atomic_torch_save(state_psnr, BEST_PSNR_PATH)
-    if math.isfinite(psnr_v) and math.isfinite(lpips_v) and psnr_v >= CKPT_SELECT_PSNR_GATE and lpips_v <= new_aux_meta["best_lpips_gate"]:
-        state_lp = _build_state_dict_snapshot(checkpoint_role="best_lpips_gate")
-        state_lp["best_records"] = next_best_records
-        atomic_torch_save(state_lp, BEST_LPIPS_GATE_PATH)
 
     # remove legacy rolling-best artifacts from older runs to keep CKPT_DIR clean
     if best_saved:
@@ -2051,18 +2006,7 @@ def main():
         print("ℹ️ LoRA disabled.")
     pixart.train()
 
-    adapter = build_adapter_v7(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
-    # SeD GAN depends on OpenAI CLIP (`pip install git+https://github.com/openai/CLIP.git`).
-    if USE_SED_GAN:
-        try:
-            import clip as _clip_dep  # noqa: F401
-        except ImportError as exc:
-            raise ImportError(
-                "USE_SED_GAN=True requires the OpenAI CLIP package. "
-                "Install it with: pip install git+https://github.com/openai/CLIP.git"
-            ) from exc
-    semantic_extractor = CLIPSemanticExtractor(pretrained=True).to(DEVICE).eval() if USE_SED_GAN else None
-    discriminator = SeDPatchDiscriminator().to(DEVICE).train() if USE_SED_GAN else None
+    adapter = build_adapter_v8(in_channels=4, hidden_size=1152, injection_layers_map=getattr(pixart, "injection_layer_to_level", getattr(pixart, "injection_layers", None))).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
@@ -2070,14 +2014,8 @@ def main():
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
 
     lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
-    lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval()
     for p in vae.parameters(): p.requires_grad_(False)
-    if semantic_extractor is not None:
-        for p in semantic_extractor.parameters(): p.requires_grad_(False)
     for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
-    for p in lpips_fn_train.parameters():
-        p.requires_grad_(False)
-    print("✅ Validation LPIPS is on CPU.")
 
     if not os.path.exists(NULL_T5_EMBED_PATH):
         raise FileNotFoundError(f"Null T5 embed not found: {NULL_T5_EMBED_PATH}")
@@ -2111,7 +2049,9 @@ def main():
     print(f"📏 EMA validation frequency: every {EMA_VALIDATE_EVERY} validations")
     print("📏 Raw validation frequency: every validation trigger")
 
-    if not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
+    if START_FROM_BASE_ONLY:
+        print("✅ START_FROM_BASE_ONLY=True: skip bootstrap/resume checkpoints; train from PixArt base.")
+    elif not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
         init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
 
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
@@ -2119,20 +2059,24 @@ def main():
         p.requires_grad_(True)
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
-    optimizer, params_to_clip, group_counts, optimizer_d, d_params_to_clip = build_optimizer_and_clippables(pixart, adapter, discriminator)
+    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
     print(f"✅ Optim groups(single-stage): {group_counts}")
     _maybe_empty_cuda_cache()
 
-    ep_start, step, best, _, adv_gate_opened, adv_gate_open_step, last_val_psnr = resume(
-        pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params,
-        discriminator=discriminator, optimizer_d=optimizer_d
-    )
+    if START_FROM_BASE_ONLY:
+        ep_start, step, best, last_val_psnr = 0, 0, [], -1.0
+        adv_gate_opened, adv_gate_open_step = False, None
+    else:
+        ep_start, step, best, _, adv_gate_opened, adv_gate_open_step, last_val_psnr = resume(
+            pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params,
+            discriminator=None, optimizer_d=None
+        )
     if ema is not None:
         ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
         ema.register(ema_named_params)
 
     if DUALSTREAM_ENABLED:
-        run_phase0_regression_check(pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu)
+        run_phase0_regression_check(pixart, adapter, vae, val_loader, y, d_info, None)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
     max_steps = MAX_TRAIN_STEPS if MAX_TRAIN_STEPS > 0 else (FAST_TRAIN_STEPS if FAST_DEV_RUN else None)
@@ -2141,8 +2085,6 @@ def main():
         train_ds.set_epoch(epoch)
         pbar = tqdm(train_loader, dynamic_ncols=True, desc=f"Ep{epoch+1}")
         accum_micro_steps = 0
-        if optimizer_d is not None:
-            optimizer_d.zero_grad(set_to_none=True)
         reached_max_steps = False
         for i, batch in enumerate(pbar):
             if max_steps is not None and step >= max_steps:
@@ -2213,19 +2155,13 @@ def main():
                 # Calculate patch-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
-                loss_lpips = torch.tensor(0.0, device=DEVICE)
-                loss_g_adv = torch.tensor(0.0, device=DEVICE)
-                loss_d_real = torch.tensor(0.0, device=DEVICE)
-                loss_d_fake = torch.tensor(0.0, device=DEVICE)
-                w_adv = 0.0
 
                 need_patch_loss = (
                     (w.get('lr_cons', 0.0) > 0) or
-                    (w.get('gw', 0.0) > 0) or
-                    (w.get('lpips', 0.0) > 0)
+                    (w.get('gw', 0.0) > 0)
                 )
 
-                PATCH_LOSS_T_MAX = max(int(PIXEL_LOSS_T_MAX), int(LPIPS_T_MAX))
+                PATCH_LOSS_T_MAX = int(PIXEL_LOSS_T_MAX)
                 patch_t_mask = (t <= PATCH_LOSS_T_MAX)
                 allow_by_stage = True
                 patch_loss_num_samples = int(patch_t_mask.sum().item()) if allow_by_stage else 0
@@ -2270,31 +2206,7 @@ def main():
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
 
-                    if w.get('lpips', 0.0) > 0:
-                        patch_local_t = t.index_select(0, active_idx)
-                        lpips_keep = (patch_local_t <= int(LPIPS_T_MAX))
-                        if bool(lpips_keep.any().item()):
-                            lpips_idx = torch.nonzero(lpips_keep, as_tuple=False).squeeze(1)
-                            pred_lp = img_p_valid.index_select(0, lpips_idx)
-                            targ_lp = img_t_valid.index_select(0, lpips_idx)
-                            loss_lpips = perceptual_lpips_loss(lpips_fn_train, pred_lp, targ_lp)
-
-                    w_adv = get_adv_weight(step, adv_gate_opened, adv_gate_open_step)
-                    if USE_SED_GAN and discriminator is not None and optimizer_d is not None and adv_gate_opened and w_adv > 0.0:
-                        with torch.no_grad():
-                            hr_semantic = semantic_extractor((img_t_valid.float() + 1.0) * 0.5)
-                        for p in discriminator.parameters():
-                            p.requires_grad_(False)
-                        fake_g_pred = discriminator((img_p_valid.float() + 1.0) * 0.5, hr_semantic)
-                        loss_g_adv = gan_bce_loss(fake_g_pred, True)
-
-                        for p in discriminator.parameters():
-                            p.requires_grad_(True)
-                        real_d_pred = discriminator((img_t_valid.float() + 1.0) * 0.5, hr_semantic.detach())
-                        fake_d_pred = discriminator((img_p_valid.detach().float() + 1.0) * 0.5, hr_semantic.detach())
-                        loss_d_real = gan_bce_loss(real_d_pred, True)
-                        loss_d_fake = gan_bce_loss(fake_d_pred, False)
-                        ((loss_d_real + loss_d_fake) * 0.5 / GRAD_ACCUM_STEPS).backward(retain_graph=True)
+                    # CasSR route: disable GAN + LPIPS training loss.
                 else:
                     patch_loss_num_samples = 0
 
@@ -2304,8 +2216,6 @@ def main():
                     + w['latent_l1'] * loss_latent_l1
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
-                    + w.get('lpips', 0.0) * loss_lpips
-                    + (w_adv * loss_g_adv if USE_SED_GAN else 0.0)
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2316,12 +2226,7 @@ def main():
                 log_critical_path_gradients(step + 1, pixart, adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
-                if optimizer_d is not None and d_params_to_clip:
-                    torch.nn.utils.clip_grad_norm_(d_params_to_clip, 1.0)
-                    optimizer_d.step()
                 optimizer.zero_grad()
-                if optimizer_d is not None:
-                    optimizer_d.zero_grad(set_to_none=True)
                 step += 1
                 if ema is not None:
                     ema.update(ema_named_params)
@@ -2337,25 +2242,25 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 dual_gate_mean, _ = _extract_dual_gate_stats(pixart) if DUALSTREAM_ENABLED else (0.0, 0.0)
+                detail_stats = getattr(pixart, "_last_detail_attn_stats", {}) or {}
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
-                    'lpips_tr': f"{loss_lpips.item():.3f}",
-                    'w_lpips': f"{w.get('lpips', 0.0):.3f}",
                     'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
-                    'gate_on': f"{int(adv_gate_opened)}",
-                    'w_adv': f"{w_adv:.4f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'g_adv': f"{loss_g_adv.item():.3f}",
-                    'd_r': f"{loss_d_real.item():.3f}",
-                    'd_f': f"{loss_d_fake.item():.3f}",
+                    'ref_rr': f"{float(detail_stats.get('ref_attn_res_ratio', 0.0)):.3f}",
+                    'lr_rr': f"{float(detail_stats.get('lr_attn_res_ratio', 0.0)):.3f}",
+                    'r_gm': f"{float(detail_stats.get('detail_ref_gate_mean', 0.0)):.3f}",
+                    'r_gs': f"{float(detail_stats.get('detail_ref_gate_std', 0.0)):.3f}",
+                    'l_gm': f"{float(detail_stats.get('detail_lr_gate_mean', 0.0)):.3f}",
+                    'l_gs': f"{float(detail_stats.get('detail_lr_gate_std', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                     **({'d_gate': f"{dual_gate_mean:.3f}"} if DUALSTREAM_ENABLED else {}),
@@ -2365,12 +2270,7 @@ def main():
             log_critical_path_gradients(step + 1, pixart, adapter)
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
-            if optimizer_d is not None and d_params_to_clip:
-                torch.nn.utils.clip_grad_norm_(d_params_to_clip, 1.0)
-                optimizer_d.step()
             optimizer.zero_grad()
-            if optimizer_d is not None:
-                optimizer_d.zero_grad(set_to_none=True)
             step += 1
             if ema is not None:
                 ema.update(ema_named_params)
@@ -2417,10 +2317,6 @@ def main():
 
         print(f"[SingleStage] val_psnr={float(best_eval_metrics_this_round[0]):.3f}")
         last_val_psnr = float(raw_metrics[0])
-        if (not adv_gate_opened) and (last_val_psnr >= float(ADV_PSNR_GATE)):
-            adv_gate_opened = True
-            adv_gate_open_step = int(step)
-            print(f"[ADV_GATE] opened at step={step}, psnr={last_val_psnr:.4f}")
 
         best = save_smart(
             epoch,
@@ -2432,16 +2328,16 @@ def main():
             best_eval_metrics_this_round,
             dl_gen,
             ema=ema,
-            discriminator=discriminator,
-            optimizer_d=optimizer_d,
+            discriminator=None,
+            optimizer_d=None,
             keep_keys=ever_keys,
             eval_source=best_eval_source_this_round,
             eval_steps=int(BEST_VAL_STEPS),
             eval_tag=f"val{validation_count}",
             export_eval_weights=True,
             ema_named_params=ema_named_params,
-            adv_gate_opened=adv_gate_opened,
-            adv_gate_open_step=adv_gate_open_step,
+            adv_gate_opened=False,
+            adv_gate_open_step=None,
             last_val_psnr=last_val_psnr,
         )
 
