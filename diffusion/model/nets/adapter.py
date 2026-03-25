@@ -147,6 +147,8 @@ class SRConvNetLSAAdapterV8(nn.Module):
         c3 = self.proj3(f3)
         c4 = self.proj4(f4)
         fused_cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
+        # NOTE: cond_tokens are currently not consumed by the CasSR-like mainline.
+        # They are kept only for interface compatibility with older experiments.
         cond_tokens = fused_cond_map.flatten(2).transpose(1, 2)
 
         ref_low = self.ref_low_proj(self.ref_low_stem(self._to_ref_token_hw(f2)))
@@ -169,8 +171,7 @@ class SRConvNetLSAAdapterV8(nn.Module):
         }
 
 
-def build_adapter_v8(in_channels=3, hidden_size=1152, injection_layers_map=None, ref_token_hw=32):
-    del injection_layers_map
+def build_adapter_v8(in_channels=3, hidden_size=1152, ref_token_hw=32):
     return SRConvNetLSAAdapterV8(in_channels=in_channels, hidden_size=hidden_size, ref_token_hw=ref_token_hw)
 
 

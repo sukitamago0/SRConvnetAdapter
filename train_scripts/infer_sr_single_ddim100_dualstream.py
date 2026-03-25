@@ -154,6 +154,8 @@ def run(args):
     inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
     hard_layers = list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12]))
     detail_layers = list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24]))
+    injection_layer_to_level = dict(inj_cfg.get("injection_layer_to_level", {}))
+    ref_token_hw = int(inj_cfg.get("ref_token_hw", 32))
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
@@ -161,6 +163,7 @@ def run(args):
         out_channels=4,
         hard_injection_layers=hard_layers,
         detail_injection_layers=detail_layers,
+        injection_layer_to_level=injection_layer_to_level,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -178,8 +181,7 @@ def run(args):
     adapter = build_adapter_v8(
         in_channels=3,
         hidden_size=1152,
-        injection_layers_map=getattr(pixart, "injection_layer_to_level", None),
-        ref_token_hw=32,
+        ref_token_hw=ref_token_hw,
     ).to(device).float()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))

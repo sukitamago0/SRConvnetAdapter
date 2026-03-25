@@ -52,20 +52,25 @@ from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
 BASE_PIXART_SHA256 = None
 
-# Added "aug_embedder" to required keys
-V7_REQUIRED_PIXART_KEY_FRAGMENTS = (
-    "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj",
-    "style_fusion_mlp", "aug_embedder", "injection_scales", "sft_cond_reduce", "sft_layers"
+ACTIVE_PIXART_KEY_FRAGMENTS = (
+    "final_layer",
+    "sft_cond_reduce",
+    "sft_layers",
+    "detail_ref_attn",
+    "detail_lr_attn",
+    "detail_ref_gate",
+    "detail_lr_gate",
+    "lora_A",
+    "lora_B",
 )
-FP32_SAVE_KEY_FRAGMENTS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
-INJECT_GATE_KEYWORDS = V7_REQUIRED_PIXART_KEY_FRAGMENTS
+FP32_SAVE_KEY_FRAGMENTS = ACTIVE_PIXART_KEY_FRAGMENTS
 FINAL_LAYER_KEYWORD = "final_layer"
 TRAIN_ADAPTER_IN_STAGE_A = True
 
-def get_required_v7_key_fragments_for_model(model: nn.Module):
+def get_required_active_key_fragments_for_model(model: nn.Module):
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
     required = []
-    for frag in V7_REQUIRED_PIXART_KEY_FRAGMENTS:
+    for frag in ACTIVE_PIXART_KEY_FRAGMENTS:
         if any(frag in name for name in trainable_names):
             required.append(frag)
     return tuple(required)
@@ -132,6 +137,14 @@ INJECT_INIT_P = 2.0
 HARD_INJECTION_LAYERS = [2, 4, 6, 8, 10, 12]
 TRANSITION_INJECTION_LAYERS = []
 DETAIL_INJECTION_LAYERS = [14, 16, 18, 20, 22, 24]
+DEFAULT_INJECTION_LAYER_TO_LEVEL = {
+    14: "mid",
+    16: "mid",
+    18: "high",
+    20: "high",
+    22: "high",
+    24: "high",
+}
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -587,7 +600,7 @@ def collect_trainable_state_dict(model: nn.Module):
         state[name] = tensor
     return state
 
-def validate_v7_trainable_state_keys(trainable_sd: dict, required_fragments):
+def validate_active_trainable_state_keys(trainable_sd: dict, required_fragments):
     keys = list(trainable_sd.keys())
     missing = []
     counts = {}
@@ -596,7 +609,7 @@ def validate_v7_trainable_state_keys(trainable_sd: dict, required_fragments):
         counts[frag] = c
         if c == 0: missing.append(frag)
     if missing:
-        raise RuntimeError("v7 trainable checkpoint validation failed: " + ", ".join(missing))
+        raise RuntimeError("active trainable checkpoint validation failed: " + ", ".join(missing))
     return counts
 
 def compute_injection_scale_reg(model: nn.Module, lambda_reg: float = 1e-4):
@@ -649,9 +662,17 @@ class ParamEMA:
 
 def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = "small"):
     names = (
-        "alpha_struct", "alpha_trans", "alpha_detail", "input_res_proj", "style_fusion_mlp", "sft_cond_reduce", "sft_layers",
-        "aug_embedder", "injection_scales", "csft_dw", "csft_pw", "final_layer", "lora_A", "lora_B", "x_embedder",
-        "lr_embedder", "dual_norm", "dual_q", "dual_kv", "dual_out", "dual_gate", "sem_norm", "sem_q", "sem_kv", "sem_out", "sem_gate"
+        "final_layer",
+        "sft_cond_reduce",
+        "sft_layers",
+        "detail_ref_attn",
+        "detail_lr_attn",
+        "detail_ref_gate",
+        "detail_lr_gate",
+        "lora_A",
+        "lora_B",
+        "x_embedder",
+        "aug_embedder",
     )
     out = []
     for n, p in adapter.named_parameters():
@@ -720,6 +741,8 @@ def load_resume_injection_config(default_cfg: dict):
             return cfg
         cfg["hard_layers"] = list(inj.get("hard_layers", cfg["hard_layers"]))
         cfg["detail_layers"] = list(inj.get("detail_layers", cfg["detail_layers"]))
+        cfg["injection_layer_to_level"] = dict(inj.get("injection_layer_to_level", cfg["injection_layer_to_level"]))
+        cfg["ref_token_hw"] = int(inj.get("ref_token_hw", cfg["ref_token_hw"]))
         print("[ResumeConfig] injection_config loaded from LAST_CKPT_PATH")
     except Exception as e:
         print(f"⚠️ Failed to load injection_config from LAST_CKPT_PATH: {e}")
@@ -1269,7 +1292,6 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
 
 
 def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
-    inject_gate_keys = INJECT_GATE_KEYWORDS
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
 
     lora_params = []
@@ -1449,8 +1471,8 @@ def save_smart(
 
     def _build_state_dict_snapshot(checkpoint_role: str):
         pixart_sd = collect_trainable_state_dict(pixart)
-        required_frags = get_required_v7_key_fragments_for_model(pixart)
-        v7_key_counts = validate_v7_trainable_state_keys(pixart_sd, required_frags)
+        required_frags = get_required_active_key_fragments_for_model(pixart)
+        active_key_counts = validate_active_trainable_state_keys(pixart_sd, required_frags)
         lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
         if ENABLE_LORA and lora_key_count == 0:
             raise RuntimeError("LoRA is enabled but no LoRA keys found in pixart_trainable.")
@@ -1458,7 +1480,7 @@ def save_smart(
             print("ℹ️ LoRA save check skipped (LoRA disabled or no trainable LoRA tensors).")
         else:
             print(f"✅ LoRA save check: {lora_key_count} tensors")
-        print("✅ v7 save check:", ", ".join([f"{k}={v}" for k, v in v7_key_counts.items()]))
+        print("✅ active save check:", ", ".join([f"{k}={v}" for k, v in active_key_counts.items()]))
 
         pixart_keep_sd = collect_state_dict_by_keys(pixart, keep_keys)
         state = {
@@ -1489,8 +1511,10 @@ def save_smart(
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
             "best_eval_tag": str(eval_tag),
             "injection_config": {
-                "hard_layers": list(HARD_INJECTION_LAYERS),
-                "detail_layers": list(DETAIL_INJECTION_LAYERS),
+                "hard_layers": sorted(list(getattr(pixart, "hard_injection_layers", HARD_INJECTION_LAYERS))),
+                "detail_layers": list(getattr(pixart, "detail_injection_layers", DETAIL_INJECTION_LAYERS)),
+                "injection_layer_to_level": dict(getattr(pixart, "injection_layer_to_level", {})),
+                "ref_token_hw": int(getattr(adapter, "ref_token_hw", 32)),
             },
         }
         return state
@@ -1628,7 +1652,7 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
             "Use last.pth or best.pth for resume."
         )
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
-    required_frags = get_required_v7_key_fragments_for_model(pixart)
+    required_frags = get_required_active_key_fragments_for_model(pixart)
     missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
     if missing_required:
         print("⚠️ Checkpoint missing some currently-trainable fragments (stage-switch expected): " + ", ".join(missing_required))
@@ -1856,12 +1880,15 @@ def main():
     inj_cfg = load_resume_injection_config({
         "hard_layers": list(HARD_INJECTION_LAYERS),
         "detail_layers": list(DETAIL_INJECTION_LAYERS),
+        "injection_layer_to_level": dict(DEFAULT_INJECTION_LAYER_TO_LEVEL),
+        "ref_token_hw": 32,
     })
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64, in_channels=4, out_channels=4,
         hard_injection_layers=list(inj_cfg["hard_layers"]),
         detail_injection_layers=list(inj_cfg["detail_layers"]),
+        injection_layer_to_level=dict(inj_cfg.get("injection_layer_to_level", DEFAULT_INJECTION_LAYER_TO_LEVEL)),
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
     set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
@@ -1888,8 +1915,7 @@ def main():
     adapter = build_adapter_v8(
         in_channels=3,
         hidden_size=1152,
-        injection_layers_map=getattr(pixart, "injection_layer_to_level", None),
-        ref_token_hw=32,
+        ref_token_hw=int(inj_cfg.get("ref_token_hw", 32)),
     ).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)

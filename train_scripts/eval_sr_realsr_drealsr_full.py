@@ -441,6 +441,8 @@ def build_model_and_assets(args, device, compute_dtype):
     inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
     if not isinstance(inj_cfg, dict):
         inj_cfg = {}
+    injection_layer_to_level = dict(inj_cfg.get("injection_layer_to_level", {}))
+    ref_token_hw = int(inj_cfg.get("ref_token_hw", 32))
 
     cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
 
@@ -450,6 +452,7 @@ def build_model_and_assets(args, device, compute_dtype):
         out_channels=4,
         hard_injection_layers=list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12])),
         detail_injection_layers=list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24])),
+        injection_layer_to_level=injection_layer_to_level,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -516,8 +519,7 @@ def build_model_and_assets(args, device, compute_dtype):
     adapter = build_adapter_v8(
         in_channels=3,
         hidden_size=1152,
-        injection_layers_map=getattr(pixart, "injection_layer_to_level", None),
-        ref_token_hw=32,
+        ref_token_hw=ref_token_hw,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
 
