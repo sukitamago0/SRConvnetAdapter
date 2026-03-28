@@ -123,11 +123,12 @@ class NAFBlock(nn.Module):
 
 
 class SRConvNetLSAAdapterV8(nn.Module):
-    def __init__(self, in_channels: int = 3, hidden_size: int = 1152, ref_token_hw: int = 32):
+    def __init__(self, in_channels: int = 3, hidden_size: int = 1152, ref_token_hw: int = 32, structure_only: bool = True):
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_size = int(hidden_size)
         self.ref_token_hw = int(ref_token_hw)
+        self.structure_only = bool(structure_only)
 
         self.stem = nn.Conv2d(self.in_channels, 64, 3, padding=1)
         self.stage1 = nn.Sequential(SRConvNetBlock(64), SRConvNetBlock(64))
@@ -201,6 +202,12 @@ class SRConvNetLSAAdapterV8(nn.Module):
         # They are kept only for interface compatibility with older experiments.
         cond_tokens = fused_cond_map.flatten(2).transpose(1, 2)
 
+        if self.structure_only:
+            return {
+                "cond_map": fused_cond_map,
+                "cond_tokens": cond_tokens,
+            }
+
         ref_low = self.ref_low_proj(self.ref_low_refiner(self._to_ref_token_hw(f2)))
         ref_mid = self.ref_mid_proj(self.ref_mid_refiner(self._to_ref_token_hw(f3)))
         ref_high = self.ref_high_proj(self.ref_high_refiner(self._to_ref_token_hw(f4)))
@@ -221,8 +228,13 @@ class SRConvNetLSAAdapterV8(nn.Module):
         }
 
 
-def build_adapter_v8(in_channels=3, hidden_size=1152, ref_token_hw=32):
-    return SRConvNetLSAAdapterV8(in_channels=in_channels, hidden_size=hidden_size, ref_token_hw=ref_token_hw)
+def build_adapter_v8(in_channels=3, hidden_size=1152, ref_token_hw=32, structure_only=True):
+    return SRConvNetLSAAdapterV8(
+        in_channels=in_channels,
+        hidden_size=hidden_size,
+        ref_token_hw=ref_token_hw,
+        structure_only=structure_only,
+    )
 
 
 def build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=None):

@@ -175,6 +175,8 @@ def run(args):
         pixart.load_pretrained_weights_with_zero_init(base)
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
+        if hasattr(pixart, "init_detail_lr_stream_from_noise_blocks"):
+            pixart.init_detail_lr_stream_from_noise_blocks()
     else:
         pixart.load_state_dict(base, strict=False)
 
@@ -182,6 +184,7 @@ def run(args):
         in_channels=3,
         hidden_size=1152,
         ref_token_hw=ref_token_hw,
+        structure_only=True,
     ).to(device).float()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
@@ -269,7 +272,8 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond,
-                                        force_drop_ids=drop_cond,
+                    lr_latent=z_lr.to(compute_dtype),
+                    force_drop_ids=drop_cond,
                 )
             else:
                 cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=device))
@@ -281,7 +285,8 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond_zero,
-                                        force_drop_ids=drop_uncond,
+                    lr_latent=z_lr.to(compute_dtype),
+                    force_drop_ids=drop_uncond,
                 )
                 out_cond = pixart(
                     x=model_in,
@@ -291,7 +296,8 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond,
-                                        force_drop_ids=drop_cond,
+                    lr_latent=z_lr.to(compute_dtype),
+                    force_drop_ids=drop_cond,
                 )
                 out = out_uncond + args.cfg_scale * (out_cond - out_uncond)
 
