@@ -56,10 +56,14 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "detail_ref_attn",
+    "lr_x_embedder",
+    "detail_lr_norm1",
     "detail_lr_attn",
-    "detail_ref_gate",
-    "detail_lr_gate",
+    "detail_lr_cross_attn",
+    "detail_lr_norm2",
+    "detail_lr_mlp",
+    "detail_lr_scale_shift_table",
+    "detail_lr_inject_conv",
     "lora_A",
     "lora_B",
 )
@@ -665,10 +669,14 @@ def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
-        "detail_ref_attn",
+        "lr_x_embedder",
+        "detail_lr_norm1",
         "detail_lr_attn",
-        "detail_ref_gate",
-        "detail_lr_gate",
+        "detail_lr_cross_attn",
+        "detail_lr_norm2",
+        "detail_lr_mlp",
+        "detail_lr_scale_shift_table",
+        "detail_lr_inject_conv",
         "lora_A",
         "lora_B",
         "x_embedder",
@@ -1246,10 +1254,14 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
-        "detail_ref_attn",
+        "lr_x_embedder",
+        "detail_lr_norm1",
         "detail_lr_attn",
-        "detail_ref_gate",
-        "detail_lr_gate",
+        "detail_lr_cross_attn",
+        "detail_lr_norm2",
+        "detail_lr_mlp",
+        "detail_lr_scale_shift_table",
+        "detail_lr_inject_conv",
     ]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
@@ -1346,7 +1358,7 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     ad_named = dict(adapter.named_parameters())
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("pixart.detail_ref_attn.14.out_proj.weight", pix_named.get("detail_ref_attn.14.out_proj.weight", None)),
+        ("pixart.detail_lr_attn.14.proj.weight", pix_named.get("detail_lr_attn.14.proj.weight", None)),
         ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
         ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
@@ -1752,8 +1764,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, lr_latent=z_lr.to(COMPUTE_DTYPE), force_drop_ids=drop_uncond)
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, lr_latent=z_lr.to(COMPUTE_DTYPE), force_drop_ids=drop_cond)
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
@@ -1903,6 +1915,8 @@ def main():
         pixart.load_pretrained_weights_with_zero_init(base)
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
+        if hasattr(pixart, "init_detail_lr_stream_from_noise_blocks"):
+            pixart.init_detail_lr_stream_from_noise_blocks()
     else:
         missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
@@ -1916,6 +1930,7 @@ def main():
         in_channels=3,
         hidden_size=1152,
         ref_token_hw=int(inj_cfg.get("ref_token_hw", 32)),
+        structure_only=True,
     ).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
@@ -2022,7 +2037,7 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in)
+                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, lr_latent=zl.to(COMPUTE_DTYPE))
                 kwargs["force_drop_ids"] = drop_uncond
 
                 out = pixart(**kwargs)
@@ -2133,12 +2148,10 @@ def main():
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'ref_rr': f"{float(detail_stats.get('ref_attn_res_ratio', 0.0)):.3f}",
-                    'lr_rr': f"{float(detail_stats.get('lr_attn_res_ratio', 0.0)):.3f}",
-                    'r_gm': f"{float(detail_stats.get('detail_ref_gate_mean', 0.0)):.3f}",
-                    'r_gs': f"{float(detail_stats.get('detail_ref_gate_std', 0.0)):.3f}",
-                    'l_gm': f"{float(detail_stats.get('detail_lr_gate_mean', 0.0)):.3f}",
-                    'l_gs': f"{float(detail_stats.get('detail_lr_gate_std', 0.0)):.3f}",
+                    'lr_n': f"{float(detail_stats.get('lr_stream_norm', 0.0)):.3f}",
+                    'lr_d': f"{float(detail_stats.get('lr_stream_delta', 0.0)):.3f}",
+                    'lr_r': f"{float(detail_stats.get('lr_residual_norm', 0.0)):.3f}",
+                    'inj_n': f"{float(detail_stats.get('mlp_inject_conv_norm', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 })

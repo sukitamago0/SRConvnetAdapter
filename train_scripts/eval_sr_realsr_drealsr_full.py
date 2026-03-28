@@ -464,6 +464,8 @@ def build_model_and_assets(args, device, compute_dtype):
         pixart.load_pretrained_weights_with_zero_init(base)
         if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
             pixart.init_lr_embedder_from_x_embedder()
+        if hasattr(pixart, "init_detail_lr_stream_from_noise_blocks"):
+            pixart.init_detail_lr_stream_from_noise_blocks()
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
@@ -520,6 +522,7 @@ def build_model_and_assets(args, device, compute_dtype):
         in_channels=3,
         hidden_size=1152,
         ref_token_hw=ref_token_hw,
+        structure_only=True,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
 
@@ -583,6 +586,7 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
                 mask=None,
                 data_info=data_info,
                 adapter_cond=cond,
+                lr_latent=z_lr.to(compute_dtype),
                 force_drop_ids=torch.ones(latents.shape[0], device=device),
             )
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
