@@ -87,6 +87,13 @@ def rgb01_to_y01(rgb01):
     return (16.0 + 65.481 * r + 128.553 * g + 24.966 * b) / 255.0
 
 
+USE_BIR_SAMPLING_GUIDANCE = False  # placeholder switch for future BIR sampling-guidance integration
+
+def apply_bir_sampling_guidance(latents: torch.Tensor, model_out: torch.Tensor, timestep: torch.Tensor):
+    """Placeholder: keep no-op until BIR sampling-guidance term is formally integrated."""
+    del timestep
+    return latents, model_out
+
 def randn_like_with_generator(tensor, generator):
     return torch.randn(tensor.shape, device=tensor.device, dtype=tensor.dtype, generator=generator)
 
@@ -583,6 +590,8 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
                 adapter_cond=cond,
                 force_drop_ids=torch.ones(latents.shape[0], device=device),
             )
+        if USE_BIR_SAMPLING_GUIDANCE:
+            latents, out = apply_bir_sampling_guidance(latents, out, t_b)
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
     pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)

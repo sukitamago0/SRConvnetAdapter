@@ -168,6 +168,7 @@ INIT_NOISE_STD = 0.0
 USE_ADAPTER_CFDROPOUT = True
 COND_DROP_PROB = 0.0
 FORCE_DROP_TEXT = True  # validation-time text drop behavior
+USE_BIR_SAMPLING_GUIDANCE = False  # placeholder switch for future BIR sampling-guidance integration
 # Phase2: Drop only concat-LR branch (adapter still sees normal/augmented LR)
 CONCAT_LR_DROP_ENABLED = False
 CONCAT_LR_DROP_SCHEDULE = [
@@ -260,6 +261,11 @@ PHASE0_NUM_SAMPLES = 4
 
 # ================= 3. Logic Functions =================
 
+
+def apply_bir_sampling_guidance(latents: torch.Tensor, model_out: torch.Tensor, timestep: torch.Tensor):
+    """Placeholder: keep no-op until BIR sampling-guidance term is formally integrated."""
+    del timestep
+    return latents, model_out
 
 def _linear_ramp(epoch_1based: int, start_epoch: int, end_epoch: int) -> float:
     if epoch_1based < start_epoch:
@@ -1784,6 +1790,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                         out = out_cond
                     else:
                         out = out_uncond + CFG_SCALE * (out_cond - out_uncond)
+                if USE_BIR_SAMPLING_GUIDANCE:
+                    latents, out = apply_bir_sampling_guidance(latents, out, t_b)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
             pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
             p01 = (pred + 1) / 2; h01 = (hr + 1) / 2

@@ -268,7 +268,9 @@ class SRConvNetLSAAdapterV11(nn.Module):
         self.proj4 = nn.Conv2d(256, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
 
-        # BIR-style degradation branch (reuse same block family)
+        # BIR-style degradation-feature branch (not a second structure-control branch).
+        # Responsibility: extract degraded-image features only for detail attention extension.
+        # It must not perform hard-structure control; hard structure still comes from cond_map trunk.
         self.deg_stem = nn.Conv2d(self.in_channels, 64, 3, padding=1)
         self.deg_stage1 = nn.Sequential(SRConvNetBlock(64), SRConvNetBlock(64))
         self.deg_down1 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
@@ -281,11 +283,14 @@ class SRConvNetLSAAdapterV11(nn.Module):
         self.deg_proj3 = nn.Conv2d(256, self.hidden_size, 1)
         self.deg_proj4 = nn.Conv2d(256, self.hidden_size, 1)
 
-        for m in [
-            self.proj2, self.proj3, self.proj4, self.out_proj,
-            self.deg_proj2, self.deg_proj3, self.deg_proj4,
-        ]:
+        for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(m.bias)
+
+        # zero-init degraded-feature projections for stable "start from no extra detail injection" behavior
+        # (ControlNet/T2I-Adapter style stability heuristic for side branches).
+        for m in [self.deg_proj2, self.deg_proj3, self.deg_proj4]:
+            nn.init.zeros_(m.weight)
             nn.init.zeros_(m.bias)
 
     @staticmethod
