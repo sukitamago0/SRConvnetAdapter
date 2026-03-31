@@ -65,41 +65,68 @@ class SRConvNetLSAAdapter(nn.Module):
 
 
 class GroupedChannelSelfAttention2D(nn.Module):
+    """
+    G-CSA block adapted toward grouped channel-wise self-attention (MDTA-style core).
+
+    Notes:
+    - This is NOT the full blind-spot TBSN DTAB block.
+    - We only keep the most transferable core: grouped channel-wise self-attention.
+    - M-WSA and blind-spot specific masking are intentionally not introduced in the SR adapter trunk.
+    """
+
     def __init__(self, channels: int, num_groups: int = 8, reduction: int = 4):
+        del reduction
         super().__init__()
         self.channels = int(channels)
         self.num_groups = int(num_groups)
         if self.channels % self.num_groups != 0:
             raise ValueError(f"channels ({self.channels}) must be divisible by num_groups ({self.num_groups})")
         self.channels_per_group = self.channels // self.num_groups
-        hidden = max(1, self.channels_per_group // int(reduction))
-        self.fc1 = nn.Linear(self.channels_per_group, hidden)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden, self.channels_per_group)
+
+        self.norm = LayerNorm2d(self.channels)
+        self.qkv = nn.Conv2d(self.channels, self.channels * 3, kernel_size=1, stride=1, padding=0, bias=True)
+        self.qkv_dw = nn.Conv2d(
+            self.channels * 3,
+            self.channels * 3,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.channels * 3,
+            bias=True,
+        )
+        self.proj = nn.Conv2d(self.channels, self.channels, kernel_size=1, stride=1, padding=0, bias=True)
+        self.temperature = nn.Parameter(torch.ones(self.num_groups, 1, 1))
         self.gamma = nn.Parameter(torch.tensor(0.0))
         self._last_attn_mean = None
         self._last_attn_std = None
-
-    def _mlp(self, t: torch.Tensor) -> torch.Tensor:
-        b, g, cg = t.shape
-        t = t.reshape(b * g, cg)
-        t = self.fc2(self.act(self.fc1(t)))
-        return t.reshape(b, g, cg)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
         if c != self.channels:
             raise RuntimeError(f"GCSA channel mismatch: expected {self.channels}, got {c}")
-        xg = x.view(b, self.num_groups, self.channels_per_group, h, w)
-        avg_desc = xg.mean(dim=(3, 4))
-        max_desc = xg.amax(dim=(3, 4))
-        logits = self._mlp(avg_desc) + self._mlp(max_desc)
-        attn = torch.sigmoid(logits)
-        attended = xg * attn[:, :, :, None, None]
-        attended = attended.reshape(b, c, h, w)
+
+        x_in = x
+        x = self.norm(x)
+        qkv = self.qkv_dw(self.qkv(x))
+        q, k, v = qkv.chunk(3, dim=1)
+
+        q = q.reshape(b, self.num_groups, self.channels_per_group, h * w)
+        k = k.reshape(b, self.num_groups, self.channels_per_group, h * w)
+        v = v.reshape(b, self.num_groups, self.channels_per_group, h * w)
+
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.temperature[None, :, :, :]
+        attn = attn.softmax(dim=-1)
+
+        out = torch.matmul(attn, v)
+        out = out.reshape(b, c, h, w)
+        out = self.proj(out)
+
         self._last_attn_mean = float(attn.detach().float().mean().item())
         self._last_attn_std = float(attn.detach().float().std(unbiased=False).item())
-        return x + self.gamma * attended
+        return x_in + self.gamma * out
 
 
 class LayerNorm2d(nn.Module):
