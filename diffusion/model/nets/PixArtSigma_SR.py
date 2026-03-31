@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
-import xformers.ops
 
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
-from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer, t2i_modulate
+from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 
@@ -52,7 +51,7 @@ class PixArtSigmaSR(PixArtMS):
         self.force_null_caption = bool(force_null_caption)
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
-        # keep hard-path SFT intact
+        # keep hard-layer SFT family
         self.sft_cond_reduce = nn.Sequential(
             nn.Conv2d(self.hidden_size, 64, 1),
             nn.LeakyReLU(0.1, inplace=True),
@@ -62,99 +61,8 @@ class PixArtSigmaSR(PixArtMS):
         self.detail_injection_layers = list(detail_injection_layers or [14, 16, 18, 20, 22, 24])
         self.injection_layer_to_level = dict(injection_layer_to_level or {})
 
-        # BIR-style detail attention extension
-        self.detail_deg_ln = nn.ModuleDict()
-        self.detail_deg_kv_proj = nn.ModuleDict()
-        self.detail_deg_gate = nn.ParameterDict()
-        self.detail_deg_out_proj = nn.ModuleDict()
-        for layer_id in self.detail_injection_layers:
-            k = str(layer_id)
-            self.detail_deg_ln[k] = nn.LayerNorm(self.hidden_size)
-            self.detail_deg_kv_proj[k] = nn.Linear(self.hidden_size, 2 * self.hidden_size)
-            self.detail_deg_out_proj[k] = nn.Linear(self.hidden_size, self.hidden_size)
-            self.detail_deg_gate[k] = nn.Parameter(torch.tensor(0.0))
-            nn.init.zeros_(self.detail_deg_out_proj[k].weight)
-            nn.init.zeros_(self.detail_deg_out_proj[k].bias)
-
         self._last_sft_stats = None
         self._last_detail_attn_stats = None
-
-    def _resolve_detail_level(self, layer_idx: int) -> str:
-        mapped = self.injection_layer_to_level.get(layer_idx, None)
-        if isinstance(mapped, str):
-            mapped = mapped.lower()
-            if mapped in ("low", "mid", "high"):
-                return mapped
-        if layer_idx in (14, 16):
-            return "mid"
-        if layer_idx in (18, 20, 22, 24):
-            return "high"
-        return "mid"
-
-    def _forward_detail_block_bir(self, block, layer_idx, x, deg_tokens, y, t0, mask, HW):
-        b, _, _ = x.shape
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            block.scale_shift_table[None] + t0.reshape(b, 6, -1)
-        ).chunk(6, dim=1)
-
-        x_mod = t2i_modulate(block.norm1(x), shift_msa, scale_msa)
-
-        attn = block.attn
-        bsz, n, c = x_mod.shape
-        qkv = attn.qkv(x_mod).reshape(bsz, n, 3, c)
-        q, k_x, v_x = qkv.unbind(2)
-        q = attn.q_norm(q)
-        k_x = attn.k_norm(k_x)
-
-        if HW is None:
-            h = w = int(n ** 0.5)
-        else:
-            h, w = HW
-        new_n = n
-        if attn.sr_ratio > 1:
-            k_x, new_n = attn.downsample_2d(k_x, h, w, attn.sr_ratio, sampling=attn.sampling)
-            v_x, _ = attn.downsample_2d(v_x, h, w, attn.sr_ratio, sampling=attn.sampling)
-
-        key = str(layer_idx)
-        deg = self.detail_deg_ln[key](deg_tokens)
-        deg_k, deg_v = self.detail_deg_kv_proj[key](deg).chunk(2, dim=-1)
-        deg_k = attn.k_norm(deg_k)
-
-        k = torch.cat([k_x, deg_k], dim=1)
-        v = torch.cat([v_x, deg_v], dim=1)
-
-        q = q.reshape(bsz, n, attn.num_heads, c // attn.num_heads).to(x.dtype)
-        k = k.reshape(bsz, k.shape[1], attn.num_heads, c // attn.num_heads).to(x.dtype)
-        v = v.reshape(bsz, v.shape[1], attn.num_heads, c // attn.num_heads).to(x.dtype)
-
-        use_fp32_attention = getattr(attn, 'fp32_attention', False)
-        if use_fp32_attention:
-            q, k, v = q.float(), k.float(), v.float()
-
-        attn_bias = None
-        if mask is not None:
-            # text mask is for cross-attn; self-attn extension does not use caption mask.
-            attn_bias = None
-
-        attn_out = xformers.ops.memory_efficient_attention(q, k, v, p=attn.attn_drop.p, attn_bias=attn_bias)
-        attn_out = attn_out.view(bsz, n, c)
-        attn_out = attn.proj(attn_out)
-        attn_out = attn.proj_drop(attn_out)
-
-        x = x + block.drop_path(gate_msa * attn_out)
-
-        deg_res = self.detail_deg_out_proj[key](attn_out)
-        deg_gate = torch.sigmoid(self.detail_deg_gate[key]).to(dtype=x.dtype).view(1, 1, 1)
-        x = x + deg_gate * deg_res
-
-        x = x + block.cross_attn(x, y, mask)
-        x = x + block.drop_path(gate_mlp * block.mlp(t2i_modulate(block.norm2(x), shift_mlp, scale_mlp)))
-
-        stats = {
-            "detail_deg_res_norm": float(deg_res.detach().float().norm(dim=-1).mean().item()),
-            "detail_deg_gate": float(torch.sigmoid(self.detail_deg_gate[key].detach().float()).item()),
-        }
-        return x, stats
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
@@ -178,14 +86,8 @@ class PixArtSigmaSR(PixArtMS):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         cond_map = None
-        deg_tokens = {"low": None, "mid": None, "high": None}
         if isinstance(adapter_cond, dict):
             cond_map = adapter_cond.get("cond_map", None)
-            deg_tokens = {
-                "low": adapter_cond.get("deg_low_tokens", None),
-                "mid": adapter_cond.get("deg_mid_tokens", None),
-                "high": adapter_cond.get("deg_high_tokens", None),
-            }
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -203,7 +105,6 @@ class PixArtSigmaSR(PixArtMS):
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
-        detail_deg_res_norm_vals, detail_deg_gate_vals = [], []
         cond_red = None
         if cond_map is not None:
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
@@ -221,25 +122,7 @@ class PixArtSigmaSR(PixArtMS):
                 sft_shift_stds.append(float(shift.detach().float().std(unbiased=False).item()))
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
 
-            if i in self.detail_injection_layers:
-                level = self._resolve_detail_level(i)
-                deg = deg_tokens.get(level, None)
-                if deg is not None:
-                    deg = deg.to(dtype=x.dtype, device=x.device)
-                    x, detail_stats = self._forward_detail_block_bir(
-                        block=block,
-                        layer_idx=i,
-                        x=x,
-                        deg_tokens=deg,
-                        y=y,
-                        t0=t0,
-                        mask=mask,
-                        HW=(self.h, self.w),
-                    )
-                    detail_deg_res_norm_vals.append(detail_stats["detail_deg_res_norm"])
-                    detail_deg_gate_vals.append(detail_stats["detail_deg_gate"])
-                    continue
-
+            # detail layers revert to original block-only forward
             x = auto_grad_checkpoint(
                 block,
                 x,
@@ -262,11 +145,7 @@ class PixArtSigmaSR(PixArtMS):
         else:
             self._last_sft_stats = None
 
-        self._last_detail_attn_stats = {
-            "detail_deg_gate_mean": float(sum(detail_deg_gate_vals) / max(1, len(detail_deg_gate_vals))),
-            "detail_deg_gate_std": float(torch.tensor(detail_deg_gate_vals).std(unbiased=False).item()) if len(detail_deg_gate_vals) > 1 else 0.0,
-            "detail_deg_res_norm": float(sum(detail_deg_res_norm_vals) / max(1, len(detail_deg_res_norm_vals))),
-        }
+        self._last_detail_attn_stats = None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)

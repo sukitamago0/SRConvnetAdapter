@@ -16,15 +16,8 @@ from PIL import Image
 from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v11
+from diffusion.model.nets.adapter import build_adapter_v12
 
-
-USE_BIR_SAMPLING_GUIDANCE = False  # placeholder switch for future BIR sampling-guidance integration
-
-def apply_bir_sampling_guidance(latents: torch.Tensor, model_out: torch.Tensor, timestep: torch.Tensor):
-    """Placeholder: keep no-op until BIR sampling-guidance term is formally integrated."""
-    del timestep
-    return latents, model_out
 
 def randn_like_with_generator(tensor, generator):
     return torch.randn(tensor.shape, device=tensor.device, dtype=tensor.dtype, generator=generator)
@@ -183,10 +176,9 @@ def run(args):
     else:
         pixart.load_state_dict(base, strict=False)
 
-    adapter = build_adapter_v11(
+    adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
-        ref_token_hw=ref_token_hw,
     ).to(device).float()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
@@ -302,8 +294,6 @@ def run(args):
 
             if out.shape[1] != 4:
                 raise RuntimeError(f"Expected 4-channel output, got {out.shape[1]}")
-        if USE_BIR_SAMPLING_GUIDANCE:
-            latents, out = apply_bir_sampling_guidance(latents, out, t_b)
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
     pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)

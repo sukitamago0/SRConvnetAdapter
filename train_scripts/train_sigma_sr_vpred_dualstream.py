@@ -45,7 +45,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v11
+from diffusion.model.nets.adapter import build_adapter_v12
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -56,10 +56,9 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "detail_deg_ln",
-    "detail_deg_kv_proj",
-    "detail_deg_gate",
-    "detail_deg_out_proj",
+    "gcsa2",
+    "gcsa3",
+    "gcsa4",
     "lora_A",
     "lora_B",
 )
@@ -168,7 +167,6 @@ INIT_NOISE_STD = 0.0
 USE_ADAPTER_CFDROPOUT = True
 COND_DROP_PROB = 0.0
 FORCE_DROP_TEXT = True  # validation-time text drop behavior
-USE_BIR_SAMPLING_GUIDANCE = False  # placeholder switch for future BIR sampling-guidance integration
 # Phase2: Drop only concat-LR branch (adapter still sees normal/augmented LR)
 CONCAT_LR_DROP_ENABLED = False
 CONCAT_LR_DROP_SCHEDULE = [
@@ -262,10 +260,6 @@ PHASE0_NUM_SAMPLES = 4
 # ================= 3. Logic Functions =================
 
 
-def apply_bir_sampling_guidance(latents: torch.Tensor, model_out: torch.Tensor, timestep: torch.Tensor):
-    """Placeholder: keep no-op until BIR sampling-guidance term is formally integrated."""
-    del timestep
-    return latents, model_out
 
 def _linear_ramp(epoch_1based: int, start_epoch: int, end_epoch: int) -> float:
     if epoch_1based < start_epoch:
@@ -671,10 +665,9 @@ def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
-        "detail_deg_ln",
-        "detail_deg_kv_proj",
-        "detail_deg_gate",
-        "detail_deg_out_proj",
+        "gcsa2",
+        "gcsa3",
+        "gcsa4",
         "lora_A",
         "lora_B",
         "x_embedder",
@@ -1252,10 +1245,9 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
-        "detail_deg_ln",
-        "detail_deg_kv_proj",
-        "detail_deg_gate",
-        "detail_deg_out_proj",
+        "gcsa2",
+        "gcsa3",
+        "gcsa4",
     ]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
@@ -1352,7 +1344,7 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     ad_named = dict(adapter.named_parameters())
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("pixart.detail_deg_kv_proj.14.weight", pix_named.get("detail_deg_kv_proj.14.weight", None)),
+        ("adapter.gcsa2.gamma", ad_named.get("gcsa2.gamma", None)),
         ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
         ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
@@ -1790,8 +1782,6 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                         out = out_cond
                     else:
                         out = out_uncond + CFG_SCALE * (out_cond - out_uncond)
-                if USE_BIR_SAMPLING_GUIDANCE:
-                    latents, out = apply_bir_sampling_guidance(latents, out, t_b)
                 latents = scheduler.step(out.float(), t, latents.float()).prev_sample
             pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
             p01 = (pred + 1) / 2; h01 = (hr + 1) / 2
@@ -1918,10 +1908,9 @@ def main():
         print("ℹ️ LoRA disabled.")
     pixart.train()
 
-    adapter = build_adapter_v11(
+    adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
-        ref_token_hw=int(inj_cfg.get("ref_token_hw", 32)),
     ).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
@@ -2127,6 +2116,7 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 detail_stats = getattr(pixart, "_last_detail_attn_stats", {}) or {}
+                gcsa_stats = getattr(adapter, "_last_gcsa_stats", {}) or {}
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2139,12 +2129,15 @@ def main():
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'dg_gm': f"{float(detail_stats.get('detail_deg_gate_mean', 0.0)):.3f}",
-                    'dg_gs': f"{float(detail_stats.get('detail_deg_gate_std', 0.0)):.3f}",
-                    'dg_rn': f"{float(detail_stats.get('detail_deg_res_norm', 0.0)):.3f}",
-                    'dlow': f"{float(cond_in.get('deg_low_tokens').detach().float().norm(dim=-1).mean().item()) if isinstance(cond_in, dict) and cond_in.get('deg_low_tokens') is not None else 0.0:.3f}",
-                    'dmid': f"{float(cond_in.get('deg_mid_tokens').detach().float().norm(dim=-1).mean().item()) if isinstance(cond_in, dict) and cond_in.get('deg_mid_tokens') is not None else 0.0:.3f}",
-                    'dhigh': f"{float(cond_in.get('deg_high_tokens').detach().float().norm(dim=-1).mean().item()) if isinstance(cond_in, dict) and cond_in.get('deg_high_tokens') is not None else 0.0:.3f}",
+                    'g2_g': f"{float(gcsa_stats.get('gcsa2_gamma', 0.0)):.3f}",
+                    'g3_g': f"{float(gcsa_stats.get('gcsa3_gamma', 0.0)):.3f}",
+                    'g4_g': f"{float(gcsa_stats.get('gcsa4_gamma', 0.0)):.3f}",
+                    'g2_m': f"{float(gcsa_stats.get('gcsa2_attn_mean', 0.0)):.3f}",
+                    'g2_s': f"{float(gcsa_stats.get('gcsa2_attn_std', 0.0)):.3f}",
+                    'g3_m': f"{float(gcsa_stats.get('gcsa3_attn_mean', 0.0)):.3f}",
+                    'g3_s': f"{float(gcsa_stats.get('gcsa3_attn_std', 0.0)):.3f}",
+                    'g4_m': f"{float(gcsa_stats.get('gcsa4_attn_mean', 0.0)):.3f}",
+                    'g4_s': f"{float(gcsa_stats.get('gcsa4_attn_std', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 })

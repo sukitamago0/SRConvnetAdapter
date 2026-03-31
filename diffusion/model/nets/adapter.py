@@ -64,6 +64,44 @@ class SRConvNetLSAAdapter(nn.Module):
         }
 
 
+class GroupedChannelSelfAttention2D(nn.Module):
+    def __init__(self, channels: int, num_groups: int = 8, reduction: int = 4):
+        super().__init__()
+        self.channels = int(channels)
+        self.num_groups = int(num_groups)
+        if self.channels % self.num_groups != 0:
+            raise ValueError(f"channels ({self.channels}) must be divisible by num_groups ({self.num_groups})")
+        self.channels_per_group = self.channels // self.num_groups
+        hidden = max(1, self.channels_per_group // int(reduction))
+        self.fc1 = nn.Linear(self.channels_per_group, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, self.channels_per_group)
+        self.gamma = nn.Parameter(torch.tensor(0.0))
+        self._last_attn_mean = None
+        self._last_attn_std = None
+
+    def _mlp(self, t: torch.Tensor) -> torch.Tensor:
+        b, g, cg = t.shape
+        t = t.reshape(b * g, cg)
+        t = self.fc2(self.act(self.fc1(t)))
+        return t.reshape(b, g, cg)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        if c != self.channels:
+            raise RuntimeError(f"GCSA channel mismatch: expected {self.channels}, got {c}")
+        xg = x.view(b, self.num_groups, self.channels_per_group, h, w)
+        avg_desc = xg.mean(dim=(3, 4))
+        max_desc = xg.amax(dim=(3, 4))
+        logits = self._mlp(avg_desc) + self._mlp(max_desc)
+        attn = torch.sigmoid(logits)
+        attended = xg * attn[:, :, :, None, None]
+        attended = attended.reshape(b, c, h, w)
+        self._last_attn_mean = float(attn.detach().float().mean().item())
+        self._last_attn_std = float(attn.detach().float().std(unbiased=False).item())
+        return x + self.gamma * attended
+
+
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
@@ -242,14 +280,14 @@ def build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=None)
     return SRConvNetLSAAdapter(hidden_size=hidden_size)
 
 
-class SRConvNetLSAAdapterV11(nn.Module):
-    def __init__(self, in_channels: int = 3, hidden_size: int = 1152, ref_token_hw: int = 32):
+
+
+class SRConvNetLSAAdapterV12(nn.Module):
+    def __init__(self, in_channels: int = 3, hidden_size: int = 1152):
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_size = int(hidden_size)
-        self.ref_token_hw = int(ref_token_hw)
 
-        # keep v8 RGB trunk for structural cond_map
         self.stem = nn.Conv2d(self.in_channels, 64, 3, padding=1)
         self.stage1 = nn.Sequential(SRConvNetBlock(64), SRConvNetBlock(64))
         self.down1 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
@@ -257,6 +295,10 @@ class SRConvNetLSAAdapterV11(nn.Module):
         self.down2 = nn.Conv2d(128, 256, 3, stride=2, padding=1)
         self.stage3 = nn.Sequential(SRConvNetBlock(256), SRConvNetBlock(256), SRConvNetBlock(256), SRConvNetBlock(256))
         self.stage4 = nn.Sequential(SRConvNetBlock(256), SRConvNetBlock(256))
+
+        self.gcsa2 = GroupedChannelSelfAttention2D(channels=128, num_groups=4)
+        self.gcsa3 = GroupedChannelSelfAttention2D(channels=256, num_groups=8)
+        self.gcsa4 = GroupedChannelSelfAttention2D(channels=256, num_groups=8)
 
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
@@ -268,53 +310,27 @@ class SRConvNetLSAAdapterV11(nn.Module):
         self.proj4 = nn.Conv2d(256, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
 
-        # BIR-style degradation-feature branch (not a second structure-control branch).
-        # Responsibility: extract degraded-image features only for detail attention extension.
-        # It must not perform hard-structure control; hard structure still comes from cond_map trunk.
-        self.deg_stem = nn.Conv2d(self.in_channels, 64, 3, padding=1)
-        self.deg_stage1 = nn.Sequential(SRConvNetBlock(64), SRConvNetBlock(64))
-        self.deg_down1 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
-        self.deg_stage2 = nn.Sequential(SRConvNetBlock(128), SRConvNetBlock(128))
-        self.deg_down2 = nn.Conv2d(128, 256, 3, stride=2, padding=1)
-        self.deg_stage3 = nn.Sequential(SRConvNetBlock(256), SRConvNetBlock(256), SRConvNetBlock(256), SRConvNetBlock(256))
-        self.deg_stage4 = nn.Sequential(SRConvNetBlock(256), SRConvNetBlock(256))
-
-        self.deg_proj2 = nn.Conv2d(128, self.hidden_size, 1)
-        self.deg_proj3 = nn.Conv2d(256, self.hidden_size, 1)
-        self.deg_proj4 = nn.Conv2d(256, self.hidden_size, 1)
-
         for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
 
-        # zero-init degraded-feature projections for stable "start from no extra detail injection" behavior
-        # (ControlNet/T2I-Adapter style stability heuristic for side branches).
-        for m in [self.deg_proj2, self.deg_proj3, self.deg_proj4]:
-            nn.init.zeros_(m.weight)
-            nn.init.zeros_(m.bias)
+        self._last_gcsa_stats = None
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         return (1.0 + gamma[:, :, None, None]) * feat + beta[:, :, None, None]
 
-    @staticmethod
-    def _to_tokens(feat: torch.Tensor, proj: nn.Module) -> torch.Tensor:
-        pooled = F.adaptive_avg_pool2d(feat, output_size=(32, 32))
-        tok_map = proj(pooled)
-        return tok_map.flatten(2).transpose(1, 2).contiguous()
-
     def forward(self, lr_small: torch.Tensor, t_embed: torch.Tensor = None):
-        # main cond_map trunk
-        f1 = self.stage1(self.stem(lr_small))
+        x = lr_small
+        f1 = self.stage1(self.stem(x))
         f2 = self.stage2(self.down1(f1))
-        f3 = self.stage3(self.down2(f2))
-        f4 = self.stage4(f3)
+        f2 = self.gcsa2(f2)
 
-        # degradation branch
-        d1 = self.deg_stage1(self.deg_stem(lr_small))
-        d2 = self.deg_stage2(self.deg_down1(d1))
-        d3 = self.deg_stage3(self.deg_down2(d2))
-        d4 = self.deg_stage4(d3)
+        f3 = self.stage3(self.down2(f2))
+        f3 = self.gcsa3(f3)
+
+        f4 = self.stage4(f3)
+        f4 = self.gcsa4(f4)
 
         if t_embed is not None:
             tb = self.time_mlp(t_embed)
@@ -325,28 +341,28 @@ class SRConvNetLSAAdapterV11(nn.Module):
             f3 = self._film(f3, g3, b3)
             f4 = self._film(f4, g4, b4)
 
-            d1 = self._film(d1, g1, b1)
-            d2 = self._film(d2, g2, b2)
-            d3 = self._film(d3, g3, b3)
-            d4 = self._film(d4, g4, b4)
-
         f2_32 = F.interpolate(f2, size=f3.shape[-2:], mode="bilinear", align_corners=False)
         c2 = self.proj2(f2_32)
         c3 = self.proj3(f3)
         c4 = self.proj4(f4)
         cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
 
-        deg_low_tokens = self._to_tokens(d2, self.deg_proj2)
-        deg_mid_tokens = self._to_tokens(d3, self.deg_proj3)
-        deg_high_tokens = self._to_tokens(d4, self.deg_proj4)
+        self._last_gcsa_stats = {
+            "gcsa2_gamma": float(self.gcsa2.gamma.detach().float().item()),
+            "gcsa3_gamma": float(self.gcsa3.gamma.detach().float().item()),
+            "gcsa4_gamma": float(self.gcsa4.gamma.detach().float().item()),
+            "gcsa2_attn_mean": float(self.gcsa2._last_attn_mean if self.gcsa2._last_attn_mean is not None else 0.0),
+            "gcsa2_attn_std": float(self.gcsa2._last_attn_std if self.gcsa2._last_attn_std is not None else 0.0),
+            "gcsa3_attn_mean": float(self.gcsa3._last_attn_mean if self.gcsa3._last_attn_mean is not None else 0.0),
+            "gcsa3_attn_std": float(self.gcsa3._last_attn_std if self.gcsa3._last_attn_std is not None else 0.0),
+            "gcsa4_attn_mean": float(self.gcsa4._last_attn_mean if self.gcsa4._last_attn_mean is not None else 0.0),
+            "gcsa4_attn_std": float(self.gcsa4._last_attn_std if self.gcsa4._last_attn_std is not None else 0.0),
+        }
 
         return {
             "cond_map": cond_map,
-            "deg_low_tokens": deg_low_tokens,
-            "deg_mid_tokens": deg_mid_tokens,
-            "deg_high_tokens": deg_high_tokens,
         }
 
 
-def build_adapter_v11(in_channels=3, hidden_size=1152, ref_token_hw=32):
-    return SRConvNetLSAAdapterV11(in_channels=in_channels, hidden_size=hidden_size, ref_token_hw=ref_token_hw)
+def build_adapter_v12(in_channels=3, hidden_size=1152):
+    return SRConvNetLSAAdapterV12(in_channels=in_channels, hidden_size=hidden_size)
