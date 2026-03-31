@@ -45,7 +45,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v8
+from diffusion.model.nets.adapter import build_adapter_v12
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -56,10 +56,9 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "detail_ref_attn",
-    "detail_lr_attn",
-    "detail_ref_gate",
-    "detail_lr_gate",
+    "gcsa2",
+    "gcsa3",
+    "gcsa4",
     "lora_A",
     "lora_B",
 )
@@ -259,6 +258,7 @@ PHASE0_NUM_SAMPLES = 4
 # Keep legacy injection mostly shallow when enabling dual-stream
 
 # ================= 3. Logic Functions =================
+
 
 
 def _linear_ramp(epoch_1based: int, start_epoch: int, end_epoch: int) -> float:
@@ -665,10 +665,9 @@ def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
-        "detail_ref_attn",
-        "detail_lr_attn",
-        "detail_ref_gate",
-        "detail_lr_gate",
+        "gcsa2",
+        "gcsa3",
+        "gcsa4",
         "lora_A",
         "lora_B",
         "x_embedder",
@@ -1246,10 +1245,9 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
-        "detail_ref_attn",
-        "detail_lr_attn",
-        "detail_ref_gate",
-        "detail_lr_gate",
+        "gcsa2",
+        "gcsa3",
+        "gcsa4",
     ]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
@@ -1346,7 +1344,7 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     ad_named = dict(adapter.named_parameters())
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("pixart.detail_ref_attn.14.out_proj.weight", pix_named.get("detail_ref_attn.14.out_proj.weight", None)),
+        ("adapter.gcsa2.gamma", ad_named.get("gcsa2.gamma", None)),
         ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
         ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
@@ -1901,8 +1899,6 @@ def main():
     if "pos_embed" in base: del base["pos_embed"]
     if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
         pixart.load_pretrained_weights_with_zero_init(base)
-        if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
-            pixart.init_lr_embedder_from_x_embedder()
     else:
         missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
@@ -1912,10 +1908,9 @@ def main():
         print("ℹ️ LoRA disabled.")
     pixart.train()
 
-    adapter = build_adapter_v8(
+    adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
-        ref_token_hw=int(inj_cfg.get("ref_token_hw", 32)),
     ).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
@@ -2121,6 +2116,7 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 detail_stats = getattr(pixart, "_last_detail_attn_stats", {}) or {}
+                gcsa_stats = getattr(adapter, "_last_gcsa_stats", {}) or {}
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2133,12 +2129,15 @@ def main():
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'ref_rr': f"{float(detail_stats.get('ref_attn_res_ratio', 0.0)):.3f}",
-                    'lr_rr': f"{float(detail_stats.get('lr_attn_res_ratio', 0.0)):.3f}",
-                    'r_gm': f"{float(detail_stats.get('detail_ref_gate_mean', 0.0)):.3f}",
-                    'r_gs': f"{float(detail_stats.get('detail_ref_gate_std', 0.0)):.3f}",
-                    'l_gm': f"{float(detail_stats.get('detail_lr_gate_mean', 0.0)):.3f}",
-                    'l_gs': f"{float(detail_stats.get('detail_lr_gate_std', 0.0)):.3f}",
+                    'g2_g': f"{float(gcsa_stats.get('gcsa2_gamma', 0.0)):.3f}",
+                    'g3_g': f"{float(gcsa_stats.get('gcsa3_gamma', 0.0)):.3f}",
+                    'g4_g': f"{float(gcsa_stats.get('gcsa4_gamma', 0.0)):.3f}",
+                    'g2_m': f"{float(gcsa_stats.get('gcsa2_attn_mean', 0.0)):.3f}",
+                    'g2_s': f"{float(gcsa_stats.get('gcsa2_attn_std', 0.0)):.3f}",
+                    'g3_m': f"{float(gcsa_stats.get('gcsa3_attn_mean', 0.0)):.3f}",
+                    'g3_s': f"{float(gcsa_stats.get('gcsa3_attn_std', 0.0)):.3f}",
+                    'g4_m': f"{float(gcsa_stats.get('gcsa4_attn_mean', 0.0)):.3f}",
+                    'g4_s': f"{float(gcsa_stats.get('gcsa4_attn_std', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 })

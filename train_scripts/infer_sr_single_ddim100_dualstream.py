@@ -16,7 +16,7 @@ from PIL import Image
 from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v8
+from diffusion.model.nets.adapter import build_adapter_v12
 
 
 def randn_like_with_generator(tensor, generator):
@@ -173,15 +173,12 @@ def run(args):
         del base["pos_embed"]
     if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
         pixart.load_pretrained_weights_with_zero_init(base)
-        if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
-            pixart.init_lr_embedder_from_x_embedder()
     else:
         pixart.load_state_dict(base, strict=False)
 
-    adapter = build_adapter_v8(
+    adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
-        ref_token_hw=ref_token_hw,
     ).to(device).float()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
@@ -269,7 +266,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond,
-                                        force_drop_ids=drop_cond,
+                    force_drop_ids=drop_cond,
                 )
             else:
                 cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=device))
@@ -281,7 +278,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond_zero,
-                                        force_drop_ids=drop_uncond,
+                    force_drop_ids=drop_uncond,
                 )
                 out_cond = pixart(
                     x=model_in,
@@ -291,7 +288,7 @@ def run(args):
                     mask=None,
                     data_info=data_info,
                     adapter_cond=cond,
-                                        force_drop_ids=drop_cond,
+                    force_drop_ids=drop_cond,
                 )
                 out = out_uncond + args.cfg_scale * (out_cond - out_uncond)
 

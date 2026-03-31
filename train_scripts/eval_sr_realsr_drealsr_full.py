@@ -29,7 +29,7 @@ from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
-from diffusion.model.nets.adapter import build_adapter_v8
+from diffusion.model.nets.adapter import build_adapter_v12
 
 
 
@@ -462,8 +462,6 @@ def build_model_and_assets(args, device, compute_dtype):
         del base["pos_embed"]
     if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
         pixart.load_pretrained_weights_with_zero_init(base)
-        if hasattr(pixart, "init_lr_embedder_from_x_embedder"):
-            pixart.init_lr_embedder_from_x_embedder()
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
@@ -516,10 +514,9 @@ def build_model_and_assets(args, device, compute_dtype):
             "This usually means the eval script rebuilt LoRA with the wrong rank/alpha."
         )
 
-    adapter = build_adapter_v8(
+    adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
-        ref_token_hw=ref_token_hw,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
 
