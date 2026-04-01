@@ -51,6 +51,7 @@ from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
 BASE_PIXART_SHA256 = None
+LAST_TRAIN_LOG = {}
 
 ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
@@ -1529,6 +1530,7 @@ def save_smart(
             "best_eval_steps": int(eval_steps),
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
             "best_eval_tag": str(eval_tag),
+            "train_runtime_log": dict(LAST_TRAIN_LOG),
             "injection_config": {
                 "hard_layers": sorted(list(getattr(pixart, "hard_injection_layers", HARD_INJECTION_LAYERS))),
                 "detail_layers": list(getattr(pixart, "detail_injection_layers", DETAIL_INJECTION_LAYERS)),
@@ -1862,6 +1864,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
 
 # ================= 10. Main =================
 def main():
+    global LAST_TRAIN_LOG
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
     validate_schedule_alignment()
     validate_s2d_decoupling()
@@ -2153,7 +2156,7 @@ def main():
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 detail_stats = getattr(pixart, "_last_detail_attn_stats", {}) or {}
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
-                pbar.set_postfix({
+                log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
@@ -2173,7 +2176,21 @@ def main():
                     'xg': f"{float(detail_stats.get('mean_cross_gate', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
-                })
+                }
+                if getattr(pixart, "_last_sft_stats", None) is not None:
+                    log_dict["mean_sft_w"] = f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}"
+                if getattr(pixart, "_last_detail_attn_stats", None) is not None:
+                    log_dict["mean_cross_gate"] = f"{float(detail_stats.get('mean_cross_gate', 0.0)):.3f}"
+                log_dict["sft_strength"] = f"{sft_strength:.3f}"
+                pbar.set_postfix(log_dict)
+                LAST_TRAIN_LOG = {
+                    "sft_strength": float(sft_strength),
+                    "lpips_train_weight": float(w.get('lpips', 0.0)),
+                    "lr_cons_weight": float(w.get('lr_cons', 0.0)),
+                    "inject_reg_weight": float(inject_reg_w),
+                    "mean_sft_w": float(sft_stats.get("mean_sft_w", 0.0)),
+                    "mean_cross_gate": float(detail_stats.get("mean_cross_gate", 0.0)),
+                }
 
         if accum_micro_steps > 0 and not reached_max_steps:
             log_critical_path_gradients(step + 1, pixart, adapter)

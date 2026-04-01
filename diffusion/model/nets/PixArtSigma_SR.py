@@ -63,6 +63,8 @@ class PixArtSigmaSR(PixArtMS):
         self.sft_cross_attn = nn.ModuleDict()
         self.sft_cross_gate = nn.ParameterDict()
         self.detail_kv_proj = nn.Conv2d(64, self.hidden_size, kernel_size=1, stride=1, padding=0, bias=True)
+        nn.init.normal_(self.detail_kv_proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.detail_kv_proj.bias)
         for i in sorted(self.hard_injection_layers):
             self.sft_cross_attn[str(i)] = MultiHeadCrossAttention(self.hidden_size, self.num_heads)
             self.sft_cross_gate[str(i)] = nn.Parameter(torch.tensor(0.1))

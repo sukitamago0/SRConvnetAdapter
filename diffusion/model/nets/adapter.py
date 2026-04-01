@@ -277,6 +277,12 @@ class SRConvNetLSAAdapterV12(nn.Module):
         for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
+        nn.init.normal_(self.detail_reduce.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.detail_reduce.bias)
+        for m in self.detail_refine:
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+                nn.init.zeros_(m.bias)
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
