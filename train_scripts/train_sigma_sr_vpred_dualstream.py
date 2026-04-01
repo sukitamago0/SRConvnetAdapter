@@ -56,9 +56,9 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "gcsa2",
-    "gcsa3",
-    "gcsa4",
+    "sft_cross_attn",
+    "sft_cross_gate",
+    "detail_kv_proj",
     "lora_A",
     "lora_B",
 )
@@ -183,21 +183,21 @@ PIXEL_LOSS_T_MAX = 250
 LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
 
 # LPIPS perceptual curriculum (single-script, no separate stage script)
-USE_LPIPS_PERCEP = False
-LPIPS_START_EPOCH = 999999
-LPIPS_RAMP_END_EPOCH = 999999
-LPIPS_WEIGHT_MAX = 0.0
-LPIPS_T_MAX = 200
+USE_LPIPS_PERCEP = True
+LPIPS_START_EPOCH = 8
+LPIPS_RAMP_END_EPOCH = 25
+LPIPS_WEIGHT_MAX = 0.15
+LPIPS_T_MAX = 400
 
 # As LPIPS ramps in, old structure losses ramp down
-LATENT_L1_WEIGHT_START = 0.10
-LATENT_L1_WEIGHT_END = 0.03
+LATENT_L1_WEIGHT_START = 0.08
+LATENT_L1_WEIGHT_END = 0.01
 
-LR_CONS_WEIGHT_START = 0.05
-LR_CONS_WEIGHT_END = 0.02
+LR_CONS_WEIGHT_START = 0.04
+LR_CONS_WEIGHT_END = 0.005
 
 GW_WEIGHT_START = 0.05
-GW_WEIGHT_END = 0.02
+GW_WEIGHT_END = 0.015
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
 CKPT_SELECT_MODE = "psnr_first"
@@ -231,8 +231,8 @@ T_SAMPLE_MIN = 0
 T_SAMPLE_MAX = 999
 T_TWO_STAGE_SWITCH = 15000
 
-INJECT_REG_WARMUP_END = 2000
-INJECT_REG_RAMP_END = 12000
+INJECT_REG_WARMUP_END = 0
+INJECT_REG_RAMP_END = 1
 
 LR_CONSIST_WEIGHT_MAX = 0.1
 LR_CONSIST_WARMUP = 0
@@ -270,10 +270,13 @@ def _linear_ramp(epoch_1based: int, start_epoch: int, end_epoch: int) -> float:
 
 
 def get_loss_weights(epoch_1based: int):
-    latent_l1_w = LATENT_L1_WEIGHT_START
-    lr_cons_w = LR_CONS_WEIGHT_START
-    gw_w = GW_WEIGHT_START
+    struct_decay = _linear_ramp(epoch_1based, start_epoch=8, end_epoch=25)
+    latent_l1_w = LATENT_L1_WEIGHT_START + (LATENT_L1_WEIGHT_END - LATENT_L1_WEIGHT_START) * struct_decay
+    lr_cons_w = LR_CONS_WEIGHT_START + (LR_CONS_WEIGHT_END - LR_CONS_WEIGHT_START) * struct_decay
+    gw_w = GW_WEIGHT_START + (GW_WEIGHT_END - GW_WEIGHT_START) * struct_decay
     lpips_w = 0.0
+    if USE_LPIPS_PERCEP:
+        lpips_w = LPIPS_WEIGHT_MAX * _linear_ramp(epoch_1based, start_epoch=LPIPS_START_EPOCH, end_epoch=LPIPS_RAMP_END_EPOCH)
 
     return {
         "mse": 1.0,
@@ -282,6 +285,24 @@ def get_loss_weights(epoch_1based: int):
         "gw": float(gw_w),
         "lpips": float(lpips_w),
     }
+
+
+def get_sft_strength(epoch_1based: int) -> float:
+    if epoch_1based < 8:
+        return 1.0
+    if epoch_1based < 25:
+        p = (epoch_1based - 8) / max(1, 25 - 8)
+        return float(1.0 - 0.4 * p)
+    return 0.6
+
+
+def get_inject_reg_weight(epoch_1based: int) -> float:
+    if epoch_1based < 20:
+        return 1.0
+    if epoch_1based < 25:
+        p = (epoch_1based - 20) / max(1, 25 - 20)
+        return float(1.0 - 0.95 * p)
+    return 0.05
 
 
 def get_fixed_loss_weights(epoch_1based: int = 1):
@@ -1750,8 +1771,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
@@ -1919,8 +1940,11 @@ def main():
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
 
     lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
+    lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval() if USE_LPIPS_PERCEP else None
     for p in vae.parameters(): p.requires_grad_(False)
     for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
+    if lpips_fn_train is not None:
+        for p in lpips_fn_train.parameters(): p.requires_grad_(False)
 
     if not os.path.exists(NULL_T5_EMBED_PATH):
         raise FileNotFoundError(f"Null T5 embed not found: {NULL_T5_EMBED_PATH}")
@@ -2017,7 +2041,8 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in)
+                sft_strength = get_sft_strength(epoch + 1)
+                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, sft_strength=sft_strength)
                 kwargs["force_drop_ids"] = drop_uncond
 
                 out = pixart(**kwargs)
@@ -2055,6 +2080,7 @@ def main():
                 # Calculate patch-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
+                loss_lpips = torch.tensor(0.0, device=DEVICE)
 
                 need_patch_loss = (
                     (w.get('lr_cons', 0.0) > 0) or
@@ -2080,16 +2106,26 @@ def main():
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
 
-                    # CasSR route: disable GAN + LPIPS training loss.
+                    if (w.get('lpips', 0.0) > 0) and USE_LPIPS_PERCEP:
+                        lpips_t_mask = (t.index_select(0, active_idx) <= int(LPIPS_T_MAX))
+                        if float(lpips_t_mask.sum().item()) > 0:
+                            lp_idx = torch.nonzero(lpips_t_mask, as_tuple=False).squeeze(1)
+                            loss_lpips = perceptual_lpips_loss(
+                                lpips_fn_train,
+                                img_p_valid.index_select(0, lp_idx),
+                                img_t_valid.index_select(0, lp_idx),
+                            )
                 else:
                     patch_loss_num_samples = 0
 
-                inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
+                inject_reg_w = get_inject_reg_weight(epoch + 1)
+                inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step) * inject_reg_w)
                 loss = (
                     loss_v
                     + w['latent_l1'] * loss_latent_l1
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
+                    + w.get('lpips', 0.0) * loss_lpips
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2116,28 +2152,25 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 detail_stats = getattr(pixart, "_last_detail_attn_stats", {}) or {}
-                gcsa_stats = getattr(adapter, "_last_gcsa_stats", {}) or {}
+                sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                 pbar.set_postfix({
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
+                    'lp': f"{loss_lpips.item():.3f}",
                     'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
+                    'ireg_w': f"{inject_reg_w:.3f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
+                    'lp_w': f"{w.get('lpips', 0.0):.3f}",
+                    'sft_s': f"{sft_strength:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'g2_g': f"{float(gcsa_stats.get('gcsa2_gamma', 0.0)):.3f}",
-                    'g3_g': f"{float(gcsa_stats.get('gcsa3_gamma', 0.0)):.3f}",
-                    'g4_g': f"{float(gcsa_stats.get('gcsa4_gamma', 0.0)):.3f}",
-                    'g2_m': f"{float(gcsa_stats.get('gcsa2_attn_mean', 0.0)):.3f}",
-                    'g2_s': f"{float(gcsa_stats.get('gcsa2_attn_std', 0.0)):.3f}",
-                    'g3_m': f"{float(gcsa_stats.get('gcsa3_attn_mean', 0.0)):.3f}",
-                    'g3_s': f"{float(gcsa_stats.get('gcsa3_attn_std', 0.0)):.3f}",
-                    'g4_m': f"{float(gcsa_stats.get('gcsa4_attn_mean', 0.0)):.3f}",
-                    'g4_s': f"{float(gcsa_stats.get('gcsa4_attn_std', 0.0)):.3f}",
+                    'sft_w': f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}",
+                    'xg': f"{float(detail_stats.get('mean_cross_gate', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 })

@@ -581,6 +581,7 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
                 data_info=data_info,
                 adapter_cond=cond,
                 force_drop_ids=torch.ones(latents.shape[0], device=device),
+                sft_strength=args.sft_strength,
             )
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
@@ -766,6 +767,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--max_samples", type=int, default=0)
+    parser.add_argument("--sft_strength", type=float, default=0.6)
 
     parser.add_argument("--output_dir", type=str, default="/home/hello/HJT/SRConvnetAdapter/experiments_results")
     parser.add_argument("--save_preds", action="store_true", default=True)

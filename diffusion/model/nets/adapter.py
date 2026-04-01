@@ -64,71 +64,6 @@ class SRConvNetLSAAdapter(nn.Module):
         }
 
 
-class GroupedChannelSelfAttention2D(nn.Module):
-    """
-    G-CSA block adapted toward grouped channel-wise self-attention (MDTA-style core).
-
-    Notes:
-    - This is NOT the full blind-spot TBSN DTAB block.
-    - We only keep the most transferable core: grouped channel-wise self-attention.
-    - M-WSA and blind-spot specific masking are intentionally not introduced in the SR adapter trunk.
-    """
-
-    def __init__(self, channels: int, num_groups: int = 8, reduction: int = 4):
-        del reduction
-        super().__init__()
-        self.channels = int(channels)
-        self.num_groups = int(num_groups)
-        if self.channels % self.num_groups != 0:
-            raise ValueError(f"channels ({self.channels}) must be divisible by num_groups ({self.num_groups})")
-        self.channels_per_group = self.channels // self.num_groups
-
-        self.norm = LayerNorm2d(self.channels)
-        self.qkv = nn.Conv2d(self.channels, self.channels * 3, kernel_size=1, stride=1, padding=0, bias=True)
-        self.qkv_dw = nn.Conv2d(
-            self.channels * 3,
-            self.channels * 3,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            groups=self.channels * 3,
-            bias=True,
-        )
-        self.proj = nn.Conv2d(self.channels, self.channels, kernel_size=1, stride=1, padding=0, bias=True)
-        self.temperature = nn.Parameter(torch.ones(self.num_groups, 1, 1))
-        self.gamma = nn.Parameter(torch.tensor(0.0))
-        self._last_attn_mean = None
-        self._last_attn_std = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        if c != self.channels:
-            raise RuntimeError(f"GCSA channel mismatch: expected {self.channels}, got {c}")
-
-        x_in = x
-        x = self.norm(x)
-        qkv = self.qkv_dw(self.qkv(x))
-        q, k, v = qkv.chunk(3, dim=1)
-
-        q = q.reshape(b, self.num_groups, self.channels_per_group, h * w)
-        k = k.reshape(b, self.num_groups, self.channels_per_group, h * w)
-        v = v.reshape(b, self.num_groups, self.channels_per_group, h * w)
-
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.temperature[None, :, :, :]
-        attn = attn.softmax(dim=-1)
-
-        out = torch.matmul(attn, v)
-        out = out.reshape(b, c, h, w)
-        out = self.proj(out)
-
-        self._last_attn_mean = float(attn.detach().float().mean().item())
-        self._last_attn_std = float(attn.detach().float().std(unbiased=False).item())
-        return x_in + self.gamma * out
-
-
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
@@ -323,10 +258,6 @@ class SRConvNetLSAAdapterV12(nn.Module):
         self.stage3 = nn.Sequential(SRConvNetBlock(256), SRConvNetBlock(256), SRConvNetBlock(256), SRConvNetBlock(256))
         self.stage4 = nn.Sequential(SRConvNetBlock(256), SRConvNetBlock(256))
 
-        self.gcsa2 = GroupedChannelSelfAttention2D(channels=128, num_groups=4)
-        self.gcsa3 = GroupedChannelSelfAttention2D(channels=256, num_groups=8)
-        self.gcsa4 = GroupedChannelSelfAttention2D(channels=256, num_groups=8)
-
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(self.hidden_size, 2 * (64 + 128 + 256 + 256)),
@@ -336,28 +267,26 @@ class SRConvNetLSAAdapterV12(nn.Module):
         self.proj3 = nn.Conv2d(256, 256, 1)
         self.proj4 = nn.Conv2d(256, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
+        self.detail_reduce = nn.Conv2d(256, 64, kernel_size=1, stride=1, padding=0, bias=True)
+        self.detail_refine = nn.Sequential(
+            nn.Conv2d(64, 64, 3, 1, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(64, 64, 3, 1, 1, bias=True),
+        )
 
         for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
-
-        self._last_gcsa_stats = None
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         return (1.0 + gamma[:, :, None, None]) * feat + beta[:, :, None, None]
 
     def forward(self, lr_small: torch.Tensor, t_embed: torch.Tensor = None):
-        x = lr_small
-        f1 = self.stage1(self.stem(x))
+        f1 = self.stage1(self.stem(lr_small))
         f2 = self.stage2(self.down1(f1))
-        f2 = self.gcsa2(f2)
-
         f3 = self.stage3(self.down2(f2))
-        f3 = self.gcsa3(f3)
-
         f4 = self.stage4(f3)
-        f4 = self.gcsa4(f4)
 
         if t_embed is not None:
             tb = self.time_mlp(t_embed)
@@ -373,21 +302,12 @@ class SRConvNetLSAAdapterV12(nn.Module):
         c3 = self.proj3(f3)
         c4 = self.proj4(f4)
         cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
-
-        self._last_gcsa_stats = {
-            "gcsa2_gamma": float(self.gcsa2.gamma.detach().float().item()),
-            "gcsa3_gamma": float(self.gcsa3.gamma.detach().float().item()),
-            "gcsa4_gamma": float(self.gcsa4.gamma.detach().float().item()),
-            "gcsa2_attn_mean": float(self.gcsa2._last_attn_mean if self.gcsa2._last_attn_mean is not None else 0.0),
-            "gcsa2_attn_std": float(self.gcsa2._last_attn_std if self.gcsa2._last_attn_std is not None else 0.0),
-            "gcsa3_attn_mean": float(self.gcsa3._last_attn_mean if self.gcsa3._last_attn_mean is not None else 0.0),
-            "gcsa3_attn_std": float(self.gcsa3._last_attn_std if self.gcsa3._last_attn_std is not None else 0.0),
-            "gcsa4_attn_mean": float(self.gcsa4._last_attn_mean if self.gcsa4._last_attn_mean is not None else 0.0),
-            "gcsa4_attn_std": float(self.gcsa4._last_attn_std if self.gcsa4._last_attn_std is not None else 0.0),
-        }
+        detail_map = self.detail_reduce(f4)
+        detail_map = self.detail_refine(detail_map)
 
         return {
             "cond_map": cond_map,
+            "detail_map": detail_map,
         }
 
 

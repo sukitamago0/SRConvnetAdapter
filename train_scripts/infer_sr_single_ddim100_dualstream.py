@@ -267,6 +267,7 @@ def run(args):
                     data_info=data_info,
                     adapter_cond=cond,
                     force_drop_ids=drop_cond,
+                    sft_strength=args.sft_strength,
                 )
             else:
                 cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=device))
@@ -279,6 +280,7 @@ def run(args):
                     data_info=data_info,
                     adapter_cond=cond_zero,
                     force_drop_ids=drop_uncond,
+                    sft_strength=args.sft_strength,
                 )
                 out_cond = pixart(
                     x=model_in,
@@ -289,6 +291,7 @@ def run(args):
                     data_info=data_info,
                     adapter_cond=cond,
                     force_drop_ids=drop_cond,
+                    sft_strength=args.sft_strength,
                 )
                 out = out_uncond + args.cfg_scale * (out_cond - out_uncond)
 
@@ -322,6 +325,7 @@ def parse_args():
     parser.set_defaults(use_lq_init=True)
     parser.add_argument("--lq-init-strength", type=float, default=0.3)
     parser.add_argument("--cfg-scale", type=float, default=1.0)
+    parser.add_argument("--sft_strength", type=float, default=0.6)
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=int, default=4)
     parser.add_argument("--input_is_lr_small", type=lambda x: str(x).lower() in ("1","true","yes","y"), default=True)
