@@ -12,9 +12,16 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import xformers.ops
+try:
+    import xformers.ops as xops
+    XFORMERS_AVAILABLE = True
+except Exception:
+    xops = None
+    XFORMERS_AVAILABLE = False
 from einops import rearrange
 from timm.models.vision_transformer import Mlp, Attention as Attention_
+
+_XFORMERS_FALLBACK_WARNED = False
 
 
 def modulate(x, shift, scale):
@@ -23,6 +30,43 @@ def modulate(x, shift, scale):
 
 def t2i_modulate(x, shift, scale):
     return x * (1 + scale) + shift
+
+
+def memory_efficient_attention_fallback(q, k, v, p=0.0, attn_bias=None):
+    global _XFORMERS_FALLBACK_WARNED
+    if XFORMERS_AVAILABLE:
+        try:
+            return xops.memory_efficient_attention(q, k, v, p=p, attn_bias=attn_bias)
+        except Exception:
+            if not _XFORMERS_FALLBACK_WARNED:
+                print("⚠️ xFormers attention failed at runtime, fallback to torch SDPA.")
+                _XFORMERS_FALLBACK_WARNED = True
+    elif not _XFORMERS_FALLBACK_WARNED:
+        print("⚠️ xFormers unavailable, falling back to torch SDPA attention.")
+        _XFORMERS_FALLBACK_WARNED = True
+
+    q_t = q.permute(0, 2, 1, 3).contiguous()
+    k_t = k.permute(0, 2, 1, 3).contiguous()
+    v_t = v.permute(0, 2, 1, 3).contiguous()
+
+    attn_mask = None
+    if isinstance(attn_bias, torch.Tensor):
+        bsz, heads, n_q, _ = q_t.shape
+        n_k = k_t.shape[2]
+        if attn_bias.ndim == 3 and attn_bias.shape[0] == bsz * heads:
+            attn_mask = attn_bias.view(bsz, heads, n_q, n_k)
+        else:
+            attn_mask = attn_bias
+
+    out = F.scaled_dot_product_attention(
+        q_t,
+        k_t,
+        v_t,
+        attn_mask=attn_mask,
+        dropout_p=p if q.requires_grad else 0.0,
+        is_causal=False,
+    )
+    return out.permute(0, 2, 1, 3).contiguous()
 
 
 class MultiHeadCrossAttention(nn.Module):
@@ -48,9 +92,12 @@ class MultiHeadCrossAttention(nn.Module):
         kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
         k, v = kv.unbind(2)
         attn_bias = None
-        if mask is not None:
-            attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        if mask is not None and XFORMERS_AVAILABLE:
+            try:
+                attn_bias = xops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
+            except Exception:
+                attn_bias = None
+        x = memory_efficient_attention_fallback(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
         x = x.view(B, -1, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -150,7 +197,7 @@ class AttentionKVCompress(Attention_):
         if mask is not None:
             attn_bias = torch.zeros([B * self.num_heads, q.shape[1], k.shape[1]], dtype=q.dtype, device=q.device)
             attn_bias.masked_fill_(mask.squeeze(1).repeat(self.num_heads, 1, 1) == 0, float('-inf'))
-        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        x = memory_efficient_attention_fallback(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
 
         x = x.view(B, N, C)
         x = self.proj(x)
