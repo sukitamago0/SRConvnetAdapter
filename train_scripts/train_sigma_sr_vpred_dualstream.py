@@ -187,8 +187,8 @@ LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
 USE_LPIPS_PERCEP = True
 LPIPS_START_EPOCH = 8
 LPIPS_RAMP_END_EPOCH = 25
-LPIPS_WEIGHT_MAX = 0.15
-LPIPS_T_MAX = 400
+LPIPS_WEIGHT_MAX = 0.20
+LPIPS_T_MAX = 600
 
 # As LPIPS ramps in, old structure losses ramp down
 LATENT_L1_WEIGHT_START = 0.08
@@ -289,12 +289,12 @@ def get_loss_weights(epoch_1based: int):
 
 
 def get_sft_strength(epoch_1based: int) -> float:
-    if epoch_1based < 8:
+    if epoch_1based < 12:
         return 1.0
-    if epoch_1based < 25:
-        p = (epoch_1based - 8) / max(1, 25 - 8)
-        return float(1.0 - 0.4 * p)
-    return 0.6
+    if epoch_1based < 35:
+        p = (epoch_1based - 12) / max(1, 35 - 12)
+        return float(1.0 - 0.25 * p)
+    return 0.75
 
 
 def get_inject_reg_weight(epoch_1based: int) -> float:
@@ -1267,6 +1267,9 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
+        "sft_cross_attn",
+        "sft_cross_gate",
+        "detail_kv_proj",
         "gcsa2",
         "gcsa3",
         "gcsa4",
@@ -1312,16 +1315,34 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
 
 
 def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
-    adapter_params = [p for p in adapter.parameters() if p.requires_grad]
+    cross_detail_names = [
+        "sft_cross_attn",
+        "sft_cross_gate",
+        "detail_kv_proj",
+        "detail_reduce",
+        "detail_refine",
+    ]
+    adapter_params = []
+    adapter_cross_detail = []
+    for n, p in adapter.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(tag in n for tag in cross_detail_names):
+            adapter_cross_detail.append(p)
+        else:
+            adapter_params.append(p)
 
     lora_params = []
     final_head_params = []
     bridge_params = []
+    pixart_cross_detail = []
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if ("lora_A" in n) or ("lora_B" in n):
+        if any(tag in n for tag in cross_detail_names):
+            pixart_cross_detail.append(p)
+        elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
             final_head_params.append(p)
@@ -1331,6 +1352,9 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     optim_groups = []
     if len(adapter_params) > 0:
         optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
+    cross_detail_params = pixart_cross_detail + adapter_cross_detail
+    if len(cross_detail_params) > 0:
+        optim_groups.append({"params": cross_detail_params, "lr": LR_BASE * 8.0, "weight_decay": 0.0})
     bridge_and_head = bridge_params + final_head_params
     if len(bridge_and_head) > 0:
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
@@ -1341,10 +1365,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params
+    params_to_clip = adapter_params + adapter_cross_detail + bridge_params + final_head_params + lora_params + pixart_cross_detail
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params
+    grouped = bridge_params + final_head_params + lora_params + pixart_cross_detail
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1352,9 +1376,11 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     group_counts = {
         "bridge": len(bridge_params),
+        "cross_detail": len(cross_detail_params),
         "lora": len(lora_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
+        "adapter_cross_detail": len(adapter_cross_detail),
     }
     return optimizer, params_to_clip, group_counts
 
@@ -2138,6 +2164,18 @@ def main():
             if accum_micro_steps == GRAD_ACCUM_STEPS:
                 log_critical_path_gradients(step + 1, pixart, adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+                if (step + 1) % 500 == 0:
+                    dk = pixart.detail_kv_proj.weight.grad
+                    print(f"[GRAD] detail_kv_proj: {0.0 if dk is None else dk.norm().item():.6f}")
+                    cg_param = next(iter(pixart.sft_cross_gate.values()), None)
+                    cg = None if cg_param is None else cg_param.grad
+                    print(f"[GRAD] cross_gate: {0.0 if cg is None else cg.norm().item():.6f}")
+                    attn_grad = None
+                    for _, mod in pixart.sft_cross_attn.items():
+                        if hasattr(mod, "q_linear") and mod.q_linear is not None:
+                            attn_grad = mod.q_linear.weight.grad
+                            break
+                    print(f"[GRAD] cross_attn_q_linear: {0.0 if attn_grad is None else attn_grad.norm().item():.6f}")
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1

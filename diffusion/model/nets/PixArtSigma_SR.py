@@ -63,11 +63,11 @@ class PixArtSigmaSR(PixArtMS):
         self.sft_cross_attn = nn.ModuleDict()
         self.sft_cross_gate = nn.ParameterDict()
         self.detail_kv_proj = nn.Conv2d(64, self.hidden_size, kernel_size=1, stride=1, padding=0, bias=True)
-        nn.init.normal_(self.detail_kv_proj.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.detail_kv_proj.weight, mean=0.0, std=1e-2)
         nn.init.zeros_(self.detail_kv_proj.bias)
         for i in sorted(self.hard_injection_layers):
             self.sft_cross_attn[str(i)] = MultiHeadCrossAttention(self.hidden_size, self.num_heads)
-            self.sft_cross_gate[str(i)] = nn.Parameter(torch.tensor(0.1))
+            self.sft_cross_gate[str(i)] = nn.Parameter(torch.tensor(0.3))
 
         self._last_sft_stats = None
         self._last_detail_attn_stats = None
@@ -141,6 +141,7 @@ class PixArtSigmaSR(PixArtMS):
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
                 if detail_tokens is not None:
                     attn_out = self.sft_cross_attn[str(i)](x, detail_tokens, mask=None)
+                    attn_out = attn_out / (attn_out.abs().mean(dim=-1, keepdim=True) + 1e-6)
                     gate = self.sft_cross_gate[str(i)].to(dtype=x.dtype)
                     x = x + gate * attn_out
                     cross_gate_vals.append(float(self.sft_cross_gate[str(i)].detach().float().item()))
