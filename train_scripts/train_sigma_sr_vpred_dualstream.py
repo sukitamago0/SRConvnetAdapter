@@ -57,9 +57,7 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "sft_cross_attn",
-    "sft_cross_gate",
-    "detail_kv_proj",
+    "cfw_wrapping",
     "lora_A",
     "lora_B",
 )
@@ -1267,9 +1265,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
-        "sft_cross_attn",
-        "sft_cross_gate",
-        "detail_kv_proj",
+        "cfw_wrapping",
         "gcsa2",
         "gcsa3",
         "gcsa4",
@@ -1315,33 +1311,18 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
 
 
 def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
-    cross_detail_names = [
-        "sft_cross_attn",
-        "sft_cross_gate",
-        "detail_kv_proj",
-        "detail_reduce",
-        "detail_refine",
-    ]
-    adapter_params = []
-    adapter_cross_detail = []
-    for n, p in adapter.named_parameters():
-        if not p.requires_grad:
-            continue
-        if any(tag in n for tag in cross_detail_names):
-            adapter_cross_detail.append(p)
-        else:
-            adapter_params.append(p)
+    adapter_params = [p for p in adapter.parameters() if p.requires_grad]
 
     lora_params = []
     final_head_params = []
     bridge_params = []
-    pixart_cross_detail = []
+    cfw_params = []
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if any(tag in n for tag in cross_detail_names):
-            pixart_cross_detail.append(p)
+        if "cfw_wrapping" in n:
+            cfw_params.append(p)
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
@@ -1352,9 +1333,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     optim_groups = []
     if len(adapter_params) > 0:
         optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
-    cross_detail_params = pixart_cross_detail + adapter_cross_detail
-    if len(cross_detail_params) > 0:
-        optim_groups.append({"params": cross_detail_params, "lr": LR_BASE * 8.0, "weight_decay": 0.0})
+    if len(cfw_params) > 0:
+        optim_groups.append({"params": cfw_params, "lr": LR_BASE * 2.0, "weight_decay": 0.0})
     bridge_and_head = bridge_params + final_head_params
     if len(bridge_and_head) > 0:
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
@@ -1365,10 +1345,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + adapter_cross_detail + bridge_params + final_head_params + lora_params + pixart_cross_detail
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + cfw_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + pixart_cross_detail
+    grouped = bridge_params + final_head_params + lora_params + cfw_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1376,11 +1356,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     group_counts = {
         "bridge": len(bridge_params),
-        "cross_detail": len(cross_detail_params),
+        "cfw": len(cfw_params),
         "lora": len(lora_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
-        "adapter_cross_detail": len(adapter_cross_detail),
     }
     return optimizer, params_to_clip, group_counts
 
@@ -2165,17 +2144,11 @@ def main():
                 log_critical_path_gradients(step + 1, pixart, adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 if (step + 1) % 500 == 0:
-                    dk = pixart.detail_kv_proj.weight.grad
-                    print(f"[GRAD] detail_kv_proj: {0.0 if dk is None else dk.norm().item():.6f}")
-                    cg_param = next(iter(pixart.sft_cross_gate.values()), None)
-                    cg = None if cg_param is None else cg_param.grad
-                    print(f"[GRAD] cross_gate: {0.0 if cg is None else cg.norm().item():.6f}")
-                    attn_grad = None
-                    for _, mod in pixart.sft_cross_attn.items():
-                        if hasattr(mod, "q_linear") and mod.q_linear is not None:
-                            attn_grad = mod.q_linear.weight.grad
-                            break
-                    print(f"[GRAD] cross_attn_q_linear: {0.0 if attn_grad is None else attn_grad.norm().item():.6f}")
+                    cfw_mod = next(iter(pixart.cfw_wrapping.values()), None) if hasattr(pixart, "cfw_wrapping") else None
+                    cfw_proj = None if cfw_mod is None else cfw_mod.proj.weight.grad
+                    cfw_w = None if cfw_mod is None else cfw_mod.w.grad
+                    print(f"[GRAD] cfw_proj: {0.0 if cfw_proj is None else cfw_proj.norm().item():.6f}")
+                    print(f"[GRAD] cfw_w: {0.0 if cfw_w is None else cfw_w.norm().item():.6f}")
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
@@ -2192,7 +2165,7 @@ def main():
                 else:
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
-                detail_stats = getattr(pixart, "_last_detail_attn_stats", {}) or {}
+                cfw_stats = getattr(pixart, "_last_cfw_stats", {}) or {}
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
@@ -2211,14 +2184,14 @@ def main():
                     'sft_s': f"{sft_strength:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
                     'sft_w': f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}",
-                    'xg': f"{float(detail_stats.get('mean_cross_gate', 0.0)):.3f}",
+                    'cfw_w': f"{float(cfw_stats.get('mean_cfw_w', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 }
                 if getattr(pixart, "_last_sft_stats", None) is not None:
                     log_dict["mean_sft_w"] = f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}"
-                if getattr(pixart, "_last_detail_attn_stats", None) is not None:
-                    log_dict["mean_cross_gate"] = f"{float(detail_stats.get('mean_cross_gate', 0.0)):.3f}"
+                if getattr(pixart, "_last_cfw_stats", None) is not None:
+                    log_dict["mean_cfw_w"] = f"{float(cfw_stats.get('mean_cfw_w', 0.0)):.3f}"
                 log_dict["sft_strength"] = f"{sft_strength:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
@@ -2227,7 +2200,7 @@ def main():
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
                     "mean_sft_w": float(sft_stats.get("mean_sft_w", 0.0)),
-                    "mean_cross_gate": float(detail_stats.get("mean_cross_gate", 0.0)),
+                    "mean_cfw_w": float(cfw_stats.get("mean_cfw_w", 0.0)),
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:

@@ -4,7 +4,7 @@ import torch.nn as nn
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
-from diffusion.model.nets.PixArt_blocks import MultiHeadCrossAttention, TimestepEmbedder, T2IFinalLayer
+from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 
@@ -23,6 +23,20 @@ class SFTLayer(nn.Module):
         shift = self.shift_conv1(self.act(self.shift_conv0(cond)))
         gain = self.w * float(strength)
         return feat * (1 + gain * scale) + gain * shift, scale, shift
+
+
+class CFWWrapping(nn.Module):
+    def __init__(self, cond_dim: int, hidden_size: int):
+        super().__init__()
+        self.w = nn.Parameter(torch.tensor(0.5))
+        self.proj = nn.Conv2d(cond_dim, hidden_size, kernel_size=1, stride=1, padding=0, bias=True)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x_tokens, cond_feat_2d):
+        wrapped = self.proj(cond_feat_2d)
+        wrapped = wrapped.flatten(2).transpose(1, 2).contiguous()
+        return x_tokens + self.w * wrapped
 
 
 @MODELS.register_module()
@@ -60,17 +74,13 @@ class PixArtSigmaSR(PixArtMS):
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
         self.hard_injection_layers = set(hard_injection_layers or [2, 4, 6, 8, 10, 12])
-        self.sft_cross_attn = nn.ModuleDict()
-        self.sft_cross_gate = nn.ParameterDict()
-        self.detail_kv_proj = nn.Conv2d(64, self.hidden_size, kernel_size=1, stride=1, padding=0, bias=True)
-        nn.init.normal_(self.detail_kv_proj.weight, mean=0.0, std=1e-2)
-        nn.init.zeros_(self.detail_kv_proj.bias)
+        self.use_detail_cross_attn = False
+        self.cfw_wrapping = nn.ModuleDict()
         for i in sorted(self.hard_injection_layers):
-            self.sft_cross_attn[str(i)] = MultiHeadCrossAttention(self.hidden_size, self.num_heads)
-            self.sft_cross_gate[str(i)] = nn.Parameter(torch.tensor(0.3))
+            self.cfw_wrapping[str(i)] = CFWWrapping(cond_dim=64, hidden_size=self.hidden_size)
 
         self._last_sft_stats = None
-        self._last_detail_attn_stats = None
+        self._last_cfw_stats = None
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
@@ -95,10 +105,8 @@ class PixArtSigmaSR(PixArtMS):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         cond_map = None
-        detail_map = None
         if isinstance(adapter_cond, dict):
             cond_map = adapter_cond.get("cond_map", None)
-            detail_map = adapter_cond.get("detail_map", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -116,16 +124,10 @@ class PixArtSigmaSR(PixArtMS):
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
-        cross_gate_vals = []
+        cfw_w_vals = []
         cond_red = None
         if cond_map is not None:
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
-        detail_tokens = None
-        if detail_map is not None:
-            detail_feat = self.detail_kv_proj(detail_map.to(dtype=x.dtype))
-            detail_tokens = detail_feat.flatten(2).transpose(1, 2).contiguous()
-            if detail_tokens.shape[-1] != x.shape[-1]:
-                raise RuntimeError(f"detail token dim mismatch: got {detail_tokens.shape[-1]}, expected {x.shape[-1]}")
 
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.hard_injection_layers:
@@ -138,13 +140,10 @@ class PixArtSigmaSR(PixArtMS):
                 sft_scale_stds.append(float(scale.detach().float().std(unbiased=False).item()))
                 sft_shift_means.append(float(shift.detach().float().mean().item()))
                 sft_shift_stds.append(float(shift.detach().float().std(unbiased=False).item()))
-                x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
-                if detail_tokens is not None:
-                    attn_out = self.sft_cross_attn[str(i)](x, detail_tokens, mask=None)
-                    attn_out = attn_out / (attn_out.abs().mean(dim=-1, keepdim=True) + 1e-6)
-                    gate = self.sft_cross_gate[str(i)].to(dtype=x.dtype)
-                    x = x + gate * attn_out
-                    cross_gate_vals.append(float(self.sft_cross_gate[str(i)].detach().float().item()))
+                x_tokens = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
+                x_tokens = self.cfw_wrapping[str(i)](x_tokens, cond_red)
+                x = x_tokens
+                cfw_w_vals.append(float(self.cfw_wrapping[str(i)].w.detach().float().item()))
 
             # detail layers revert to original block-only forward
             x = auto_grad_checkpoint(
@@ -171,9 +170,9 @@ class PixArtSigmaSR(PixArtMS):
         else:
             self._last_sft_stats = None
 
-        self._last_detail_attn_stats = {
-            "mean_cross_gate": float(sum(cross_gate_vals) / len(cross_gate_vals))
-        } if len(cross_gate_vals) > 0 else None
+        self._last_cfw_stats = {
+            "mean_cfw_w": float(sum(cfw_w_vals) / len(cfw_w_vals))
+        } if len(cfw_w_vals) > 0 else None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
