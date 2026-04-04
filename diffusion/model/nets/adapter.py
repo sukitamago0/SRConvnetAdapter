@@ -267,22 +267,10 @@ class SRConvNetLSAAdapterV12(nn.Module):
         self.proj3 = nn.Conv2d(256, 256, 1)
         self.proj4 = nn.Conv2d(256, 256, 1)
         self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
-        self.detail_reduce = nn.Conv2d(256, 64, kernel_size=1, stride=1, padding=0, bias=True)
-        self.detail_refine = nn.Sequential(
-            nn.Conv2d(64, 64, 3, 1, 1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(64, 64, 3, 1, 1, bias=True),
-        )
 
         for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
-        nn.init.normal_(self.detail_reduce.weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.detail_reduce.bias)
-        for m in self.detail_refine:
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, mean=0.0, std=1e-3)
-                nn.init.zeros_(m.bias)
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -308,12 +296,9 @@ class SRConvNetLSAAdapterV12(nn.Module):
         c3 = self.proj3(f3)
         c4 = self.proj4(f4)
         cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
-        detail_map = self.detail_reduce(f4)
-        detail_map = self.detail_refine(detail_map)
 
         return {
             "cond_map": cond_map,
-            "detail_map": detail_map,
         }
 
 

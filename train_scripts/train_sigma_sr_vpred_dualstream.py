@@ -1266,9 +1266,6 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "sft_cond_reduce",
         "sft_layers",
         "cfw_wrapping",
-        "gcsa2",
-        "gcsa3",
-        "gcsa4",
     ]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])

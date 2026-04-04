@@ -74,7 +74,6 @@ class PixArtSigmaSR(PixArtMS):
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
         self.hard_injection_layers = set(hard_injection_layers or [2, 4, 6, 8, 10, 12])
-        self.use_detail_cross_attn = False
         self.cfw_wrapping = nn.ModuleDict()
         for i in sorted(self.hard_injection_layers):
             self.cfw_wrapping[str(i)] = CFWWrapping(cond_dim=64, hidden_size=self.hidden_size)
