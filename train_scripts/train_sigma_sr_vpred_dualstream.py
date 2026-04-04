@@ -51,14 +51,13 @@ from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
 
 BASE_PIXART_SHA256 = None
+LAST_TRAIN_LOG = {}
 
 ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "gcsa2",
-    "gcsa3",
-    "gcsa4",
+    "cfw_wrapping",
     "lora_A",
     "lora_B",
 )
@@ -183,21 +182,21 @@ PIXEL_LOSS_T_MAX = 250
 LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
 
 # LPIPS perceptual curriculum (single-script, no separate stage script)
-USE_LPIPS_PERCEP = False
-LPIPS_START_EPOCH = 999999
-LPIPS_RAMP_END_EPOCH = 999999
-LPIPS_WEIGHT_MAX = 0.0
-LPIPS_T_MAX = 200
+USE_LPIPS_PERCEP = True
+LPIPS_START_EPOCH = 8
+LPIPS_RAMP_END_EPOCH = 25
+LPIPS_WEIGHT_MAX = 0.20
+LPIPS_T_MAX = 600
 
 # As LPIPS ramps in, old structure losses ramp down
-LATENT_L1_WEIGHT_START = 0.10
-LATENT_L1_WEIGHT_END = 0.03
+LATENT_L1_WEIGHT_START = 0.08
+LATENT_L1_WEIGHT_END = 0.01
 
-LR_CONS_WEIGHT_START = 0.05
-LR_CONS_WEIGHT_END = 0.02
+LR_CONS_WEIGHT_START = 0.04
+LR_CONS_WEIGHT_END = 0.005
 
 GW_WEIGHT_START = 0.05
-GW_WEIGHT_END = 0.02
+GW_WEIGHT_END = 0.015
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
 CKPT_SELECT_MODE = "psnr_first"
@@ -231,8 +230,8 @@ T_SAMPLE_MIN = 0
 T_SAMPLE_MAX = 999
 T_TWO_STAGE_SWITCH = 15000
 
-INJECT_REG_WARMUP_END = 2000
-INJECT_REG_RAMP_END = 12000
+INJECT_REG_WARMUP_END = 0
+INJECT_REG_RAMP_END = 1
 
 LR_CONSIST_WEIGHT_MAX = 0.1
 LR_CONSIST_WARMUP = 0
@@ -270,10 +269,13 @@ def _linear_ramp(epoch_1based: int, start_epoch: int, end_epoch: int) -> float:
 
 
 def get_loss_weights(epoch_1based: int):
-    latent_l1_w = LATENT_L1_WEIGHT_START
-    lr_cons_w = LR_CONS_WEIGHT_START
-    gw_w = GW_WEIGHT_START
+    struct_decay = _linear_ramp(epoch_1based, start_epoch=8, end_epoch=25)
+    latent_l1_w = LATENT_L1_WEIGHT_START + (LATENT_L1_WEIGHT_END - LATENT_L1_WEIGHT_START) * struct_decay
+    lr_cons_w = LR_CONS_WEIGHT_START + (LR_CONS_WEIGHT_END - LR_CONS_WEIGHT_START) * struct_decay
+    gw_w = GW_WEIGHT_START + (GW_WEIGHT_END - GW_WEIGHT_START) * struct_decay
     lpips_w = 0.0
+    if USE_LPIPS_PERCEP:
+        lpips_w = LPIPS_WEIGHT_MAX * _linear_ramp(epoch_1based, start_epoch=LPIPS_START_EPOCH, end_epoch=LPIPS_RAMP_END_EPOCH)
 
     return {
         "mse": 1.0,
@@ -282,6 +284,24 @@ def get_loss_weights(epoch_1based: int):
         "gw": float(gw_w),
         "lpips": float(lpips_w),
     }
+
+
+def get_sft_strength(epoch_1based: int) -> float:
+    if epoch_1based < 12:
+        return 1.0
+    if epoch_1based < 35:
+        p = (epoch_1based - 12) / max(1, 35 - 12)
+        return float(1.0 - 0.25 * p)
+    return 0.75
+
+
+def get_inject_reg_weight(epoch_1based: int) -> float:
+    if epoch_1based < 20:
+        return 1.0
+    if epoch_1based < 25:
+        p = (epoch_1based - 20) / max(1, 25 - 20)
+        return float(1.0 - 0.95 * p)
+    return 0.05
 
 
 def get_fixed_loss_weights(epoch_1based: int = 1):
@@ -1245,9 +1265,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         "final_layer",
         "sft_cond_reduce",
         "sft_layers",
-        "gcsa2",
-        "gcsa3",
-        "gcsa4",
+        "cfw_wrapping",
     ]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
@@ -1295,11 +1313,14 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     lora_params = []
     final_head_params = []
     bridge_params = []
+    cfw_params = []
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if ("lora_A" in n) or ("lora_B" in n):
+        if "cfw_wrapping" in n:
+            cfw_params.append(p)
+        elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
             final_head_params.append(p)
@@ -1309,6 +1330,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     optim_groups = []
     if len(adapter_params) > 0:
         optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
+    if len(cfw_params) > 0:
+        optim_groups.append({"params": cfw_params, "lr": LR_BASE * 2.0, "weight_decay": 0.0})
     bridge_and_head = bridge_params + final_head_params
     if len(bridge_and_head) > 0:
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
@@ -1319,10 +1342,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + cfw_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params
+    grouped = bridge_params + final_head_params + lora_params + cfw_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1330,6 +1353,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     group_counts = {
         "bridge": len(bridge_params),
+        "cfw": len(cfw_params),
         "lora": len(lora_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
@@ -1508,6 +1532,7 @@ def save_smart(
             "best_eval_steps": int(eval_steps),
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
             "best_eval_tag": str(eval_tag),
+            "train_runtime_log": dict(LAST_TRAIN_LOG),
             "injection_config": {
                 "hard_layers": sorted(list(getattr(pixart, "hard_injection_layers", HARD_INJECTION_LAYERS))),
                 "detail_layers": list(getattr(pixart, "detail_injection_layers", DETAIL_INJECTION_LAYERS)),
@@ -1750,8 +1775,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond)
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
@@ -1841,6 +1866,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
 
 # ================= 10. Main =================
 def main():
+    global LAST_TRAIN_LOG
     seed_everything(SEED); dl_gen = torch.Generator(); dl_gen.manual_seed(SEED)
     validate_schedule_alignment()
     validate_s2d_decoupling()
@@ -1919,8 +1945,11 @@ def main():
     if VAE_TILING and hasattr(vae, "enable_tiling"): vae.enable_tiling()
 
     lpips_fn_val_cpu = lpips.LPIPS(net='vgg').to("cpu").eval()
+    lpips_fn_train = lpips.LPIPS(net='vgg').to(DEVICE).eval() if USE_LPIPS_PERCEP else None
     for p in vae.parameters(): p.requires_grad_(False)
     for p in lpips_fn_val_cpu.parameters(): p.requires_grad_(False)
+    if lpips_fn_train is not None:
+        for p in lpips_fn_train.parameters(): p.requires_grad_(False)
 
     if not os.path.exists(NULL_T5_EMBED_PATH):
         raise FileNotFoundError(f"Null T5 embed not found: {NULL_T5_EMBED_PATH}")
@@ -2017,7 +2046,8 @@ def main():
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
-                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in)
+                sft_strength = get_sft_strength(epoch + 1)
+                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, sft_strength=sft_strength)
                 kwargs["force_drop_ids"] = drop_uncond
 
                 out = pixart(**kwargs)
@@ -2055,6 +2085,7 @@ def main():
                 # Calculate patch-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
+                loss_lpips = torch.tensor(0.0, device=DEVICE)
 
                 need_patch_loss = (
                     (w.get('lr_cons', 0.0) > 0) or
@@ -2080,16 +2111,26 @@ def main():
                     if w.get('gw', 0.0) > 0:
                         loss_gw = gradient_weighted_loss(img_p_valid, img_t_valid, alpha=GW_ALPHA)
 
-                    # CasSR route: disable GAN + LPIPS training loss.
+                    if (w.get('lpips', 0.0) > 0) and USE_LPIPS_PERCEP:
+                        lpips_t_mask = (t.index_select(0, active_idx) <= int(LPIPS_T_MAX))
+                        if float(lpips_t_mask.sum().item()) > 0:
+                            lp_idx = torch.nonzero(lpips_t_mask, as_tuple=False).squeeze(1)
+                            loss_lpips = perceptual_lpips_loss(
+                                lpips_fn_train,
+                                img_p_valid.index_select(0, lp_idx),
+                                img_t_valid.index_select(0, lp_idx),
+                            )
                 else:
                     patch_loss_num_samples = 0
 
-                inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step))
+                inject_reg_w = get_inject_reg_weight(epoch + 1)
+                inject_reg = compute_injection_scale_reg(pixart, inject_reg_lambda(step) * inject_reg_w)
                 loss = (
                     loss_v
                     + w['latent_l1'] * loss_latent_l1
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
+                    + w.get('lpips', 0.0) * loss_lpips
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
 
@@ -2099,6 +2140,12 @@ def main():
             if accum_micro_steps == GRAD_ACCUM_STEPS:
                 log_critical_path_gradients(step + 1, pixart, adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+                if (step + 1) % 500 == 0:
+                    cfw_mod = next(iter(pixart.cfw_wrapping.values()), None) if hasattr(pixart, "cfw_wrapping") else None
+                    cfw_proj = None if cfw_mod is None else cfw_mod.proj.weight.grad
+                    cfw_w = None if cfw_mod is None else cfw_mod.w.grad
+                    print(f"[GRAD] cfw_proj: {0.0 if cfw_proj is None else cfw_proj.norm().item():.6f}")
+                    print(f"[GRAD] cfw_w: {0.0 if cfw_w is None else cfw_w.norm().item():.6f}")
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
@@ -2115,32 +2162,43 @@ def main():
                 else:
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
-                detail_stats = getattr(pixart, "_last_detail_attn_stats", {}) or {}
-                gcsa_stats = getattr(adapter, "_last_gcsa_stats", {}) or {}
-                pbar.set_postfix({
+                cfw_stats = getattr(pixart, "_last_cfw_stats", {}) or {}
+                sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
+                log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmax': f"{LATENT_L1_T_MAX}",
                     'gw': f"{loss_gw.item():.3f}",
+                    'lp': f"{loss_lpips.item():.3f}",
                     'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
+                    'ireg_w': f"{inject_reg_w:.3f}",
                     'lr_cons': f"{loss_lr_cons.item():.3f}",
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
+                    'lp_w': f"{w.get('lpips', 0.0):.3f}",
+                    'sft_s': f"{sft_strength:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'g2_g': f"{float(gcsa_stats.get('gcsa2_gamma', 0.0)):.3f}",
-                    'g3_g': f"{float(gcsa_stats.get('gcsa3_gamma', 0.0)):.3f}",
-                    'g4_g': f"{float(gcsa_stats.get('gcsa4_gamma', 0.0)):.3f}",
-                    'g2_m': f"{float(gcsa_stats.get('gcsa2_attn_mean', 0.0)):.3f}",
-                    'g2_s': f"{float(gcsa_stats.get('gcsa2_attn_std', 0.0)):.3f}",
-                    'g3_m': f"{float(gcsa_stats.get('gcsa3_attn_mean', 0.0)):.3f}",
-                    'g3_s': f"{float(gcsa_stats.get('gcsa3_attn_std', 0.0)):.3f}",
-                    'g4_m': f"{float(gcsa_stats.get('gcsa4_attn_mean', 0.0)):.3f}",
-                    'g4_s': f"{float(gcsa_stats.get('gcsa4_attn_std', 0.0)):.3f}",
+                    'sft_w': f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}",
+                    'cfw_w': f"{float(cfw_stats.get('mean_cfw_w', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
-                })
+                }
+                if getattr(pixart, "_last_sft_stats", None) is not None:
+                    log_dict["mean_sft_w"] = f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}"
+                if getattr(pixart, "_last_cfw_stats", None) is not None:
+                    log_dict["mean_cfw_w"] = f"{float(cfw_stats.get('mean_cfw_w', 0.0)):.3f}"
+                log_dict["sft_strength"] = f"{sft_strength:.3f}"
+                pbar.set_postfix(log_dict)
+                LAST_TRAIN_LOG = {
+                    "sft_strength": float(sft_strength),
+                    "lpips_train_weight": float(w.get('lpips', 0.0)),
+                    "lr_cons_weight": float(w.get('lr_cons', 0.0)),
+                    "inject_reg_weight": float(inject_reg_w),
+                    "mean_sft_w": float(sft_stats.get("mean_sft_w", 0.0)),
+                    "mean_cfw_w": float(cfw_stats.get("mean_cfw_w", 0.0)),
+                }
 
         if accum_micro_steps > 0 and not reached_max_steps:
             log_critical_path_gradients(step + 1, pixart, adapter)

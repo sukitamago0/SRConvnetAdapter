@@ -16,11 +16,27 @@ class SFTLayer(nn.Module):
         self.shift_conv0 = nn.Conv2d(cond_nc, cond_nc, 1)
         self.shift_conv1 = nn.Conv2d(cond_nc, feat_nc, 1)
         self.act = nn.LeakyReLU(0.1, inplace=True)
+        self.w = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, feat, cond):
+    def forward(self, feat, cond, strength=1.0):
         scale = self.scale_conv1(self.act(self.scale_conv0(cond)))
         shift = self.shift_conv1(self.act(self.shift_conv0(cond)))
-        return feat * (1 + scale) + shift, scale, shift
+        gain = self.w * float(strength)
+        return feat * (1 + gain * scale) + gain * shift, scale, shift
+
+
+class CFWWrapping(nn.Module):
+    def __init__(self, cond_dim: int, hidden_size: int):
+        super().__init__()
+        self.w = nn.Parameter(torch.tensor(0.5))
+        self.proj = nn.Conv2d(cond_dim, hidden_size, kernel_size=1, stride=1, padding=0, bias=True)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x_tokens, cond_feat_2d):
+        wrapped = self.proj(cond_feat_2d)
+        wrapped = wrapped.flatten(2).transpose(1, 2).contiguous()
+        return x_tokens + self.w * wrapped
 
 
 @MODELS.register_module()
@@ -58,14 +74,16 @@ class PixArtSigmaSR(PixArtMS):
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
         self.hard_injection_layers = set(hard_injection_layers or [2, 4, 6, 8, 10, 12])
-        self.detail_injection_layers = list(detail_injection_layers or [14, 16, 18, 20, 22, 24])
-        self.injection_layer_to_level = dict(injection_layer_to_level or {})
+        self.cfw_wrapping = nn.ModuleDict()
+        for i in sorted(self.hard_injection_layers):
+            self.cfw_wrapping[str(i)] = CFWWrapping(cond_dim=64, hidden_size=self.hidden_size)
 
         self._last_sft_stats = None
-        self._last_detail_attn_stats = None
+        self._last_cfw_stats = None
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
+        sft_strength = float(kwargs.pop("sft_strength", 1.0))
         bs = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
@@ -105,6 +123,7 @@ class PixArtSigmaSR(PixArtMS):
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
+        cfw_w_vals = []
         cond_red = None
         if cond_map is not None:
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
@@ -115,12 +134,15 @@ class PixArtSigmaSR(PixArtMS):
                 if n != self.h * self.w:
                     raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w} from input/patch rule")
                 x_map = x.transpose(1, 2).reshape(b, c, self.h, self.w)
-                x_map, scale, shift = self.sft_layers[i](x_map, cond_red)
+                x_map, scale, shift = self.sft_layers[i](x_map, cond_red, strength=sft_strength)
                 sft_scale_means.append(float(scale.detach().float().mean().item()))
                 sft_scale_stds.append(float(scale.detach().float().std(unbiased=False).item()))
                 sft_shift_means.append(float(shift.detach().float().mean().item()))
                 sft_shift_stds.append(float(shift.detach().float().std(unbiased=False).item()))
-                x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
+                x_tokens = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
+                x_tokens = self.cfw_wrapping[str(i)](x_tokens, cond_red)
+                x = x_tokens
+                cfw_w_vals.append(float(self.cfw_wrapping[str(i)].w.detach().float().item()))
 
             # detail layers revert to original block-only forward
             x = auto_grad_checkpoint(
@@ -136,16 +158,20 @@ class PixArtSigmaSR(PixArtMS):
             )
 
         if len(sft_scale_means) > 0:
+            sft_ws = [float(layer.w.detach().float().item()) for idx, layer in enumerate(self.sft_layers) if idx in self.hard_injection_layers]
             self._last_sft_stats = {
                 "sft_scale_mean": float(sum(sft_scale_means) / len(sft_scale_means)),
                 "sft_scale_std": float(sum(sft_scale_stds) / len(sft_scale_stds)),
                 "sft_shift_mean": float(sum(sft_shift_means) / len(sft_shift_means)),
                 "sft_shift_std": float(sum(sft_shift_stds) / len(sft_shift_stds)),
+                "mean_sft_w": float(sum(sft_ws) / len(sft_ws)) if len(sft_ws) > 0 else 0.0,
             }
         else:
             self._last_sft_stats = None
 
-        self._last_detail_attn_stats = None
+        self._last_cfw_stats = {
+            "mean_cfw_w": float(sum(cfw_w_vals) / len(cfw_w_vals))
+        } if len(cfw_w_vals) > 0 else None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
