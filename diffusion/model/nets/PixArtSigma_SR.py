@@ -4,7 +4,7 @@ import torch.nn as nn
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
-from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
+from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer, MultiHeadCrossAttention
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 
@@ -25,18 +25,24 @@ class SFTLayer(nn.Module):
         return feat * (1 + gain * scale) + gain * shift, scale, shift
 
 
-class CFWWrapping(nn.Module):
-    def __init__(self, cond_dim: int, hidden_size: int):
+class BackboneMemoryQuery(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int = 16):
         super().__init__()
-        self.w = nn.Parameter(torch.tensor(0.5))
-        self.proj = nn.Conv2d(cond_dim, hidden_size, kernel_size=1, stride=1, padding=0, bias=True)
-        nn.init.normal_(self.proj.weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.proj.bias)
+        self.q_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.kv_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.cross_attn = MultiHeadCrossAttention(
+            d_model=hidden_size,
+            num_heads=num_heads,
+            attn_drop=0.0,
+            proj_drop=0.0,
+        )
+        self.alpha = nn.Parameter(torch.tensor(0.05))
 
-    def forward(self, x_tokens, cond_feat_2d):
-        wrapped = self.proj(cond_feat_2d)
-        wrapped = wrapped.flatten(2).transpose(1, 2).contiguous()
-        return x_tokens + self.w * wrapped
+    def forward(self, x, memory_tokens):
+        x_q = self.q_norm(x)
+        mem_kv = self.kv_norm(memory_tokens)
+        attn_out = self.cross_attn(x_q, mem_kv, mask=None)
+        return x + self.alpha.to(dtype=x.dtype) * attn_out
 
 
 @MODELS.register_module()
@@ -74,12 +80,13 @@ class PixArtSigmaSR(PixArtMS):
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
         self.hard_injection_layers = set(hard_injection_layers or [2, 4, 6, 8, 10, 12])
-        self.cfw_wrapping = nn.ModuleDict()
-        for i in sorted(self.hard_injection_layers):
-            self.cfw_wrapping[str(i)] = CFWWrapping(cond_dim=64, hidden_size=self.hidden_size)
+        self.memory_query_layers = {7, 14, 21}
+        self.memory_query = nn.ModuleDict()
+        for i in sorted(self.memory_query_layers):
+            self.memory_query[str(i)] = BackboneMemoryQuery(hidden_size=self.hidden_size, num_heads=self.num_heads)
 
         self._last_sft_stats = None
-        self._last_cfw_stats = None
+        self._last_memory_query_stats = None
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
@@ -104,8 +111,10 @@ class PixArtSigmaSR(PixArtMS):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         cond_map = None
+        cond_tokens = None
         if isinstance(adapter_cond, dict):
             cond_map = adapter_cond.get("cond_map", None)
+            cond_tokens = adapter_cond.get("cond_tokens", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -123,28 +132,35 @@ class PixArtSigmaSR(PixArtMS):
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
         sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
-        cfw_w_vals = []
+        memory_alpha_vals = []
         cond_red = None
         if cond_map is not None:
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
+
+        # 真实的 timestep-aware SFT 强度
+        t_ratio = (timestep.float() / 1000.0).view(-1, 1, 1, 1).to(dtype=x.dtype)
+        time_aware_strength = sft_strength * (t_ratio ** 1.5)
 
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.hard_injection_layers:
                 b, n, c = x.shape
                 if n != self.h * self.w:
                     raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w} from input/patch rule")
+
                 x_map = x.transpose(1, 2).reshape(b, c, self.h, self.w)
-                x_map, scale, shift = self.sft_layers[i](x_map, cond_red, strength=sft_strength)
+                x_pre_sft = x_map
+                x_post_sft, scale, shift = self.sft_layers[i](x_map, cond_red, strength=1.0)
+                x_map = x_pre_sft + (x_post_sft - x_pre_sft) * time_aware_strength
                 sft_scale_means.append(float(scale.detach().float().mean().item()))
                 sft_scale_stds.append(float(scale.detach().float().std(unbiased=False).item()))
                 sft_shift_means.append(float(shift.detach().float().mean().item()))
                 sft_shift_stds.append(float(shift.detach().float().std(unbiased=False).item()))
-                x_tokens = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
-                x_tokens = self.cfw_wrapping[str(i)](x_tokens, cond_red)
-                x = x_tokens
-                cfw_w_vals.append(float(self.cfw_wrapping[str(i)].w.detach().float().item()))
+                x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
 
-            # detail layers revert to original block-only forward
+            if cond_tokens is not None and str(i) in self.memory_query:
+                x = self.memory_query[str(i)](x, cond_tokens)
+                memory_alpha_vals.append(float(self.memory_query[str(i)].alpha.detach().float().item()))
+
             x = auto_grad_checkpoint(
                 block,
                 x,
@@ -169,9 +185,9 @@ class PixArtSigmaSR(PixArtMS):
         else:
             self._last_sft_stats = None
 
-        self._last_cfw_stats = {
-            "mean_cfw_w": float(sum(cfw_w_vals) / len(cfw_w_vals))
-        } if len(cfw_w_vals) > 0 else None
+        self._last_memory_query_stats = {
+            "mean_alpha": float(sum(memory_alpha_vals) / len(memory_alpha_vals))
+        } if len(memory_alpha_vals) > 0 else None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)

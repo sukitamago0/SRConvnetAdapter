@@ -55,9 +55,7 @@ LAST_TRAIN_LOG = {}
 
 ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
-    "sft_cond_reduce",
-    "sft_layers",
-    "cfw_wrapping",
+    "memory_query",
     "lora_A",
     "lora_B",
 )
@@ -185,8 +183,8 @@ LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
 USE_LPIPS_PERCEP = True
 LPIPS_START_EPOCH = 8
 LPIPS_RAMP_END_EPOCH = 25
-LPIPS_WEIGHT_MAX = 0.20
-LPIPS_T_MAX = 600
+LPIPS_WEIGHT_MAX = 0.25
+LPIPS_T_MAX = 800
 
 # As LPIPS ramps in, old structure losses ramp down
 LATENT_L1_WEIGHT_START = 0.08
@@ -287,12 +285,7 @@ def get_loss_weights(epoch_1based: int):
 
 
 def get_sft_strength(epoch_1based: int) -> float:
-    if epoch_1based < 12:
-        return 1.0
-    if epoch_1based < 35:
-        p = (epoch_1based - 12) / max(1, 35 - 12)
-        return float(1.0 - 0.25 * p)
-    return 0.75
+    return 1.0
 
 
 def get_inject_reg_weight(epoch_1based: int) -> float:
@@ -1263,9 +1256,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
 
     always_train_keywords = [
         "final_layer",
-        "sft_cond_reduce",
-        "sft_layers",
-        "cfw_wrapping",
+        "memory_query",
     ]
     if ENABLE_LORA:
         always_train_keywords.extend(["lora_A", "lora_B"])
@@ -1313,13 +1304,13 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     lora_params = []
     final_head_params = []
     bridge_params = []
-    cfw_params = []
+    memory_params = []
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if "cfw_wrapping" in n:
-            cfw_params.append(p)
+        if "memory_query" in n:
+            memory_params.append(p)
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
@@ -1330,8 +1321,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     optim_groups = []
     if len(adapter_params) > 0:
         optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(cfw_params) > 0:
-        optim_groups.append({"params": cfw_params, "lr": LR_BASE * 2.0, "weight_decay": 0.0})
+    if len(memory_params) > 0:
+        optim_groups.append({"params": memory_params, "lr": 2e-4, "weight_decay": 0.0})
     bridge_and_head = bridge_params + final_head_params
     if len(bridge_and_head) > 0:
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
@@ -1342,10 +1333,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + cfw_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + memory_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + cfw_params
+    grouped = bridge_params + final_head_params + lora_params + memory_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1353,7 +1344,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     group_counts = {
         "bridge": len(bridge_params),
-        "cfw": len(cfw_params),
+        "memory_query": len(memory_params),
         "lora": len(lora_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
@@ -1368,8 +1359,9 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     ad_named = dict(adapter.named_parameters())
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("adapter.gcsa2.gamma", ad_named.get("gcsa2.gamma", None)),
-        ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
+        ("pixart.memory_query.7.cross_attn.q_linear.weight", pix_named.get("memory_query.7.cross_attn.q_linear.weight", None)),
+        ("pixart.memory_query.7.cross_attn.kv_linear.weight", pix_named.get("memory_query.7.cross_attn.kv_linear.weight", None)),
+        ("pixart.memory_query.7.alpha", pix_named.get("memory_query.7.alpha", None)),
         ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
     ]
@@ -2141,11 +2133,13 @@ def main():
                 log_critical_path_gradients(step + 1, pixart, adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 if (step + 1) % 500 == 0:
-                    cfw_mod = next(iter(pixart.cfw_wrapping.values()), None) if hasattr(pixart, "cfw_wrapping") else None
-                    cfw_proj = None if cfw_mod is None else cfw_mod.proj.weight.grad
-                    cfw_w = None if cfw_mod is None else cfw_mod.w.grad
-                    print(f"[GRAD] cfw_proj: {0.0 if cfw_proj is None else cfw_proj.norm().item():.6f}")
-                    print(f"[GRAD] cfw_w: {0.0 if cfw_w is None else cfw_w.norm().item():.6f}")
+                    mq_mod = next(iter(pixart.memory_query.values()), None) if hasattr(pixart, "memory_query") else None
+                    mq_q = None if mq_mod is None else mq_mod.cross_attn.q_linear.weight.grad
+                    mq_kv = None if mq_mod is None else mq_mod.cross_attn.kv_linear.weight.grad
+                    mq_alpha = None if mq_mod is None else mq_mod.alpha.grad
+                    print(f"[GRAD] memory_q: {0.0 if mq_q is None else mq_q.norm().item():.6f}")
+                    print(f"[GRAD] memory_kv: {0.0 if mq_kv is None else mq_kv.norm().item():.6f}")
+                    print(f"[GRAD] memory_alpha: {0.0 if mq_alpha is None else mq_alpha.norm().item():.6f}")
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
@@ -2162,7 +2156,7 @@ def main():
                 else:
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
-                cfw_stats = getattr(pixart, "_last_cfw_stats", {}) or {}
+                mq_stats = getattr(pixart, "_last_memory_query_stats", {}) or {}
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
@@ -2181,14 +2175,14 @@ def main():
                     'sft_s': f"{sft_strength:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
                     'sft_w': f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}",
-                    'cfw_w': f"{float(cfw_stats.get('mean_cfw_w', 0.0)):.3f}",
+                    'mq_alpha': f"{float(mq_stats.get('mean_alpha', 0.0)):.3f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 }
                 if getattr(pixart, "_last_sft_stats", None) is not None:
                     log_dict["mean_sft_w"] = f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}"
-                if getattr(pixart, "_last_cfw_stats", None) is not None:
-                    log_dict["mean_cfw_w"] = f"{float(cfw_stats.get('mean_cfw_w', 0.0)):.3f}"
+                if getattr(pixart, "_last_memory_query_stats", None) is not None:
+                    log_dict["mean_memory_alpha"] = f"{float(mq_stats.get('mean_alpha', 0.0)):.3f}"
                 log_dict["sft_strength"] = f"{sft_strength:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
@@ -2197,7 +2191,7 @@ def main():
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
                     "mean_sft_w": float(sft_stats.get("mean_sft_w", 0.0)),
-                    "mean_cfw_w": float(cfw_stats.get("mean_cfw_w", 0.0)),
+                    "mean_memory_alpha": float(mq_stats.get("mean_alpha", 0.0)),
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
