@@ -325,7 +325,7 @@ def parse_args():
     parser.set_defaults(use_lq_init=True)
     parser.add_argument("--lq-init-strength", type=float, default=0.3)
     parser.add_argument("--cfg-scale", type=float, default=1.0)
-    parser.add_argument("--sft_strength", type=float, default=0.75)
+    parser.add_argument("--sft_strength", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=int, default=4)
     parser.add_argument("--input_is_lr_small", type=lambda x: str(x).lower() in ("1","true","yes","y"), default=True)

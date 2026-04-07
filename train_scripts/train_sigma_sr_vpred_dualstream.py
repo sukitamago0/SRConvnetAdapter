@@ -1352,11 +1352,22 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         return
     pix_named = dict(pixart.named_parameters())
     ad_named = dict(adapter.named_parameters())
+    up3_param = None
+    for candidate in (
+        "up3.comp.weight",
+        "up3.channel_compressor.weight",
+        "up3.channel_compressor.conv.weight",
+    ):
+        if candidate in ad_named:
+            up3_param = ad_named[candidate]
+            break
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("adapter.gcsa2.gamma", ad_named.get("gcsa2.gamma", None)),
         ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
-        ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
+        ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
+        ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
+        ("adapter.up3.comp.weight", up3_param),
+        ("adapter.to32.1.weight", ad_named.get("to32.1.weight", None)),
         ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
     ]
     msg = [f"[GradSanity][step={step}]"]
