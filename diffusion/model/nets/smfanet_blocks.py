@@ -74,6 +74,6 @@ class FMB(nn.Module):
         self.pcfn = PCFN(dim, growth_rate=ffn_scale)
 
     def forward(self, x):
-        x = F.normalize(x, dim=1) + self.smfa(x)
-        x = x + self.pcfn(F.normalize(x, dim=1))
+        x = self.smfa(F.normalize(x, dim=1)) + x
+        x = self.pcfn(F.normalize(x, dim=1)) + x
         return x
