@@ -767,7 +767,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--max_samples", type=int, default=0)
-    parser.add_argument("--sft_strength", type=float, default=0.6)
+    parser.add_argument("--sft_strength", type=float, default=0.75)
 
     parser.add_argument("--output_dir", type=str, default="/home/hello/HJT/SRConvnetAdapter/experiments_results")
     parser.add_argument("--save_preds", action="store_true", default=True)

@@ -185,8 +185,8 @@ LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
 USE_LPIPS_PERCEP = True
 LPIPS_START_EPOCH = 8
 LPIPS_RAMP_END_EPOCH = 25
-LPIPS_WEIGHT_MAX = 0.20
-LPIPS_T_MAX = 600
+LPIPS_WEIGHT_MAX = 0.25
+LPIPS_T_MAX = 800
 
 # As LPIPS ramps in, old structure losses ramp down
 LATENT_L1_WEIGHT_START = 0.08
