@@ -57,7 +57,7 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "cfw_wrapping",
+    "kv_inject",
     "lora_A",
     "lora_B",
 )
@@ -164,7 +164,7 @@ LQ_INIT_STRENGTH = 0.3
 
 INIT_NOISE_STD = 0.0
 USE_ADAPTER_CFDROPOUT = True
-COND_DROP_PROB = 0.0
+COND_DROP_PROB = 0.10
 FORCE_DROP_TEXT = True  # validation-time text drop behavior
 # Phase2: Drop only concat-LR branch (adapter still sees normal/augmented LR)
 CONCAT_LR_DROP_ENABLED = False
@@ -177,26 +177,25 @@ CONCAT_LR_DROP_SCHEDULE = [
 ]
 CONCAT_LR_DROP_NO_RESCALE = True
 INJECT_SCALE_REG_LAMBDA = 1e-4
-PIXEL_LOSS_T_MAX = 250
-# Structure-first schedule: start pixel-space supervision at Stage B boundary.
-LATENT_L1_T_MAX = 250  # apply latent L1 only at lower-noise timesteps
+PIXEL_LOSS_T_MIN = 200
+LATENT_L1_T_MIN = 200
 
 # LPIPS perceptual curriculum (single-script, no separate stage script)
 USE_LPIPS_PERCEP = True
 LPIPS_START_EPOCH = 8
 LPIPS_RAMP_END_EPOCH = 25
-LPIPS_WEIGHT_MAX = 0.20
-LPIPS_T_MAX = 600
+LPIPS_WEIGHT_MAX = 0.25
+LPIPS_T_MAX = 800
 
 # As LPIPS ramps in, old structure losses ramp down
 LATENT_L1_WEIGHT_START = 0.08
-LATENT_L1_WEIGHT_END = 0.01
+LATENT_L1_WEIGHT_END = 0.0
 
 LR_CONS_WEIGHT_START = 0.04
-LR_CONS_WEIGHT_END = 0.005
+LR_CONS_WEIGHT_END = 0.0
 
 GW_WEIGHT_START = 0.05
-GW_WEIGHT_END = 0.015
+GW_WEIGHT_END = 0.0
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
 CKPT_SELECT_MODE = "psnr_first"
@@ -287,12 +286,7 @@ def get_loss_weights(epoch_1based: int):
 
 
 def get_sft_strength(epoch_1based: int) -> float:
-    if epoch_1based < 12:
-        return 1.0
-    if epoch_1based < 35:
-        p = (epoch_1based - 12) / max(1, 35 - 12)
-        return float(1.0 - 0.25 * p)
-    return 0.75
+    return 1.0
 
 
 def get_inject_reg_weight(epoch_1based: int) -> float:
@@ -1261,17 +1255,16 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = [
-        "final_layer",
-        "sft_cond_reduce",
-        "sft_layers",
-        "cfw_wrapping",
-    ]
-    if ENABLE_LORA:
-        always_train_keywords.extend(["lora_A", "lora_B"])
-
     for n, p in pixart.named_parameters():
-        if any(k in n for k in always_train_keywords):
+        if (
+            ("final_layer" in n)
+            or ("lora_A" in n)
+            or ("lora_B" in n)
+            or ("kv_inject" in n)
+            or ("sft_cond_reduce" in n)
+        ):
+            p.requires_grad_(True)
+        if ("sft_layers.2." in n) or ("sft_layers.4." in n) or ("sft_layers.6." in n):
             p.requires_grad_(True)
 
     if not train_x_embedder:
@@ -1313,13 +1306,13 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     lora_params = []
     final_head_params = []
     bridge_params = []
-    cfw_params = []
+    kv_params = []
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if "cfw_wrapping" in n:
-            cfw_params.append(p)
+        if "kv_inject" in n:
+            kv_params.append(p)
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
@@ -1330,22 +1323,22 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     optim_groups = []
     if len(adapter_params) > 0:
         optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
-    if len(cfw_params) > 0:
-        optim_groups.append({"params": cfw_params, "lr": LR_BASE * 2.0, "weight_decay": 0.0})
     bridge_and_head = bridge_params + final_head_params
     if len(bridge_and_head) > 0:
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(kv_params) > 0:
+        optim_groups.append({"params": kv_params, "lr": 2.0 * LR_BASE, "weight_decay": 0.0})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + cfw_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + kv_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + cfw_params
+    grouped = bridge_params + final_head_params + lora_params + kv_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1353,8 +1346,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     group_counts = {
         "bridge": len(bridge_params),
-        "cfw": len(cfw_params),
         "lora": len(lora_params),
+        "kv_inject": len(kv_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
     }
@@ -1368,10 +1361,12 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     ad_named = dict(adapter.named_parameters())
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("adapter.gcsa2.gamma", ad_named.get("gcsa2.gamma", None)),
-        ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
-        ("adapter.out_proj.weight", ad_named.get("out_proj.weight", None)),
-        ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
+        ("pixart.sft_layers.2.scale_conv1.weight", pix_named.get("sft_layers.2.scale_conv1.weight", None)),
+        ("pixart.kv_inject.8.k_proj.weight", pix_named.get("kv_inject.8.k_proj.weight", None)),
+        ("pixart.kv_inject.8.gamma", pix_named.get("kv_inject.8.gamma", None)),
+        ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
+        ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
+        ("adapter.to32.1.weight", ad_named.get("to32.1.weight", None)),
     ]
     msg = [f"[GradSanity][step={step}]"]
     warnings = []
@@ -2074,7 +2069,7 @@ def main():
                 z0 = alpha_t * zt.float() - sigma_t * model_pred
 
                 latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
-                latent_l1_mask = (t <= int(LATENT_L1_T_MAX)).float()
+                latent_l1_mask = (t >= int(LATENT_L1_T_MIN)).float()
                 if float(latent_l1_mask.sum().item()) > 0:
                     loss_latent_l1 = (latent_l1_per * latent_l1_mask).sum() / latent_l1_mask.sum().clamp_min(1.0)
                 else:
@@ -2092,8 +2087,7 @@ def main():
                     (w.get('gw', 0.0) > 0)
                 )
 
-                PATCH_LOSS_T_MAX = int(PIXEL_LOSS_T_MAX)
-                patch_t_mask = (t <= PATCH_LOSS_T_MAX)
+                patch_t_mask = (t >= int(PIXEL_LOSS_T_MIN))
                 allow_by_stage = True
                 patch_loss_num_samples = int(patch_t_mask.sum().item()) if allow_by_stage else 0
                 calc_patch_loss = need_patch_loss and allow_by_stage and (patch_loss_num_samples > 0)
@@ -2140,12 +2134,6 @@ def main():
             if accum_micro_steps == GRAD_ACCUM_STEPS:
                 log_critical_path_gradients(step + 1, pixart, adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
-                if (step + 1) % 500 == 0:
-                    cfw_mod = next(iter(pixart.cfw_wrapping.values()), None) if hasattr(pixart, "cfw_wrapping") else None
-                    cfw_proj = None if cfw_mod is None else cfw_mod.proj.weight.grad
-                    cfw_w = None if cfw_mod is None else cfw_mod.w.grad
-                    print(f"[GRAD] cfw_proj: {0.0 if cfw_proj is None else cfw_proj.norm().item():.6f}")
-                    print(f"[GRAD] cfw_w: {0.0 if cfw_w is None else cfw_w.norm().item():.6f}")
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
@@ -2162,12 +2150,15 @@ def main():
                 else:
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
-                cfw_stats = getattr(pixart, "_last_cfw_stats", {}) or {}
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
+                kv_stats = getattr(pixart, "_last_kv_stats", {}) or {}
+                kv_gamma_mean = float(kv_stats.get("gamma_mean", 0.0))
+                kv_gamma_min = float(kv_stats.get("gamma_min", 0.0))
+                kv_gamma_max = float(kv_stats.get("gamma_max", 0.0))
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
-                    'l1_tmax': f"{LATENT_L1_T_MAX}",
+                    'l1_tmin': f"{LATENT_L1_T_MIN}",
                     'gw': f"{loss_gw.item():.3f}",
                     'lp': f"{loss_lpips.item():.3f}",
                     'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
@@ -2180,15 +2171,16 @@ def main():
                     'lp_w': f"{w.get('lpips', 0.0):.3f}",
                     'sft_s': f"{sft_strength:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'sft_w': f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}",
-                    'cfw_w': f"{float(cfw_stats.get('mean_cfw_w', 0.0)):.3f}",
+                    'tau': f"{float(sft_stats.get('tau_mean', 0.0)):.3f}",
+                    'kv_g': f"{kv_gamma_mean:.4f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 }
                 if getattr(pixart, "_last_sft_stats", None) is not None:
-                    log_dict["mean_sft_w"] = f"{float(sft_stats.get('mean_sft_w', 0.0)):.3f}"
-                if getattr(pixart, "_last_cfw_stats", None) is not None:
-                    log_dict["mean_cfw_w"] = f"{float(cfw_stats.get('mean_cfw_w', 0.0)):.3f}"
+                    log_dict["tau_min"] = f"{float(sft_stats.get('tau_min', 0.0)):.3f}"
+                    log_dict["tau_max"] = f"{float(sft_stats.get('tau_max', 0.0)):.3f}"
+                log_dict["kv_gmin"] = f"{kv_gamma_min:.4f}"
+                log_dict["kv_gmax"] = f"{kv_gamma_max:.4f}"
                 log_dict["sft_strength"] = f"{sft_strength:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
@@ -2196,8 +2188,12 @@ def main():
                     "lpips_train_weight": float(w.get('lpips', 0.0)),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
-                    "mean_sft_w": float(sft_stats.get("mean_sft_w", 0.0)),
-                    "mean_cfw_w": float(cfw_stats.get("mean_cfw_w", 0.0)),
+                    "tau_mean": float(sft_stats.get("tau_mean", 0.0)),
+                    "tau_min": float(sft_stats.get("tau_min", 0.0)),
+                    "tau_max": float(sft_stats.get("tau_max", 0.0)),
+                    "kv_gamma_mean": kv_gamma_mean,
+                    "kv_gamma_min": kv_gamma_min,
+                    "kv_gamma_max": kv_gamma_max,
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:

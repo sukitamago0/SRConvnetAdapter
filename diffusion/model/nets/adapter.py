@@ -3,6 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusion.model.nets.srconvnet_blocks import SRConvNetBlock
+from diffusion.model.nets.smfanet_blocks import FMB
+
+try:
+    from mmcv.ops import CARAFEPack
+except Exception:
+    from diffusion.model.nets.carafe import CARAFEPack
 
 
 class SRConvNetLSAAdapter(nn.Module):
@@ -250,25 +256,73 @@ class SRConvNetLSAAdapterV12(nn.Module):
         self.in_channels = int(in_channels)
         self.hidden_size = int(hidden_size)
 
-        self.stem = nn.Conv2d(self.in_channels, 64, 3, padding=1)
-        self.stage1 = nn.Sequential(SRConvNetBlock(64), SRConvNetBlock(64))
+        self.stem = nn.Conv2d(self.in_channels, 64, 3, 1, 1)
+        self.stage1 = nn.Sequential(
+            FMB(64, ffn_scale=2.0),
+            FMB(64, ffn_scale=2.0),
+        )
         self.down1 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
-        self.stage2 = nn.Sequential(SRConvNetBlock(128), SRConvNetBlock(128))
+        self.stage2 = nn.Sequential(
+            FMB(128, ffn_scale=2.0),
+            FMB(128, ffn_scale=2.0),
+        )
         self.down2 = nn.Conv2d(128, 256, 3, stride=2, padding=1)
-        self.stage3 = nn.Sequential(SRConvNetBlock(256), SRConvNetBlock(256), SRConvNetBlock(256), SRConvNetBlock(256))
-        self.stage4 = nn.Sequential(SRConvNetBlock(256), SRConvNetBlock(256))
+        self.stage3 = nn.Sequential(
+            FMB(256, ffn_scale=2.0),
+            FMB(256, ffn_scale=2.0),
+            FMB(256, ffn_scale=2.0),
+            FMB(256, ffn_scale=2.0),
+        )
+        self.stage4 = nn.Sequential(
+            FMB(256, ffn_scale=2.0),
+            FMB(256, ffn_scale=2.0),
+        )
 
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(self.hidden_size, 2 * (64 + 128 + 256 + 256)),
         )
 
-        self.proj2 = nn.Conv2d(128, 256, 1)
-        self.proj3 = nn.Conv2d(256, 256, 1)
-        self.proj4 = nn.Conv2d(256, 256, 1)
-        self.out_proj = nn.Conv2d(768, self.hidden_size, 1)
+        self.up3 = CARAFEPack(
+            channels=256,
+            scale_factor=2,
+            up_kernel=5,
+            up_group=1,
+            encoder_kernel=3,
+            encoder_dilation=1,
+            compressed_channels=64,
+        )
+        self.up4 = CARAFEPack(
+            channels=256,
+            scale_factor=2,
+            up_kernel=5,
+            up_group=1,
+            encoder_kernel=3,
+            encoder_dilation=1,
+            compressed_channels=64,
+        )
 
-        for m in [self.proj2, self.proj3, self.proj4, self.out_proj]:
+        self.proj2_hi = nn.Conv2d(128, 256, 1)
+        self.proj3_hi = nn.Conv2d(256, 256, 1)
+        self.proj4_hi = nn.Conv2d(256, 256, 1)
+        self.fuse64 = nn.Sequential(
+            nn.Conv2d(768, 512, 1),
+            nn.GELU(),
+            nn.Conv2d(512, 288, 3, 1, 1),
+        )
+        self.to32 = nn.Sequential(
+            nn.PixelUnshuffle(2),
+            nn.Conv2d(1152, self.hidden_size, 1),
+        )
+
+        for m in [
+            self.proj2_hi,
+            self.proj3_hi,
+            self.proj4_hi,
+            self.fuse64[0],
+            self.fuse64[2],
+            self.to32[1],
+        ]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
 
@@ -291,14 +345,21 @@ class SRConvNetLSAAdapterV12(nn.Module):
             f3 = self._film(f3, g3, b3)
             f4 = self._film(f4, g4, b4)
 
-        f2_32 = F.interpolate(f2, size=f3.shape[-2:], mode="bilinear", align_corners=False)
-        c2 = self.proj2(f2_32)
-        c3 = self.proj3(f3)
-        c4 = self.proj4(f4)
-        cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
+        f3_up = self.up3(f3)
+        f4_up = self.up4(f4)
+
+        c2_64 = self.proj2_hi(f2)
+        c3_64 = self.proj3_hi(f3_up)
+        c4_64 = self.proj4_hi(f4_up)
+
+        fused_64 = torch.cat([c2_64, c3_64, c4_64], dim=1)
+        fused_64 = self.fuse64(fused_64)
+        cond_map = self.to32(fused_64)
+        cond_tokens = cond_map.flatten(2).transpose(1, 2).contiguous()
 
         return {
             "cond_map": cond_map,
+            "cond_tokens": cond_tokens,
         }
 
 
