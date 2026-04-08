@@ -493,25 +493,6 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
     return psnr_v, ssim_v, lpips_v
 
 
-def _extract_adapter_cond_stats(cond):
-    gate_mean = 0.0
-    gate_std = 0.0
-    if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
-        means = []
-        spatial_stds = []
-        for v in cond[2].values():
-            if torch.is_tensor(v):
-                flat = v.detach().float().reshape(v.shape[0], -1)
-                means.append(flat.mean(dim=1))
-                spatial_stds.append(flat.std(dim=1, unbiased=False))
-        if len(means) > 0:
-            gm = torch.stack(means, dim=0).mean(dim=0)
-            gs = torch.stack(spatial_stds, dim=0).mean(dim=0)
-            gate_mean = float(gm.mean().item())
-            gate_std = float(gs.mean().item())
-    return gate_mean, gate_std
-
-
 def seed_everything(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
@@ -1541,7 +1522,7 @@ def save_smart(
             "best_eval_tag": str(eval_tag),
             "train_runtime_log": dict(LAST_TRAIN_LOG),
             "injection_config": {
-                "hard_layers": sorted(list(getattr(pixart, "hard_injection_layers", HARD_INJECTION_LAYERS))),
+                "hard_layers": sorted(list(getattr(pixart, "anchor_layers", HARD_INJECTION_LAYERS))),
                 "detail_layers": list(getattr(pixart, "detail_injection_layers", DETAIL_INJECTION_LAYERS)),
                 "injection_layer_to_level": dict(getattr(pixart, "injection_layer_to_level", {})),
                 "ref_token_hw": int(getattr(adapter, "ref_token_hw", 32)),
@@ -1758,7 +1739,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         flat_psnrs, flat_ssims, flat_lpipss = [], [], []
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
-        cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
+        cond_deltas = []
         sft_tau_means, sft_alpha_means, kv_gamma_means, kv_eff_means = [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
@@ -1787,21 +1768,6 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
-
-                    a = getattr(pixart, "_last_adapter_alpha", None)
-                    if torch.is_tensor(a):
-                        a = a.detach().float().reshape(a.shape[0], -1)
-                        alpha_means.append(float(a.mean().item()))
-                        alpha_stds.append(float(a.std(unbiased=False).item()) if a.numel() > 1 else 0.0)
-                    elif isinstance(a, dict):
-                        vals = [float(v) for v in a.values()]
-                        if len(vals) > 0:
-                            alpha_means.append(float(np.mean(vals)))
-                            alpha_stds.append(float(np.std(vals)))
-
-                    gm, gs = _extract_adapter_cond_stats(cond)
-                    gate_means.append(gm)
-                    gate_stds.append(gs)
 
                     sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                     kv_stats = getattr(pixart, "_last_kv_stats", {}) or {}
@@ -1851,17 +1817,13 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
         results[int(steps)] = res
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
-        am = float(np.mean(alpha_means)) if len(alpha_means) > 0 else 0.0
-        ast = float(np.mean(alpha_stds)) if len(alpha_stds) > 0 else 0.0
-        gm = float(np.mean(gate_means)) if len(gate_means) > 0 else 0.0
-        gs = float(np.mean(gate_stds)) if len(gate_stds) > 0 else 0.0
         sft_tau_mean = float(np.mean(sft_tau_means)) if len(sft_tau_means) > 0 else 0.0
         sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         kv_gamma_mean = float(np.mean(kv_gamma_means)) if len(kv_gamma_means) > 0 else 0.0
         kv_eff_mean = float(np.mean(kv_eff_means)) if len(kv_eff_means) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
+            f"CONDΔ={cdelta:.5f} | "
             f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
             f"kv_gamma_mean={kv_gamma_mean:.4f} | kv_eff_mean={kv_eff_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
@@ -2154,14 +2116,6 @@ def main():
                 accum_micro_steps = 0
 
             if i % 10 == 0:
-                a = getattr(pixart, "_last_adapter_alpha", None)
-                if torch.is_tensor(a):
-                    alpha_mean = float(a.detach().float().mean().item())
-                elif isinstance(a, dict) and len(a) > 0:
-                    alpha_mean = float(np.mean([float(v) for v in a.values()]))
-                else:
-                    alpha_mean = 0.0
-                gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                 kv_stats = getattr(pixart, "_last_kv_stats", {}) or {}
                 tau_mean = float(sft_stats.get("tau_mean", 0.0))
@@ -2191,8 +2145,6 @@ def main():
                     'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
                     'kv_g': f"{kv_gamma_mean:.4f}",
                     'kv_eff': f"{kv_eff_mean:.4f}",
-                    'alpha': f"{alpha_mean:.3f}",
-                    'gate': f"{gate_mean:.3f}",
                 }
                 log_dict["sft_strength"] = f"{sft_strength:.3f}"
                 pbar.set_postfix(log_dict)
