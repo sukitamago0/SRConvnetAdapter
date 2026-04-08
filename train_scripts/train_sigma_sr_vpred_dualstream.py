@@ -57,6 +57,7 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
+    "kv_inject",
     "lora_A",
     "lora_B",
 )
@@ -1254,16 +1255,16 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for _, p in pixart.named_parameters():
         p.requires_grad_(False)
 
-    always_train_keywords = [
-        "final_layer",
-        "sft_cond_reduce",
-        "sft_layers",
-    ]
-    if ENABLE_LORA:
-        always_train_keywords.extend(["lora_A", "lora_B"])
-
     for n, p in pixart.named_parameters():
-        if any(k in n for k in always_train_keywords):
+        if (
+            ("final_layer" in n)
+            or ("lora_A" in n)
+            or ("lora_B" in n)
+            or ("kv_inject" in n)
+            or ("sft_cond_reduce" in n)
+        ):
+            p.requires_grad_(True)
+        if ("sft_layers.2." in n) or ("sft_layers.4." in n) or ("sft_layers.6." in n):
             p.requires_grad_(True)
 
     if not train_x_embedder:
@@ -1305,11 +1306,14 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     lora_params = []
     final_head_params = []
     bridge_params = []
+    kv_params = []
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if ("lora_A" in n) or ("lora_B" in n):
+        if "kv_inject" in n:
+            kv_params.append(p)
+        elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
             final_head_params.append(p)
@@ -1324,15 +1328,17 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(kv_params) > 0:
+        optim_groups.append({"params": kv_params, "lr": 2.0 * LR_BASE, "weight_decay": 0.0})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + kv_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params
+    grouped = bridge_params + final_head_params + lora_params + kv_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1341,6 +1347,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     group_counts = {
         "bridge": len(bridge_params),
         "lora": len(lora_params),
+        "kv_inject": len(kv_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
     }
@@ -1352,23 +1359,14 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         return
     pix_named = dict(pixart.named_parameters())
     ad_named = dict(adapter.named_parameters())
-    up3_param = None
-    for candidate in (
-        "up3.comp.weight",
-        "up3.channel_compressor.weight",
-        "up3.channel_compressor.conv.weight",
-    ):
-        if candidate in ad_named:
-            up3_param = ad_named[candidate]
-            break
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
-        ("pixart.sft_layers.0.scale_conv1.weight", pix_named.get("sft_layers.0.scale_conv1.weight", None)),
+        ("pixart.sft_layers.2.scale_conv1.weight", pix_named.get("sft_layers.2.scale_conv1.weight", None)),
+        ("pixart.kv_inject.8.k_proj.weight", pix_named.get("kv_inject.8.k_proj.weight", None)),
+        ("pixart.kv_inject.8.gamma", pix_named.get("kv_inject.8.gamma", None)),
         ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
         ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
-        ("adapter.up3.comp.weight", up3_param),
         ("adapter.to32.1.weight", ad_named.get("to32.1.weight", None)),
-        ("pixart.lora_B.sample", next((p for n,p in pix_named.items() if "lora_B" in n), None)),
     ]
     msg = [f"[GradSanity][step={step}]"]
     warnings = []
@@ -2153,6 +2151,10 @@ def main():
                     alpha_mean = 0.0
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
+                kv_stats = getattr(pixart, "_last_kv_stats", {}) or {}
+                kv_gamma_mean = float(kv_stats.get("gamma_mean", 0.0))
+                kv_gamma_min = float(kv_stats.get("gamma_min", 0.0))
+                kv_gamma_max = float(kv_stats.get("gamma_max", 0.0))
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2170,12 +2172,15 @@ def main():
                     'sft_s': f"{sft_strength:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
                     'tau': f"{float(sft_stats.get('tau_mean', 0.0)):.3f}",
+                    'kv_g': f"{kv_gamma_mean:.4f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 }
                 if getattr(pixart, "_last_sft_stats", None) is not None:
                     log_dict["tau_min"] = f"{float(sft_stats.get('tau_min', 0.0)):.3f}"
                     log_dict["tau_max"] = f"{float(sft_stats.get('tau_max', 0.0)):.3f}"
+                log_dict["kv_gmin"] = f"{kv_gamma_min:.4f}"
+                log_dict["kv_gmax"] = f"{kv_gamma_max:.4f}"
                 log_dict["sft_strength"] = f"{sft_strength:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
@@ -2186,6 +2191,9 @@ def main():
                     "tau_mean": float(sft_stats.get("tau_mean", 0.0)),
                     "tau_min": float(sft_stats.get("tau_min", 0.0)),
                     "tau_max": float(sft_stats.get("tau_max", 0.0)),
+                    "kv_gamma_mean": kv_gamma_mean,
+                    "kv_gamma_min": kv_gamma_min,
+                    "kv_gamma_max": kv_gamma_max,
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
