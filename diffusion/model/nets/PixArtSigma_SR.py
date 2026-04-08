@@ -95,11 +95,18 @@ class PixArtSigmaSR(PixArtMS):
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
         self.hard_injection_layers = set(hard_injection_layers or [2, 4, 6, 8, 10, 12])
-        self.anchor_layers = set([2, 4, 6])
-        self.kv_inject_layers = set([8, 12, 16, 20, 24, 26])
+        self.sft_candidate_layers = [2, 4, 6, 8]
+        self.anchor_layers = set(self.sft_candidate_layers)
+        self.kv_inject_layers = set([10, 14, 18, 22, 24, 26])
         self.kv_inject = nn.ModuleDict({
             str(i): KVInjectAttention(hidden_size=self.hidden_size, num_heads=self.num_heads)
             for i in sorted(self.kv_inject_layers)
+        })
+        self.sft_alpha = nn.ParameterDict({
+            "2": nn.Parameter(torch.tensor(1.0)),
+            "4": nn.Parameter(torch.tensor(1.0)),
+            "6": nn.Parameter(torch.tensor(0.5)),
+            "8": nn.Parameter(torch.tensor(0.25)),
         })
 
         self._last_sft_stats = None
@@ -148,10 +155,14 @@ class PixArtSigmaSR(PixArtMS):
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
-        tau_mean_vals, tau_min_vals, tau_max_vals = [], [], []
         cond_red = None
         if cond_map is not None:
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
+
+        t_norm = timestep.float() / 1000.0
+        tau_scalar = t_norm.pow(1.5)
+        tau_map = tau_scalar.view(-1, 1, 1, 1).to(x.dtype)
+        tau_seq = tau_scalar.view(-1, 1, 1).to(x.dtype)
 
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.anchor_layers:
@@ -160,13 +171,11 @@ class PixArtSigmaSR(PixArtMS):
                     raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w} from input/patch rule")
                 x_map_pre = x.transpose(1, 2).reshape(b, c, self.h, self.w)
                 x_map_post, _, _ = self.sft_layers[i](x_map_pre, cond_red, strength=1.0)
-                t_norm = timestep.float() / 1000.0
-                tau = t_norm.pow(1.5).view(-1, 1, 1, 1).to(x_map_pre.dtype)
-                x_map = x_map_pre + (x_map_post - x_map_pre) * tau
+
+                alpha_i = self.sft_alpha[str(i)].to(x_map_pre.dtype)
+                x_map = x_map_pre + (x_map_post - x_map_pre) * (alpha_i * tau_map)
+
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
-                tau_mean_vals.append(float(tau.detach().float().mean().item()))
-                tau_min_vals.append(float(tau.detach().float().min().item()))
-                tau_max_vals.append(float(tau.detach().float().max().item()))
 
             # detail layers revert to original block-only forward
             x = auto_grad_checkpoint(
@@ -181,28 +190,36 @@ class PixArtSigmaSR(PixArtMS):
                 **kwargs,
             )
             if cond_tokens is not None and i in self.kv_inject_layers:
-                x = x + self.kv_inject[str(i)](x, cond_tokens.to(dtype=x.dtype))
+                kv_out = self.kv_inject[str(i)](x, cond_tokens.to(dtype=x.dtype))
+                x = x + kv_out * (1.0 - tau_seq)
 
-        if len(tau_mean_vals) > 0:
+        if len(self.anchor_layers) > 0:
+            alpha_vals = [self.sft_alpha[str(i)].item() for i in self.sft_candidate_layers]
             self._last_sft_stats = {
-                "tau_mean": float(sum(tau_mean_vals) / len(tau_mean_vals)),
-                "tau_min": float(min(tau_min_vals)),
-                "tau_max": float(max(tau_max_vals)),
+                "tau_mean": float(tau_scalar.mean().item()),
+                "tau_min": float(tau_scalar.min().item()),
+                "tau_max": float(tau_scalar.max().item()),
+                "alpha_mean": float(sum(alpha_vals) / len(alpha_vals)),
+                "alpha_min": float(min(alpha_vals)),
+                "alpha_max": float(max(alpha_vals)),
             }
         else:
             self._last_sft_stats = None
         if len(self.kv_inject) > 0:
             gammas = [self.kv_inject[str(i)].gamma.item() for i in sorted(self.kv_inject_layers)]
+            gamma_mean = float(sum(gammas) / len(gammas))
             self._last_kv_stats = {
-                "gamma_mean": float(sum(gammas) / len(gammas)),
+                "gamma_mean": gamma_mean,
                 "gamma_min": float(min(gammas)),
                 "gamma_max": float(max(gammas)),
+                "eff_mean": float((1.0 - tau_scalar.mean().item()) * gamma_mean),
             }
         else:
             self._last_kv_stats = {
                 "gamma_mean": 0.0,
                 "gamma_min": 0.0,
                 "gamma_max": 0.0,
+                "eff_mean": 0.0,
             }
 
         x = self.final_layer(x, t)

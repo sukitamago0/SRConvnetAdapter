@@ -57,6 +57,7 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
+    "sft_alpha",
     "kv_inject",
     "lora_A",
     "lora_B",
@@ -1252,20 +1253,26 @@ def apply_lora(model):
 
 def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False):
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
-    for _, p in pixart.named_parameters():
-        p.requires_grad_(False)
+    for name, p in pixart.named_parameters():
+        p.requires_grad = False
 
-    for n, p in pixart.named_parameters():
         if (
-            ("final_layer" in n)
-            or ("lora_A" in n)
-            or ("lora_B" in n)
-            or ("kv_inject" in n)
-            or ("sft_cond_reduce" in n)
+            "final_layer" in name
+            or "lora_A" in name
+            or "lora_B" in name
+            or "kv_inject" in name
+            or "sft_cond_reduce" in name
+            or "sft_alpha" in name
         ):
-            p.requires_grad_(True)
-        if ("sft_layers.2." in n) or ("sft_layers.4." in n) or ("sft_layers.6." in n):
-            p.requires_grad_(True)
+            p.requires_grad = True
+
+        if (
+            "sft_layers.2." in name
+            or "sft_layers.4." in name
+            or "sft_layers.6." in name
+            or "sft_layers.8." in name
+        ):
+            p.requires_grad = True
 
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
@@ -1306,13 +1313,14 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     lora_params = []
     final_head_params = []
     bridge_params = []
-    kv_params = []
+    kv_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "kv_inject" in n]
+    alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha" in n]
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if "kv_inject" in n:
-            kv_params.append(p)
+        if ("kv_inject" in n) or ("sft_alpha" in n):
+            continue
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
@@ -1328,6 +1336,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(alpha_params) > 0:
+        optim_groups.append({"params": alpha_params, "lr": 2.0 * LR_BASE, "weight_decay": 0.0})
     if len(kv_params) > 0:
         optim_groups.append({"params": kv_params, "lr": 2.0 * LR_BASE, "weight_decay": 0.0})
 
@@ -1335,10 +1345,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + kv_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + kv_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + kv_params
+    grouped = bridge_params + final_head_params + lora_params + alpha_params + kv_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1347,6 +1357,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     group_counts = {
         "bridge": len(bridge_params),
         "lora": len(lora_params),
+        "sft_alpha": len(alpha_params),
         "kv_inject": len(kv_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
@@ -1362,8 +1373,9 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.sft_layers.2.scale_conv1.weight", pix_named.get("sft_layers.2.scale_conv1.weight", None)),
-        ("pixart.kv_inject.8.k_proj.weight", pix_named.get("kv_inject.8.k_proj.weight", None)),
-        ("pixart.kv_inject.8.gamma", pix_named.get("kv_inject.8.gamma", None)),
+        ("pixart.sft_alpha.2", pix_named.get("sft_alpha.2", None)),
+        ("pixart.kv_inject.10.k_proj.weight", pix_named.get("kv_inject.10.k_proj.weight", None)),
+        ("pixart.kv_inject.10.gamma", pix_named.get("kv_inject.10.gamma", None)),
         ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
         ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
         ("adapter.to32.1.weight", ad_named.get("to32.1.weight", None)),
@@ -1747,7 +1759,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
         cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
-        sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
+        sft_tau_means, sft_alpha_means, kv_gamma_means, kv_eff_means = [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1791,12 +1803,12 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     gate_means.append(gm)
                     gate_stds.append(gs)
 
-                    sft_stats = getattr(pixart, "_last_sft_stats", None)
-                    if isinstance(sft_stats, dict):
-                        sft_scale_means.append(float(sft_stats.get("sft_scale_mean", 0.0)))
-                        sft_scale_stds.append(float(sft_stats.get("sft_scale_std", 0.0)))
-                        sft_shift_means.append(float(sft_stats.get("sft_shift_mean", 0.0)))
-                        sft_shift_stds.append(float(sft_stats.get("sft_shift_std", 0.0)))
+                    sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
+                    kv_stats = getattr(pixart, "_last_kv_stats", {}) or {}
+                    sft_tau_means.append(float(sft_stats.get("tau_mean", 0.0)))
+                    sft_alpha_means.append(float(sft_stats.get("alpha_mean", 0.0)))
+                    kv_gamma_means.append(float(kv_stats.get("gamma_mean", 0.0)))
+                    kv_eff_means.append(float(kv_stats.get("eff_mean", 0.0)))
 
                     if CFG_SCALE == 1.0:
                         out = out_cond
@@ -1843,15 +1855,15 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         ast = float(np.mean(alpha_stds)) if len(alpha_stds) > 0 else 0.0
         gm = float(np.mean(gate_means)) if len(gate_means) > 0 else 0.0
         gs = float(np.mean(gate_stds)) if len(gate_stds) > 0 else 0.0
-        sft_sm = float(np.mean(sft_scale_means)) if len(sft_scale_means) > 0 else 0.0
-        sft_ss = float(np.mean(sft_scale_stds)) if len(sft_scale_stds) > 0 else 0.0
-        sft_shm = float(np.mean(sft_shift_means)) if len(sft_shift_means) > 0 else 0.0
-        sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
+        sft_tau_mean = float(np.mean(sft_tau_means)) if len(sft_tau_means) > 0 else 0.0
+        sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
+        kv_gamma_mean = float(np.mean(kv_gamma_means)) if len(kv_gamma_means) > 0 else 0.0
+        kv_eff_mean = float(np.mean(kv_eff_means)) if len(kv_eff_means) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
-            f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
-            f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
+            f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
+            f"kv_gamma_mean={kv_gamma_mean:.4f} | kv_eff_mean={kv_eff_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
@@ -2152,9 +2164,13 @@ def main():
                 gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                 kv_stats = getattr(pixart, "_last_kv_stats", {}) or {}
+                tau_mean = float(sft_stats.get("tau_mean", 0.0))
+                alpha_mean_sft = float(sft_stats.get("alpha_mean", 0.0))
+                alpha_min = float(sft_stats.get("alpha_min", 0.0))
+                alpha_max = float(sft_stats.get("alpha_max", 0.0))
+
                 kv_gamma_mean = float(kv_stats.get("gamma_mean", 0.0))
-                kv_gamma_min = float(kv_stats.get("gamma_min", 0.0))
-                kv_gamma_max = float(kv_stats.get("gamma_max", 0.0))
+                kv_eff_mean = float(kv_stats.get("eff_mean", 0.0))
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2171,16 +2187,13 @@ def main():
                     'lp_w': f"{w.get('lpips', 0.0):.3f}",
                     'sft_s': f"{sft_strength:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'tau': f"{float(sft_stats.get('tau_mean', 0.0)):.3f}",
+                    'sft_tau': f"{tau_mean:.3f}",
+                    'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
                     'kv_g': f"{kv_gamma_mean:.4f}",
+                    'kv_eff': f"{kv_eff_mean:.4f}",
                     'alpha': f"{alpha_mean:.3f}",
                     'gate': f"{gate_mean:.3f}",
                 }
-                if getattr(pixart, "_last_sft_stats", None) is not None:
-                    log_dict["tau_min"] = f"{float(sft_stats.get('tau_min', 0.0)):.3f}"
-                    log_dict["tau_max"] = f"{float(sft_stats.get('tau_max', 0.0)):.3f}"
-                log_dict["kv_gmin"] = f"{kv_gamma_min:.4f}"
-                log_dict["kv_gmax"] = f"{kv_gamma_max:.4f}"
                 log_dict["sft_strength"] = f"{sft_strength:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
@@ -2188,12 +2201,12 @@ def main():
                     "lpips_train_weight": float(w.get('lpips', 0.0)),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
-                    "tau_mean": float(sft_stats.get("tau_mean", 0.0)),
-                    "tau_min": float(sft_stats.get("tau_min", 0.0)),
-                    "tau_max": float(sft_stats.get("tau_max", 0.0)),
+                    "tau_mean": tau_mean,
+                    "alpha_mean": alpha_mean_sft,
+                    "alpha_min": alpha_min,
+                    "alpha_max": alpha_max,
                     "kv_gamma_mean": kv_gamma_mean,
-                    "kv_gamma_min": kv_gamma_min,
-                    "kv_gamma_max": kv_gamma_max,
+                    "kv_eff_mean": kv_eff_mean,
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
