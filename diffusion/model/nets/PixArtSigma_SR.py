@@ -37,13 +37,19 @@ class KVInjectAttention(nn.Module):
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+
+        # 保持“零影响启动”，但不要让整条分支完全无梯度
         self.gamma = nn.Parameter(torch.tensor(0.0))
 
-        nn.init.zeros_(self.k_proj.weight)
+        # K/V 投影不能全 0，否则 gamma/out_proj 都拿不到有效梯度
+        nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.zeros_(self.k_proj.bias)
-        nn.init.zeros_(self.v_proj.weight)
+
+        nn.init.xavier_uniform_(self.v_proj.weight)
         nn.init.zeros_(self.v_proj.bias)
-        nn.init.zeros_(self.out_proj.weight)
+
+        # out_proj 保持极小初始化，保证初期扰动很小，但不是严格死零
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-5)
         nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, q_tokens: torch.Tensor, cond_tokens: torch.Tensor):
@@ -112,6 +118,7 @@ class PixArtSigmaSR(PixArtMS):
 
         self._last_sft_stats = None
         self._last_kv_stats = None
+        self._last_kv_raw_stats = {"raw_mean": 0.0, "raw_std": 0.0}
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
@@ -191,7 +198,27 @@ class PixArtSigmaSR(PixArtMS):
                 **kwargs,
             )
             if cond_tokens is not None and i in self.kv_inject_layers:
-                kv_out = self.kv_inject[str(i)](x, cond_tokens.to(dtype=x.dtype))
+                kv_module = self.kv_inject[str(i)]
+
+                # 手动展开一份 raw 输出，便于确认分支不是死的
+                b2, n2, c2 = x.shape
+                m2 = cond_tokens.shape[1]
+                cond_tokens_cast = cond_tokens.to(dtype=x.dtype)
+
+                q = x.view(b2, n2, kv_module.num_heads, kv_module.head_dim).transpose(1, 2)
+                k = kv_module.k_proj(cond_tokens_cast).view(b2, m2, kv_module.num_heads, kv_module.head_dim).transpose(1, 2)
+                v = kv_module.v_proj(cond_tokens_cast).view(b2, m2, kv_module.num_heads, kv_module.head_dim).transpose(1, 2)
+
+                raw_attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+                raw_attn = raw_attn.transpose(1, 2).contiguous().view(b2, n2, c2)
+                raw_attn = kv_module.out_proj(raw_attn)
+
+                self._last_kv_raw_stats = {
+                    "raw_mean": float(raw_attn.mean().item()),
+                    "raw_std": float(raw_attn.std().item()),
+                }
+
+                kv_out = kv_module.gamma.to(raw_attn.dtype) * raw_attn
                 x = x + kv_out * (1.0 - tau_seq)
 
         if len(self.anchor_layers) > 0:
@@ -209,11 +236,14 @@ class PixArtSigmaSR(PixArtMS):
         if len(self.kv_inject) > 0:
             gammas = [self.kv_inject[str(i)].gamma.item() for i in sorted(self.kv_inject_layers)]
             gamma_mean = float(sum(gammas) / len(gammas))
+            raw_stats = getattr(self, "_last_kv_raw_stats", {"raw_mean": 0.0, "raw_std": 0.0})
             self._last_kv_stats = {
                 "gamma_mean": gamma_mean,
                 "gamma_min": float(min(gammas)),
                 "gamma_max": float(max(gammas)),
                 "eff_mean": float((1.0 - tau_scalar.mean().item()) * gamma_mean),
+                "raw_mean": float(raw_stats.get("raw_mean", 0.0)),
+                "raw_std": float(raw_stats.get("raw_std", 0.0)),
             }
         else:
             self._last_kv_stats = {
@@ -221,6 +251,8 @@ class PixArtSigmaSR(PixArtMS):
                 "gamma_min": 0.0,
                 "gamma_max": 0.0,
                 "eff_mean": 0.0,
+                "raw_mean": 0.0,
+                "raw_std": 0.0,
             }
 
         x = self.final_layer(x, t)

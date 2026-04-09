@@ -1318,9 +1318,9 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
     if len(alpha_params) > 0:
-        optim_groups.append({"params": alpha_params, "lr": 2.0 * LR_BASE, "weight_decay": 0.0})
+        optim_groups.append({"params": alpha_params, "lr": 1.0 * LR_BASE, "weight_decay": 0.0})
     if len(kv_params) > 0:
-        optim_groups.append({"params": kv_params, "lr": 2.0 * LR_BASE, "weight_decay": 0.0})
+        optim_groups.append({"params": kv_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.0})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
@@ -1356,6 +1356,8 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         ("pixart.sft_layers.2.scale_conv1.weight", pix_named.get("sft_layers.2.scale_conv1.weight", None)),
         ("pixart.sft_alpha.2", pix_named.get("sft_alpha.2", None)),
         ("pixart.kv_inject.10.k_proj.weight", pix_named.get("kv_inject.10.k_proj.weight", None)),
+        ("pixart.kv_inject.10.v_proj.weight", pix_named.get("kv_inject.10.v_proj.weight", None)),
+        ("pixart.kv_inject.10.out_proj.weight", pix_named.get("kv_inject.10.out_proj.weight", None)),
         ("pixart.kv_inject.10.gamma", pix_named.get("kv_inject.10.gamma", None)),
         ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
         ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
@@ -1740,7 +1742,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
         cond_deltas = []
-        sft_tau_means, sft_alpha_means, kv_gamma_means, kv_eff_means = [], [], [], []
+        sft_tau_means, sft_alpha_means, kv_gamma_means, kv_eff_means, kv_raw_stds = [], [], [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1775,6 +1777,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     sft_alpha_means.append(float(sft_stats.get("alpha_mean", 0.0)))
                     kv_gamma_means.append(float(kv_stats.get("gamma_mean", 0.0)))
                     kv_eff_means.append(float(kv_stats.get("eff_mean", 0.0)))
+                    kv_raw_stds.append(float(kv_stats.get("raw_std", 0.0)))
 
                     if CFG_SCALE == 1.0:
                         out = out_cond
@@ -1821,11 +1824,12 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         kv_gamma_mean = float(np.mean(kv_gamma_means)) if len(kv_gamma_means) > 0 else 0.0
         kv_eff_mean = float(np.mean(kv_eff_means)) if len(kv_eff_means) > 0 else 0.0
+        kv_raw_std = float(np.mean(kv_raw_stds)) if len(kv_raw_stds) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | "
             f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
-            f"kv_gamma_mean={kv_gamma_mean:.4f} | kv_eff_mean={kv_eff_mean:.4f} | "
+            f"kv_gamma_mean={kv_gamma_mean:.4f} | kv_eff_mean={kv_eff_mean:.4f} | kv_raw_std={kv_raw_std:.6f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
@@ -2125,6 +2129,8 @@ def main():
 
                 kv_gamma_mean = float(kv_stats.get("gamma_mean", 0.0))
                 kv_eff_mean = float(kv_stats.get("eff_mean", 0.0))
+                kv_raw_mean = float(kv_stats.get("raw_mean", 0.0))
+                kv_raw_std = float(kv_stats.get("raw_std", 0.0))
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2143,8 +2149,9 @@ def main():
                     'val_psnr': f"{last_val_psnr:.2f}",
                     'sft_tau': f"{tau_mean:.3f}",
                     'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
-                    'kv_g': f"{kv_gamma_mean:.4f}",
-                    'kv_eff': f"{kv_eff_mean:.4f}",
+                    'kv_g': f"{kv_gamma_mean:.6f}",
+                    'kv_eff': f"{kv_eff_mean:.6f}",
+                    'kv_raw_std': f"{kv_raw_std:.6f}",
                 }
                 log_dict["sft_strength"] = f"{sft_strength:.3f}"
                 pbar.set_postfix(log_dict)
@@ -2159,6 +2166,8 @@ def main():
                     "alpha_max": alpha_max,
                     "kv_gamma_mean": kv_gamma_mean,
                     "kv_eff_mean": kv_eff_mean,
+                    "kv_raw_mean": kv_raw_mean,
+                    "kv_raw_std": kv_raw_std,
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
