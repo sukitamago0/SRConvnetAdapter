@@ -57,7 +57,13 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "kv_inject",
+    "sft_alpha",
+    "control_cross_attn",
+    "control_local_dw",
+    "control_alpha",
+    "control_local_alpha",
+    "control_norm",
+    "control_local_norm",
     "lora_A",
     "lora_B",
 )
@@ -492,25 +498,6 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
     return psnr_v, ssim_v, lpips_v
 
 
-def _extract_adapter_cond_stats(cond):
-    gate_mean = 0.0
-    gate_std = 0.0
-    if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
-        means = []
-        spatial_stds = []
-        for v in cond[2].values():
-            if torch.is_tensor(v):
-                flat = v.detach().float().reshape(v.shape[0], -1)
-                means.append(flat.mean(dim=1))
-                spatial_stds.append(flat.std(dim=1, unbiased=False))
-        if len(means) > 0:
-            gm = torch.stack(means, dim=0).mean(dim=0)
-            gs = torch.stack(spatial_stds, dim=0).mean(dim=0)
-            gate_mean = float(gm.mean().item())
-            gate_std = float(gs.mean().item())
-    return gate_mean, gate_std
-
-
 def seed_everything(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
@@ -722,7 +709,14 @@ def get_config_snapshot():
         "lora_alpha": float(LORA_ALPHA),
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
-        "adapter_type": "SRConvNetLSAAdapterV8",
+        "adapter_type": "SRConvNetLSAAdapterV12",
+        "control_type": "PixArt-native internal control",
+        "adapter_backbone": "V12_with_official_SMFANet_FMB",
+        "adapter_token_head": "FMBx2 + Conv3x3_s2 + LN",
+        "internal_control_type": "PixArt-native cross-attn + zero-init dwconv",
+        "internal_control_layers": [18, 22, 24, 26],
+        "internal_control_gate": "(1 - tau)",
+        "control_integration": "self-attn -> internal control -> text cross-attn -> mlp",
         "seed": SEED,
         "lpips_enabled": bool(USE_LPIPS_PERCEP),
         "latent_l1_start": LATENT_L1_WEIGHT_START,
@@ -1252,20 +1246,31 @@ def apply_lora(model):
 
 def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False):
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
-    for _, p in pixart.named_parameters():
-        p.requires_grad_(False)
+    for name, p in pixart.named_parameters():
+        p.requires_grad = False
 
-    for n, p in pixart.named_parameters():
         if (
-            ("final_layer" in n)
-            or ("lora_A" in n)
-            or ("lora_B" in n)
-            or ("kv_inject" in n)
-            or ("sft_cond_reduce" in n)
+            "final_layer" in name
+            or "lora_A" in name
+            or "lora_B" in name
+            or "control_cross_attn" in name
+            or "control_local_dw" in name
+            or "control_alpha" in name
+            or "control_local_alpha" in name
+            or "control_norm" in name
+            or "control_local_norm" in name
+            or "sft_cond_reduce" in name
+            or "sft_alpha" in name
         ):
-            p.requires_grad_(True)
-        if ("sft_layers.2." in n) or ("sft_layers.4." in n) or ("sft_layers.6." in n):
-            p.requires_grad_(True)
+            p.requires_grad = True
+
+        if (
+            "sft_layers.2." in name
+            or "sft_layers.4." in name
+            or "sft_layers.6." in name
+            or "sft_layers.8." in name
+        ):
+            p.requires_grad = True
 
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
@@ -1306,13 +1311,21 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     lora_params = []
     final_head_params = []
     bridge_params = []
-    kv_params = []
+    internal_control_params = [
+        p for n, p in pixart.named_parameters()
+        if p.requires_grad and (("control_cross_attn" in n) or ("control_local_dw" in n) or ("control_norm" in n) or ("control_local_norm" in n))
+    ]
+    internal_control_alpha_params = [
+        p for n, p in pixart.named_parameters()
+        if p.requires_grad and (("control_alpha" in n) or ("control_local_alpha" in n))
+    ]
+    alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha" in n]
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if "kv_inject" in n:
-            kv_params.append(p)
+        if ("control_cross_attn" in n) or ("control_local_dw" in n) or ("control_norm" in n) or ("control_local_norm" in n) or ("control_alpha" in n) or ("control_local_alpha" in n) or ("sft_alpha" in n):
+            continue
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
@@ -1328,17 +1341,21 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
-    if len(kv_params) > 0:
-        optim_groups.append({"params": kv_params, "lr": 2.0 * LR_BASE, "weight_decay": 0.0})
+    if len(alpha_params) > 0:
+        optim_groups.append({"params": alpha_params, "lr": 1.0 * LR_BASE, "weight_decay": 0.0})
+    if len(internal_control_params) > 0:
+        optim_groups.append({"params": internal_control_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.0})
+    if len(internal_control_alpha_params) > 0:
+        optim_groups.append({"params": internal_control_alpha_params, "lr": 10.0 * LR_BASE, "weight_decay": 0.0})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + kv_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + internal_control_params + internal_control_alpha_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + kv_params
+    grouped = bridge_params + final_head_params + lora_params + alpha_params + internal_control_params + internal_control_alpha_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1347,7 +1364,9 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     group_counts = {
         "bridge": len(bridge_params),
         "lora": len(lora_params),
-        "kv_inject": len(kv_params),
+        "sft_alpha": len(alpha_params),
+        "internal_control": len(internal_control_params),
+        "internal_control_alpha": len(internal_control_alpha_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
     }
@@ -1362,8 +1381,10 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.sft_layers.2.scale_conv1.weight", pix_named.get("sft_layers.2.scale_conv1.weight", None)),
-        ("pixart.kv_inject.8.k_proj.weight", pix_named.get("kv_inject.8.k_proj.weight", None)),
-        ("pixart.kv_inject.8.gamma", pix_named.get("kv_inject.8.gamma", None)),
+        ("pixart.sft_alpha.2", pix_named.get("sft_alpha.2", None)),
+        ("pixart.blocks.18.control_cross_attn.q_linear.weight", pix_named.get("blocks.18.control_cross_attn.q_linear.weight", None)),
+        ("pixart.blocks.18.control_cross_attn.kv_linear.weight", pix_named.get("blocks.18.control_cross_attn.kv_linear.weight", None)),
+        ("pixart.blocks.18.control_local_dw.weight", pix_named.get("blocks.18.control_local_dw.weight", None)),
         ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
         ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
         ("adapter.to32.1.weight", ad_named.get("to32.1.weight", None)),
@@ -1499,13 +1520,22 @@ def save_smart(
             print(f"✅ LoRA save check: {lora_key_count} tensors")
         print("✅ active save check:", ", ".join([f"{k}={v}" for k, v in active_key_counts.items()]))
 
+        adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
+        adapter_token_head_counts = {
+            "adapter.token_refine": int(sum(1 for k in adapter_sd.keys() if k.startswith("token_refine."))),
+            "adapter.token_down": int(sum(1 for k in adapter_sd.keys() if k.startswith("token_down."))),
+            "adapter.token_norm": int(sum(1 for k in adapter_sd.keys() if k.startswith("token_norm."))),
+        }
+        print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
+
         pixart_keep_sd = collect_state_dict_by_keys(pixart, keep_keys)
         state = {
             "epoch": epoch,
             "step": global_step,
             "lora_rank": int(LORA_RANK),
             "lora_alpha": float(LORA_ALPHA),
-            "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
+            "adapter": adapter_sd,
+            "adapter_token_head_counts": adapter_token_head_counts,
             "optimizer": optimizer.state_dict(),
             "rng_state": {
                 "torch": torch.get_rng_state(),
@@ -1529,7 +1559,7 @@ def save_smart(
             "best_eval_tag": str(eval_tag),
             "train_runtime_log": dict(LAST_TRAIN_LOG),
             "injection_config": {
-                "hard_layers": sorted(list(getattr(pixart, "hard_injection_layers", HARD_INJECTION_LAYERS))),
+                "hard_layers": sorted(list(getattr(pixart, "anchor_layers", HARD_INJECTION_LAYERS))),
                 "detail_layers": list(getattr(pixart, "detail_injection_layers", DETAIL_INJECTION_LAYERS)),
                 "injection_layer_to_level": dict(getattr(pixart, "injection_layer_to_level", {})),
                 "ref_token_hw": int(getattr(adapter, "ref_token_hw", 32)),
@@ -1746,8 +1776,11 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         flat_psnrs, flat_ssims, flat_lpipss = [], [], []
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
-        cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
-        sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
+        cond_deltas = []
+        adapter_tok_stds, adapter_map_stds, adapter_tok_means = [], [], []
+        sft_tau_means, sft_alpha_means = [], []
+        ctrl_tok_stds, ctrl_attn_stds, ctrl_local_stds = [], [], []
+        ctrl_gates, ctrl_alphas, ctrl_local_alphas = [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1775,28 +1808,21 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
+                    adapter_tok_stds.append(float(cond["cond_tokens"].detach().float().std().item()))
+                    adapter_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
+                    adapter_tok_means.append(float(cond["cond_tokens"].detach().float().mean().item()))
 
-                    a = getattr(pixart, "_last_adapter_alpha", None)
-                    if torch.is_tensor(a):
-                        a = a.detach().float().reshape(a.shape[0], -1)
-                        alpha_means.append(float(a.mean().item()))
-                        alpha_stds.append(float(a.std(unbiased=False).item()) if a.numel() > 1 else 0.0)
-                    elif isinstance(a, dict):
-                        vals = [float(v) for v in a.values()]
-                        if len(vals) > 0:
-                            alpha_means.append(float(np.mean(vals)))
-                            alpha_stds.append(float(np.std(vals)))
-
-                    gm, gs = _extract_adapter_cond_stats(cond)
-                    gate_means.append(gm)
-                    gate_stds.append(gs)
-
-                    sft_stats = getattr(pixart, "_last_sft_stats", None)
-                    if isinstance(sft_stats, dict):
-                        sft_scale_means.append(float(sft_stats.get("sft_scale_mean", 0.0)))
-                        sft_scale_stds.append(float(sft_stats.get("sft_scale_std", 0.0)))
-                        sft_shift_means.append(float(sft_stats.get("sft_shift_mean", 0.0)))
-                        sft_shift_stds.append(float(sft_stats.get("sft_shift_std", 0.0)))
+                    sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
+                    control_stats = getattr(pixart, "_last_control_stats", {}) or {}
+                    sft_tau_means.append(float(sft_stats.get("tau_mean", 0.0)))
+                    sft_alpha_means.append(float(sft_stats.get("alpha_mean", 0.0)))
+                    if len(control_stats) > 0:
+                        ctrl_tok_stds.append(float(np.mean([v.get("control_tokens_std", 0.0) for v in control_stats.values()])))
+                        ctrl_attn_stds.append(float(np.mean([v.get("control_out_std", 0.0) for v in control_stats.values()])))
+                        ctrl_local_stds.append(float(np.mean([v.get("local_out_std", 0.0) for v in control_stats.values()])))
+                        ctrl_gates.append(float(np.mean([v.get("control_gate_mean", 0.0) for v in control_stats.values()])))
+                        ctrl_alphas.append(float(np.mean([v.get("control_alpha", 0.0) for v in control_stats.values()])))
+                        ctrl_local_alphas.append(float(np.mean([v.get("control_local_alpha", 0.0) for v in control_stats.values()])))
 
                     if CFG_SCALE == 1.0:
                         out = out_cond
@@ -1839,19 +1865,22 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
         results[int(steps)] = res
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
-        am = float(np.mean(alpha_means)) if len(alpha_means) > 0 else 0.0
-        ast = float(np.mean(alpha_stds)) if len(alpha_stds) > 0 else 0.0
-        gm = float(np.mean(gate_means)) if len(gate_means) > 0 else 0.0
-        gs = float(np.mean(gate_stds)) if len(gate_stds) > 0 else 0.0
-        sft_sm = float(np.mean(sft_scale_means)) if len(sft_scale_means) > 0 else 0.0
-        sft_ss = float(np.mean(sft_scale_stds)) if len(sft_scale_stds) > 0 else 0.0
-        sft_shm = float(np.mean(sft_shift_means)) if len(sft_shift_means) > 0 else 0.0
-        sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
+        adapter_token_std = float(np.mean(adapter_tok_stds)) if len(adapter_tok_stds) > 0 else 0.0
+        adapter_map_std = float(np.mean(adapter_map_stds)) if len(adapter_map_stds) > 0 else 0.0
+        adapter_token_mean = float(np.mean(adapter_tok_means)) if len(adapter_tok_means) > 0 else 0.0
+        sft_tau_mean = float(np.mean(sft_tau_means)) if len(sft_tau_means) > 0 else 0.0
+        sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
+        ctrl_tok_std = float(np.mean(ctrl_tok_stds)) if len(ctrl_tok_stds) > 0 else 0.0
+        ctrl_attn_std = float(np.mean(ctrl_attn_stds)) if len(ctrl_attn_stds) > 0 else 0.0
+        ctrl_local_std = float(np.mean(ctrl_local_stds)) if len(ctrl_local_stds) > 0 else 0.0
+        ctrl_gate = float(np.mean(ctrl_gates)) if len(ctrl_gates) > 0 else 0.0
+        ctrl_alpha = float(np.mean(ctrl_alphas)) if len(ctrl_alphas) > 0 else 0.0
+        ctrl_local_alpha = float(np.mean(ctrl_local_alphas)) if len(ctrl_local_alphas) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
-            f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
-            f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
+            f"CONDΔ={cdelta:.5f} | adapter_token_std={adapter_token_std:.4f} | adapter_map_std={adapter_map_std:.4f} | adapter_token_mean={adapter_token_mean:.4f} | "
+            f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
+            f"ctrl_attn_std={ctrl_attn_std:.4f} | ctrl_local_std={ctrl_local_std:.4f} | ctrl_gate={ctrl_gate:.4f} | ctrl_alpha={ctrl_alpha:.4f} | ctrl_local_alpha={ctrl_local_alpha:.4f} | ctrl_tok_std={ctrl_tok_std:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
@@ -2081,10 +2110,12 @@ def main():
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
+                lpips_num_samples = 0
 
                 need_patch_loss = (
-                    (w.get('lr_cons', 0.0) > 0) or
-                    (w.get('gw', 0.0) > 0)
+                    (w.get('lr_cons', 0.0) > 0)
+                    or (w.get('gw', 0.0) > 0)
+                    or (w.get('lpips', 0.0) > 0)
                 )
 
                 patch_t_mask = (t >= int(PIXEL_LOSS_T_MIN))
@@ -2109,6 +2140,7 @@ def main():
                         lpips_t_mask = (t.index_select(0, active_idx) <= int(LPIPS_T_MAX))
                         if float(lpips_t_mask.sum().item()) > 0:
                             lp_idx = torch.nonzero(lpips_t_mask, as_tuple=False).squeeze(1)
+                            lpips_num_samples = int(lp_idx.numel())
                             loss_lpips = perceptual_lpips_loss(
                                 lpips_fn_train,
                                 img_p_valid.index_select(0, lp_idx),
@@ -2142,25 +2174,37 @@ def main():
                 accum_micro_steps = 0
 
             if i % 10 == 0:
-                a = getattr(pixart, "_last_adapter_alpha", None)
-                if torch.is_tensor(a):
-                    alpha_mean = float(a.detach().float().mean().item())
-                elif isinstance(a, dict) and len(a) > 0:
-                    alpha_mean = float(np.mean([float(v) for v in a.values()]))
-                else:
-                    alpha_mean = 0.0
-                gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
-                kv_stats = getattr(pixart, "_last_kv_stats", {}) or {}
-                kv_gamma_mean = float(kv_stats.get("gamma_mean", 0.0))
-                kv_gamma_min = float(kv_stats.get("gamma_min", 0.0))
-                kv_gamma_max = float(kv_stats.get("gamma_max", 0.0))
+                control_stats = getattr(pixart, "_last_control_stats", {}) or {}
+                tau_mean = float(sft_stats.get("tau_mean", 0.0))
+                alpha_mean_sft = float(sft_stats.get("alpha_mean", 0.0))
+                alpha_min = float(sft_stats.get("alpha_min", 0.0))
+                alpha_max = float(sft_stats.get("alpha_max", 0.0))
+
+                if len(control_stats) > 0:
+                    ctrl_tok_std = float(np.mean([v.get("control_tokens_std", 0.0) for v in control_stats.values()]))
+                    ctrl_attn_std = float(np.mean([v.get("control_out_std", 0.0) for v in control_stats.values()]))
+                    ctrl_local_std = float(np.mean([v.get("local_out_std", 0.0) for v in control_stats.values()]))
+                    ctrl_gate = float(np.mean([v.get("control_gate_mean", 0.0) for v in control_stats.values()]))
+                    ctrl_alpha = float(np.mean([v.get("control_alpha", 0.0) for v in control_stats.values()]))
+                    ctrl_local_alpha = float(np.mean([v.get("control_local_alpha", 0.0) for v in control_stats.values()]))
+                else:
+                    ctrl_tok_std = 0.0
+                    ctrl_attn_std = 0.0
+                    ctrl_local_std = 0.0
+                    ctrl_gate = 0.0
+                    ctrl_alpha = 0.0
+                    ctrl_local_alpha = 0.0
+                adapter_token_std = float(cond_in["cond_tokens"].detach().float().std().item())
+                adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
+                adapter_token_mean = float(cond_in["cond_tokens"].detach().float().mean().item())
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmin': f"{LATENT_L1_T_MIN}",
                     'gw': f"{loss_gw.item():.3f}",
                     'lp': f"{loss_lpips.item():.3f}",
+                    'lp_n': f"{lpips_num_samples}",
                     'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
@@ -2171,29 +2215,38 @@ def main():
                     'lp_w': f"{w.get('lpips', 0.0):.3f}",
                     'sft_s': f"{sft_strength:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'tau': f"{float(sft_stats.get('tau_mean', 0.0)):.3f}",
-                    'kv_g': f"{kv_gamma_mean:.4f}",
-                    'alpha': f"{alpha_mean:.3f}",
-                    'gate': f"{gate_mean:.3f}",
+                    'sft_tau': f"{tau_mean:.3f}",
+                    'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
+                    'ctrl_attn_std': f"{ctrl_attn_std:.4f}",
+                    'ctrl_local_std': f"{ctrl_local_std:.4f}",
+                    'ctrl_gate': f"{ctrl_gate:.4f}",
+                    'ctrl_alpha': f"{ctrl_alpha:.4f}",
+                    'ctrl_local_alpha': f"{ctrl_local_alpha:.4f}",
+                    'ctrl_tok_std': f"{ctrl_tok_std:.4f}",
+                    'ad_tok_std': f"{adapter_token_std:.4f}",
+                    'ad_map_std': f"{adapter_map_std:.4f}",
                 }
-                if getattr(pixart, "_last_sft_stats", None) is not None:
-                    log_dict["tau_min"] = f"{float(sft_stats.get('tau_min', 0.0)):.3f}"
-                    log_dict["tau_max"] = f"{float(sft_stats.get('tau_max', 0.0)):.3f}"
-                log_dict["kv_gmin"] = f"{kv_gamma_min:.4f}"
-                log_dict["kv_gmax"] = f"{kv_gamma_max:.4f}"
                 log_dict["sft_strength"] = f"{sft_strength:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
                     "sft_strength": float(sft_strength),
                     "lpips_train_weight": float(w.get('lpips', 0.0)),
+                    "lpips_num_samples": int(lpips_num_samples),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
-                    "tau_mean": float(sft_stats.get("tau_mean", 0.0)),
-                    "tau_min": float(sft_stats.get("tau_min", 0.0)),
-                    "tau_max": float(sft_stats.get("tau_max", 0.0)),
-                    "kv_gamma_mean": kv_gamma_mean,
-                    "kv_gamma_min": kv_gamma_min,
-                    "kv_gamma_max": kv_gamma_max,
+                    "tau_mean": tau_mean,
+                    "alpha_mean": alpha_mean_sft,
+                    "alpha_min": alpha_min,
+                    "alpha_max": alpha_max,
+                    "ctrl_attn_std": ctrl_attn_std,
+                    "ctrl_local_std": ctrl_local_std,
+                    "ctrl_gate": ctrl_gate,
+                    "ctrl_alpha": ctrl_alpha,
+                    "ctrl_local_alpha": ctrl_local_alpha,
+                    "ctrl_tok_std": ctrl_tok_std,
+                    "adapter_token_std": adapter_token_std,
+                    "adapter_map_std": adapter_map_std,
+                    "adapter_token_mean": adapter_token_mean,
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:

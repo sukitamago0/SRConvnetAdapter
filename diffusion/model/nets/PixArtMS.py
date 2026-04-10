@@ -17,6 +17,7 @@ from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint, to_2tuple
 from diffusion.model.nets.PixArt_blocks import t2i_modulate, CaptionEmbedder, AttentionKVCompress, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, SizeEmbedder
 from diffusion.model.nets.PixArt import PixArt, get_2d_sincos_pos_embed
+from diffusion.model.nets.dit4sr_control_blocks import zero_module
 
 
 class PatchEmbed(nn.Module):
@@ -67,8 +68,27 @@ class PixArtMSBlock(nn.Module):
         self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
+        self.has_internal_control = False
+        self.control_norm = None
+        self.control_cross_attn = None
+        self.control_alpha = None
+        self.control_local_norm = None
+        self.control_local_dw = None
+        self.control_local_alpha = None
+        self._last_control_stats = None
 
-    def forward(self, x, y, t, mask=None, HW=None, **kwargs):
+    def enable_internal_control(self):
+        self.has_internal_control = True
+        self.control_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+        self.control_cross_attn = MultiHeadCrossAttention(self.hidden_size, self.attn.num_heads)
+        self.control_alpha = nn.Parameter(torch.tensor(1e-3))
+        self.control_local_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+        self.control_local_dw = zero_module(
+            nn.Conv2d(self.hidden_size, self.hidden_size, kernel_size=3, stride=1, padding=1, groups=self.hidden_size)
+        )
+        self.control_local_alpha = nn.Parameter(torch.tensor(1e-3))
+
+    def forward(self, x, y, t, mask=None, HW=None, control_tokens=None, control_gate=None, control_mask=None, **kwargs):
         B, N, C = x.shape
         adaln_shift = kwargs.get("adaln_shift", None)
         adaln_scale = kwargs.get("adaln_scale", None)
@@ -79,6 +99,45 @@ class PixArtMSBlock(nn.Module):
         if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
             h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
         x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
+
+        if self.has_internal_control and (control_tokens is not None):
+            if (control_tokens.shape[1] != N) or (control_tokens.shape[2] != C):
+                raise RuntimeError(
+                    f"Control token shape mismatch: x={tuple(x.shape)}, control_tokens={tuple(control_tokens.shape)}"
+                )
+            control_tokens = control_tokens.to(dtype=x.dtype)
+            if control_gate is None:
+                control_gate = 1.0
+            hc = self.control_norm(x)
+            control_out = self.control_cross_attn(hc, control_tokens, control_mask)
+            x = x + self.drop_path((self.control_alpha.to(x.dtype) * control_gate) * control_out)
+
+            control_local = self.control_local_norm(control_tokens)
+            if HW is None:
+                side = int(N ** 0.5)
+                if side * side != N:
+                    raise RuntimeError(f"Cannot infer control spatial shape from token length N={N}")
+                H, W = side, side
+            else:
+                H, W = int(HW[0]), int(HW[1])
+            control_map = control_local.transpose(1, 2).reshape(B, C, H, W)
+            local_map = self.control_local_dw(control_map)
+            local_tokens = local_map.flatten(2).transpose(1, 2).contiguous()
+            x = x + self.drop_path((self.control_local_alpha.to(x.dtype) * control_gate) * local_tokens)
+
+            gate_mean = float(torch.as_tensor(control_gate, dtype=x.dtype, device=x.device).mean().item())
+            self._last_control_stats = {
+                "control_alpha": float(self.control_alpha.detach().float().item()),
+                "control_local_alpha": float(self.control_local_alpha.detach().float().item()),
+                "control_gate_mean": gate_mean,
+                "control_out_std": float(control_out.detach().float().std().item()),
+                "local_out_std": float(local_tokens.detach().float().std().item()),
+                "x_std": float(x.detach().float().std().item()),
+                "control_tokens_std": float(control_tokens.detach().float().std().item()),
+            }
+        else:
+            self._last_control_stats = None
+
         x = x + self.cross_attn(x, y, mask)
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
 

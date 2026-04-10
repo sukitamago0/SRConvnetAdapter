@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusion.model.nets.srconvnet_blocks import SRConvNetBlock
-from diffusion.model.nets.smfanet_blocks import FMB
+from diffusion.model.nets.smfanet_blocks_official import FMB
 
 try:
     from mmcv.ops import CARAFEPack
@@ -315,6 +315,14 @@ class SRConvNetLSAAdapterV12(nn.Module):
             nn.Conv2d(1152, self.hidden_size, 1),
         )
 
+        self.token_refine = nn.Sequential(
+            FMB(288, ffn_scale=2.0),
+            FMB(288, ffn_scale=2.0),
+        )
+        self.token_down = nn.Conv2d(288, self.hidden_size, kernel_size=3, stride=2, padding=1)
+        self.token_norm = nn.LayerNorm(self.hidden_size)
+        self.token_drop = nn.Dropout(0.0)
+
         for m in [
             self.proj2_hi,
             self.proj3_hi,
@@ -322,6 +330,7 @@ class SRConvNetLSAAdapterV12(nn.Module):
             self.fuse64[0],
             self.fuse64[2],
             self.to32[1],
+            self.token_down,
         ]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
@@ -355,11 +364,17 @@ class SRConvNetLSAAdapterV12(nn.Module):
         fused_64 = torch.cat([c2_64, c3_64, c4_64], dim=1)
         fused_64 = self.fuse64(fused_64)
         cond_map = self.to32(fused_64)
-        cond_tokens = cond_map.flatten(2).transpose(1, 2).contiguous()
+
+        token_feat = self.token_refine(fused_64)
+        token_map = self.token_down(token_feat)
+        cond_tokens = token_map.flatten(2).transpose(1, 2).contiguous()
+        cond_tokens = self.token_norm(cond_tokens)
+        cond_tokens = self.token_drop(cond_tokens)
 
         return {
             "cond_map": cond_map,
             "cond_tokens": cond_tokens,
+            "token_map": token_map,
         }
 
 
