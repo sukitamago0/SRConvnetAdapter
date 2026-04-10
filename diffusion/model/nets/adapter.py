@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusion.model.nets.srconvnet_blocks import SRConvNetBlock
-from diffusion.model.nets.smfanet_blocks import FMB
+from diffusion.model.nets.smfanet_blocks_official import FMB
 
 try:
     from mmcv.ops import CARAFEPack
