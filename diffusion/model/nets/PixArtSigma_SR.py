@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
 from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
+from diffusion.model.nets.dit4sr_control_blocks import AttentionZero, FeedForwardControl, JointAttnProcessor2_0
 
 
 class SFTLayer(nn.Module):
@@ -26,40 +26,6 @@ class SFTLayer(nn.Module):
         return feat * (1 + gain * scale) + gain * shift, scale, shift
 
 
-class KVInjectAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int):
-        super().__init__()
-        assert hidden_size % num_heads == 0
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.gamma = nn.Parameter(torch.tensor(0.0))
-
-        nn.init.zeros_(self.k_proj.weight)
-        nn.init.zeros_(self.k_proj.bias)
-        nn.init.zeros_(self.v_proj.weight)
-        nn.init.zeros_(self.v_proj.bias)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
-
-    def forward(self, q_tokens: torch.Tensor, cond_tokens: torch.Tensor):
-        b, n, c = q_tokens.shape
-        m = cond_tokens.shape[1]
-
-        q = q_tokens.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(cond_tokens).view(b, m, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(cond_tokens).view(b, m, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-        attn = attn.transpose(1, 2).contiguous().view(b, n, c)
-        attn = self.out_proj(attn)
-        return self.gamma.to(attn.dtype) * attn
-
-
 @MODELS.register_module()
 class PixArtSigmaSR(PixArtMS):
     def __init__(
@@ -68,6 +34,7 @@ class PixArtSigmaSR(PixArtMS):
         hard_injection_layers=None,
         detail_injection_layers=None,
         injection_layer_to_level=None,
+        use_dit4sr_control: bool = True,
         **kwargs
     ):
         kwargs.setdefault("model_max_length", 300)
@@ -88,22 +55,51 @@ class PixArtSigmaSR(PixArtMS):
         self.force_null_caption = bool(force_null_caption)
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
-        # keep hard-layer SFT family
         self.sft_cond_reduce = nn.Sequential(
             nn.Conv2d(self.hidden_size, 64, 1),
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
-        self.hard_injection_layers = set(hard_injection_layers or [2, 4, 6, 8, 10, 12])
-        self.anchor_layers = set([2, 4, 6])
-        self.kv_inject_layers = set([8, 12, 16, 20, 24, 26])
-        self.kv_inject = nn.ModuleDict({
-            str(i): KVInjectAttention(hidden_size=self.hidden_size, num_heads=self.num_heads)
-            for i in sorted(self.kv_inject_layers)
+        _ = hard_injection_layers
+        _ = detail_injection_layers
+        _ = injection_layer_to_level
+        self.sft_candidate_layers = [2, 4, 6, 8]
+        self.anchor_layers = set(self.sft_candidate_layers)
+
+        self.use_dit4sr_control = bool(use_dit4sr_control)
+        self.control_layers = [18, 22, 24, 26]
+        self.control_attn_zero = nn.ModuleDict()
+        self.control_ffn = nn.ModuleDict()
+        control_processor = JointAttnProcessor2_0()
+        for i in self.control_layers:
+            self.control_attn_zero[str(i)] = AttentionZero(
+                query_dim=self.hidden_size,
+                cross_attention_dim=None,
+                added_kv_proj_dim=self.hidden_size,
+                dim_head=self.hidden_size // self.num_heads,
+                heads=self.num_heads,
+                out_dim=self.hidden_size,
+                context_pre_only=False,
+                bias=True,
+                processor=control_processor,
+                qk_norm=None,
+                eps=1e-6,
+            )
+            self.control_ffn[str(i)] = FeedForwardControl(
+                dim=self.hidden_size,
+                dim_out=self.hidden_size,
+                activation_fn="gelu-approximate",
+            )
+
+        self.sft_alpha = nn.ParameterDict({
+            "2": nn.Parameter(torch.tensor(1.0)),
+            "4": nn.Parameter(torch.tensor(1.0)),
+            "6": nn.Parameter(torch.tensor(0.5)),
+            "8": nn.Parameter(torch.tensor(0.25)),
         })
 
         self._last_sft_stats = None
-        self._last_kv_stats = None
+        self._last_control_stats = None
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
@@ -128,10 +124,10 @@ class PixArtSigmaSR(PixArtMS):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         cond_map = None
-        cond_tokens = None
+        control_tokens = None
         if adapter_cond is not None:
             cond_map = adapter_cond.get("cond_map", None)
-            cond_tokens = adapter_cond.get("cond_tokens", None)
+            control_tokens = adapter_cond.get("cond_tokens", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -148,11 +144,15 @@ class PixArtSigmaSR(PixArtMS):
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
-        tau_mean_vals, tau_min_vals, tau_max_vals = [], [], []
         cond_red = None
         if cond_map is not None:
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
 
+        t_norm = timestep.float() / 1000.0
+        tau_scalar = t_norm.pow(1.5)
+        tau_map = tau_scalar.view(-1, 1, 1, 1).to(x.dtype)
+
+        control_stats = {}
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.anchor_layers:
                 b, n, c = x.shape
@@ -160,15 +160,11 @@ class PixArtSigmaSR(PixArtMS):
                     raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w} from input/patch rule")
                 x_map_pre = x.transpose(1, 2).reshape(b, c, self.h, self.w)
                 x_map_post, _, _ = self.sft_layers[i](x_map_pre, cond_red, strength=1.0)
-                t_norm = timestep.float() / 1000.0
-                tau = t_norm.pow(1.5).view(-1, 1, 1, 1).to(x_map_pre.dtype)
-                x_map = x_map_pre + (x_map_post - x_map_pre) * tau
-                x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
-                tau_mean_vals.append(float(tau.detach().float().mean().item()))
-                tau_min_vals.append(float(tau.detach().float().min().item()))
-                tau_max_vals.append(float(tau.detach().float().max().item()))
 
-            # detail layers revert to original block-only forward
+                alpha_i = self.sft_alpha[str(i)].to(x_map_pre.dtype)
+                x_map = x_map_pre + (x_map_post - x_map_pre) * (alpha_i * tau_map)
+                x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
+
             x = auto_grad_checkpoint(
                 block,
                 x,
@@ -180,30 +176,45 @@ class PixArtSigmaSR(PixArtMS):
                 pe_interpolation=self.pe_interpolation,
                 **kwargs,
             )
-            if cond_tokens is not None and i in self.kv_inject_layers:
-                x = x + self.kv_inject[str(i)](x, cond_tokens.to(dtype=x.dtype))
 
-        if len(tau_mean_vals) > 0:
+            if self.use_dit4sr_control and (control_tokens is not None) and (i in self.control_layers):
+                if control_tokens.shape[1] != x.shape[1]:
+                    raise RuntimeError(f"Control token length mismatch at layer {i}: x={x.shape[1]}, control={control_tokens.shape[1]}")
+                x_cat = torch.cat([x, control_tokens.to(dtype=x.dtype)], dim=1)
+                attn_module = self.control_attn_zero[str(i)]
+                ffn_module = self.control_ffn[str(i)]
+
+                x_cat = x_cat + attn_module(x_cat)
+                x_cat = ffn_module(x_cat)
+                x, control_tokens = x_cat.chunk(2, dim=1)
+
+                control_stats[str(i)] = {
+                    "q_mean": float(attn_module.to_q_control.weight.mean().item()),
+                    "q_std": float(attn_module.to_q_control.weight.std().item()),
+                    "k_mean": float(attn_module.to_k_control.weight.mean().item()),
+                    "k_std": float(attn_module.to_k_control.weight.std().item()),
+                    "v_mean": float(attn_module.to_v_control.weight.mean().item()),
+                    "v_std": float(attn_module.to_v_control.weight.std().item()),
+                    "x_std": float(x.std().item()),
+                    "control_std": float(control_tokens.std().item()),
+                    "ffn_mean": float(x_cat.mean().item()),
+                    "ffn_std": float(x_cat.std().item()),
+                }
+
+        if len(self.anchor_layers) > 0:
+            alpha_vals = [self.sft_alpha[str(i)].item() for i in self.sft_candidate_layers]
             self._last_sft_stats = {
-                "tau_mean": float(sum(tau_mean_vals) / len(tau_mean_vals)),
-                "tau_min": float(min(tau_min_vals)),
-                "tau_max": float(max(tau_max_vals)),
+                "tau_mean": float(tau_scalar.mean().item()),
+                "tau_min": float(tau_scalar.min().item()),
+                "tau_max": float(tau_scalar.max().item()),
+                "alpha_mean": float(sum(alpha_vals) / len(alpha_vals)),
+                "alpha_min": float(min(alpha_vals)),
+                "alpha_max": float(max(alpha_vals)),
             }
         else:
             self._last_sft_stats = None
-        if len(self.kv_inject) > 0:
-            gammas = [self.kv_inject[str(i)].gamma.item() for i in sorted(self.kv_inject_layers)]
-            self._last_kv_stats = {
-                "gamma_mean": float(sum(gammas) / len(gammas)),
-                "gamma_min": float(min(gammas)),
-                "gamma_max": float(max(gammas)),
-            }
-        else:
-            self._last_kv_stats = {
-                "gamma_mean": 0.0,
-                "gamma_min": 0.0,
-                "gamma_max": 0.0,
-            }
+
+        self._last_control_stats = control_stats if len(control_stats) > 0 else None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
