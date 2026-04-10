@@ -39,7 +39,7 @@ class KVInjectAttention(nn.Module):
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
 
         # 保持“零影响启动”，但不要让整条分支完全无梯度
-        self.gamma = nn.Parameter(torch.tensor(0.0))
+        self.gamma = nn.Parameter(torch.tensor(1e-3))
 
         # K/V 投影不能全 0，否则 gamma/out_proj 都拿不到有效梯度
         nn.init.xavier_uniform_(self.k_proj.weight)
@@ -49,7 +49,7 @@ class KVInjectAttention(nn.Module):
         nn.init.zeros_(self.v_proj.bias)
 
         # out_proj 保持极小初始化，保证初期扰动很小，但不是严格死零
-        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-5)
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, q_tokens: torch.Tensor, cond_tokens: torch.Tensor):
@@ -239,6 +239,8 @@ class PixArtSigmaSR(PixArtMS):
             raw_stats = getattr(self, "_last_kv_raw_stats", {"raw_mean": 0.0, "raw_std": 0.0})
             self._last_kv_stats = {
                 "gamma_mean": gamma_mean,
+                "gamma_abs_mean": float(sum(abs(g) for g in gammas) / len(gammas)),
+                "gamma_values": [float(g) for g in gammas],
                 "gamma_min": float(min(gammas)),
                 "gamma_max": float(max(gammas)),
                 "eff_mean": float((1.0 - tau_scalar.mean().item()) * gamma_mean),
@@ -248,6 +250,8 @@ class PixArtSigmaSR(PixArtMS):
         else:
             self._last_kv_stats = {
                 "gamma_mean": 0.0,
+                "gamma_abs_mean": 0.0,
+                "gamma_values": [],
                 "gamma_min": 0.0,
                 "gamma_max": 0.0,
                 "eff_mean": 0.0,

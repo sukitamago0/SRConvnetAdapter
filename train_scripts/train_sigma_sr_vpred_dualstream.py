@@ -704,7 +704,7 @@ def get_config_snapshot():
         "lora_alpha": float(LORA_ALPHA),
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
-        "adapter_type": "SRConvNetLSAAdapterV8",
+        "adapter_type": "SRConvNetLSAAdapterV12",
         "seed": SEED,
         "lpips_enabled": bool(USE_LPIPS_PERCEP),
         "latent_l1_start": LATENT_L1_WEIGHT_START,
@@ -1294,7 +1294,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     lora_params = []
     final_head_params = []
     bridge_params = []
-    kv_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "kv_inject" in n]
+    kv_gamma_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "kv_inject" in n and n.endswith(".gamma")]
+    kv_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "kv_inject" in n and not n.endswith(".gamma")]
     alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha" in n]
 
     for n, p in pixart.named_parameters():
@@ -1321,15 +1322,17 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         optim_groups.append({"params": alpha_params, "lr": 1.0 * LR_BASE, "weight_decay": 0.0})
     if len(kv_params) > 0:
         optim_groups.append({"params": kv_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.0})
+    if len(kv_gamma_params) > 0:
+        optim_groups.append({"params": kv_gamma_params, "lr": 10.0 * LR_BASE, "weight_decay": 0.0})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + kv_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + kv_params + kv_gamma_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + alpha_params + kv_params
+    grouped = bridge_params + final_head_params + lora_params + alpha_params + kv_params + kv_gamma_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1340,6 +1343,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         "lora": len(lora_params),
         "sft_alpha": len(alpha_params),
         "kv_inject": len(kv_params),
+        "kv_gamma": len(kv_gamma_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
     }
@@ -2059,10 +2063,12 @@ def main():
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
+                lpips_num_samples = 0
 
                 need_patch_loss = (
-                    (w.get('lr_cons', 0.0) > 0) or
-                    (w.get('gw', 0.0) > 0)
+                    (w.get('lr_cons', 0.0) > 0)
+                    or (w.get('gw', 0.0) > 0)
+                    or (w.get('lpips', 0.0) > 0)
                 )
 
                 patch_t_mask = (t >= int(PIXEL_LOSS_T_MIN))
@@ -2087,6 +2093,7 @@ def main():
                         lpips_t_mask = (t.index_select(0, active_idx) <= int(LPIPS_T_MAX))
                         if float(lpips_t_mask.sum().item()) > 0:
                             lp_idx = torch.nonzero(lpips_t_mask, as_tuple=False).squeeze(1)
+                            lpips_num_samples = int(lp_idx.numel())
                             loss_lpips = perceptual_lpips_loss(
                                 lpips_fn_train,
                                 img_p_valid.index_select(0, lp_idx),
@@ -2137,6 +2144,7 @@ def main():
                     'l1_tmin': f"{LATENT_L1_T_MIN}",
                     'gw': f"{loss_gw.item():.3f}",
                     'lp': f"{loss_lpips.item():.3f}",
+                    'lp_n': f"{lpips_num_samples}",
                     'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
@@ -2158,6 +2166,7 @@ def main():
                 LAST_TRAIN_LOG = {
                     "sft_strength": float(sft_strength),
                     "lpips_train_weight": float(w.get('lpips', 0.0)),
+                    "lpips_num_samples": int(lpips_num_samples),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
                     "tau_mean": tau_mean,
