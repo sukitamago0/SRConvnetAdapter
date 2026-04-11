@@ -677,9 +677,11 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
     base_out = Path(args.output_dir) / dataset_name
     preds_dir = base_out / "preds"
     trip_dir = base_out / "triptychs"
+    base_out.mkdir(parents=True, exist_ok=True)
+    print(f"[Eval] Writing outputs to: {base_out}")
     if args.save_preds:
         preds_dir.mkdir(parents=True, exist_ok=True)
-    if args.save_triptychs and (not args.paper_only):
+    if args.save_triptychs:
         trip_dir.mkdir(parents=True, exist_ok=True)
 
     gen = torch.Generator(device=device)
@@ -748,6 +750,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         })
 
     csv_path = base_out / "per_image_metrics.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "dataset", "image_name", "hr_path", "lr_path", "pred_path",
         "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign",
@@ -766,6 +769,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         "maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign"
     ]
     paper_csv_path = base_out / "paper_metrics.csv"
+    paper_csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(paper_csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=paper_fieldnames)
         writer.writeheader()
@@ -829,13 +833,21 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         },
     }
 
-    with open(base_out / "summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    with open(base_out / "summary.txt", "w", encoding="utf-8") as f:
-        f.write(json.dumps(summary, indent=2, ensure_ascii=False))
-    with open(base_out / "paper_summary.json", "w", encoding="utf-8") as f:
-        json.dump(paper_summary, f, indent=2, ensure_ascii=False)
+    summary_path = base_out / "summary.json"
+    summary_txt_path = base_out / "summary.txt"
+    paper_summary_json_path = base_out / "paper_summary.json"
     paper_summary_csv = base_out / "paper_summary.csv"
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    summary_txt_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_txt_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(summary, indent=2, ensure_ascii=False))
+    paper_summary_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(paper_summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(paper_summary, f, indent=2, ensure_ascii=False)
+    paper_summary_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(paper_summary_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["dataset", "num_images", "steps", "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign"])
         writer.writeheader()
@@ -921,6 +933,7 @@ def main():
 
     if args.dataset == "both" and len(paper_rows) > 0:
         ckpt_name = Path(args.ckpt_path).stem
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         paper_table_path = Path(args.output_dir) / "paper_table.csv"
         with open(paper_table_path, "w", newline="", encoding="utf-8") as f:
             fieldnames = ["dataset", "ckpt_name", "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign"]
