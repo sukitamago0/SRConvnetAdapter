@@ -58,11 +58,14 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "sft_cond_reduce",
     "sft_layers",
     "sft_alpha",
-    "control_cross_attn",
+    "control_x_from_c_attn",
+    "control_c_from_x_attn",
     "control_local_dw",
-    "control_alpha",
+    "control_global_alpha",
+    "control_refresh_alpha",
     "control_local_alpha",
-    "control_norm",
+    "control_x_norm",
+    "control_c_norm",
     "control_local_norm",
     "lora_A",
     "lora_B",
@@ -197,10 +200,10 @@ LPIPS_T_MAX = 800
 LATENT_L1_WEIGHT_START = 0.08
 LATENT_L1_WEIGHT_END = 0.0
 
-LR_CONS_WEIGHT_START = 0.04
+LR_CONS_WEIGHT_START = 0.0
 LR_CONS_WEIGHT_END = 0.0
 
-GW_WEIGHT_START = 0.05
+GW_WEIGHT_START = 0.0
 GW_WEIGHT_END = 0.0
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
@@ -713,9 +716,13 @@ def get_config_snapshot():
         "control_type": "PixArt-native internal control",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
         "adapter_token_head": "FMBx2 + Conv3x3_s2 + LN",
-        "internal_control_type": "PixArt-native cross-attn + zero-init dwconv",
+        "internal_control_type": "asymmetric bidirectional internal control",
         "internal_control_layers": [18, 22, 24, 26],
-        "internal_control_gate": "(1 - tau)",
+        "global_control_tokens": "16x16 compressed from token_map",
+        "local_control_map": "32x32 token_map",
+        "control_attn_gate": "(1 - tau)",
+        "control_local_gate": "tau",
+        "tala_lite": "enabled",
         "control_integration": "self-attn -> internal control -> text cross-attn -> mlp",
         "seed": SEED,
         "lpips_enabled": bool(USE_LPIPS_PERCEP),
@@ -1253,11 +1260,14 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             "final_layer" in name
             or "lora_A" in name
             or "lora_B" in name
-            or "control_cross_attn" in name
+            or "control_x_from_c_attn" in name
+            or "control_c_from_x_attn" in name
             or "control_local_dw" in name
-            or "control_alpha" in name
+            or "control_global_alpha" in name
+            or "control_refresh_alpha" in name
             or "control_local_alpha" in name
-            or "control_norm" in name
+            or "control_x_norm" in name
+            or "control_c_norm" in name
             or "control_local_norm" in name
             or "sft_cond_reduce" in name
             or "sft_alpha" in name
@@ -1313,18 +1323,18 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     bridge_params = []
     internal_control_params = [
         p for n, p in pixart.named_parameters()
-        if p.requires_grad and (("control_cross_attn" in n) or ("control_local_dw" in n) or ("control_norm" in n) or ("control_local_norm" in n))
+        if p.requires_grad and (("control_x_from_c_attn" in n) or ("control_c_from_x_attn" in n) or ("control_local_dw" in n) or ("control_x_norm" in n) or ("control_c_norm" in n) or ("control_local_norm" in n))
     ]
     internal_control_alpha_params = [
         p for n, p in pixart.named_parameters()
-        if p.requires_grad and (("control_alpha" in n) or ("control_local_alpha" in n))
+        if p.requires_grad and (("control_global_alpha" in n) or ("control_refresh_alpha" in n) or ("control_local_alpha" in n))
     ]
     alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha" in n]
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if ("control_cross_attn" in n) or ("control_local_dw" in n) or ("control_norm" in n) or ("control_local_norm" in n) or ("control_alpha" in n) or ("control_local_alpha" in n) or ("sft_alpha" in n):
+        if ("control_x_from_c_attn" in n) or ("control_c_from_x_attn" in n) or ("control_local_dw" in n) or ("control_x_norm" in n) or ("control_c_norm" in n) or ("control_local_norm" in n) or ("control_global_alpha" in n) or ("control_refresh_alpha" in n) or ("control_local_alpha" in n) or ("sft_alpha" in n):
             continue
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
@@ -1382,8 +1392,8 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.sft_layers.2.scale_conv1.weight", pix_named.get("sft_layers.2.scale_conv1.weight", None)),
         ("pixart.sft_alpha.2", pix_named.get("sft_alpha.2", None)),
-        ("pixart.blocks.18.control_cross_attn.q_linear.weight", pix_named.get("blocks.18.control_cross_attn.q_linear.weight", None)),
-        ("pixart.blocks.18.control_cross_attn.kv_linear.weight", pix_named.get("blocks.18.control_cross_attn.kv_linear.weight", None)),
+        ("pixart.blocks.18.control_x_from_c_attn.q_linear.weight", pix_named.get("blocks.18.control_x_from_c_attn.q_linear.weight", None)),
+        ("pixart.blocks.18.control_c_from_x_attn.q_linear.weight", pix_named.get("blocks.18.control_c_from_x_attn.q_linear.weight", None)),
         ("pixart.blocks.18.control_local_dw.weight", pix_named.get("blocks.18.control_local_dw.weight", None)),
         ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
         ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
@@ -1779,8 +1789,9 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         cond_deltas = []
         adapter_tok_stds, adapter_map_stds, adapter_tok_means = [], [], []
         sft_tau_means, sft_alpha_means = [], []
-        ctrl_tok_stds, ctrl_attn_stds, ctrl_local_stds = [], [], []
-        ctrl_gates, ctrl_alphas, ctrl_local_alphas = [], [], []
+        ctrl_global_tok_stds, ctrl_global_attn_stds, ctrl_refresh_stds, ctrl_local_stds = [], [], [], []
+        ctrl_attn_gs, ctrl_local_gs = [], []
+        ctrl_global_alphas, ctrl_refresh_alphas, ctrl_local_alphas = [], [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1808,20 +1819,23 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
-                    adapter_tok_stds.append(float(cond["cond_tokens"].detach().float().std().item()))
+                    adapter_tok_stds.append(float(cond["global_tokens"].detach().float().std().item()))
                     adapter_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
-                    adapter_tok_means.append(float(cond["cond_tokens"].detach().float().mean().item()))
+                    adapter_tok_means.append(float(cond["global_tokens"].detach().float().mean().item()))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                     control_stats = getattr(pixart, "_last_control_stats", {}) or {}
                     sft_tau_means.append(float(sft_stats.get("tau_mean", 0.0)))
                     sft_alpha_means.append(float(sft_stats.get("alpha_mean", 0.0)))
                     if len(control_stats) > 0:
-                        ctrl_tok_stds.append(float(np.mean([v.get("control_tokens_std", 0.0) for v in control_stats.values()])))
-                        ctrl_attn_stds.append(float(np.mean([v.get("control_out_std", 0.0) for v in control_stats.values()])))
-                        ctrl_local_stds.append(float(np.mean([v.get("local_out_std", 0.0) for v in control_stats.values()])))
-                        ctrl_gates.append(float(np.mean([v.get("control_gate_mean", 0.0) for v in control_stats.values()])))
-                        ctrl_alphas.append(float(np.mean([v.get("control_alpha", 0.0) for v in control_stats.values()])))
+                        ctrl_global_tok_stds.append(float(np.mean([v.get("control_global_tokens_std", 0.0) for v in control_stats.values()])))
+                        ctrl_global_attn_stds.append(float(np.mean([v.get("global_attn_std", 0.0) for v in control_stats.values()])))
+                        ctrl_refresh_stds.append(float(np.mean([v.get("global_refresh_std", 0.0) for v in control_stats.values()])))
+                        ctrl_local_stds.append(float(np.mean([v.get("local_std", 0.0) for v in control_stats.values()])))
+                        ctrl_attn_gs.append(float(np.mean([v.get("control_attn_gate_mean", 0.0) for v in control_stats.values()])))
+                        ctrl_local_gs.append(float(np.mean([v.get("control_local_gate_mean", 0.0) for v in control_stats.values()])))
+                        ctrl_global_alphas.append(float(np.mean([v.get("control_global_alpha", 0.0) for v in control_stats.values()])))
+                        ctrl_refresh_alphas.append(float(np.mean([v.get("control_refresh_alpha", 0.0) for v in control_stats.values()])))
                         ctrl_local_alphas.append(float(np.mean([v.get("control_local_alpha", 0.0) for v in control_stats.values()])))
 
                     if CFG_SCALE == 1.0:
@@ -1870,17 +1884,21 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         adapter_token_mean = float(np.mean(adapter_tok_means)) if len(adapter_tok_means) > 0 else 0.0
         sft_tau_mean = float(np.mean(sft_tau_means)) if len(sft_tau_means) > 0 else 0.0
         sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
-        ctrl_tok_std = float(np.mean(ctrl_tok_stds)) if len(ctrl_tok_stds) > 0 else 0.0
-        ctrl_attn_std = float(np.mean(ctrl_attn_stds)) if len(ctrl_attn_stds) > 0 else 0.0
+        ctrl_global_tok_std = float(np.mean(ctrl_global_tok_stds)) if len(ctrl_global_tok_stds) > 0 else 0.0
+        ctrl_global_attn_std = float(np.mean(ctrl_global_attn_stds)) if len(ctrl_global_attn_stds) > 0 else 0.0
+        ctrl_refresh_std = float(np.mean(ctrl_refresh_stds)) if len(ctrl_refresh_stds) > 0 else 0.0
         ctrl_local_std = float(np.mean(ctrl_local_stds)) if len(ctrl_local_stds) > 0 else 0.0
-        ctrl_gate = float(np.mean(ctrl_gates)) if len(ctrl_gates) > 0 else 0.0
-        ctrl_alpha = float(np.mean(ctrl_alphas)) if len(ctrl_alphas) > 0 else 0.0
+        ctrl_attn_g = float(np.mean(ctrl_attn_gs)) if len(ctrl_attn_gs) > 0 else 0.0
+        ctrl_local_g = float(np.mean(ctrl_local_gs)) if len(ctrl_local_gs) > 0 else 0.0
+        ctrl_global_alpha = float(np.mean(ctrl_global_alphas)) if len(ctrl_global_alphas) > 0 else 0.0
+        ctrl_refresh_alpha = float(np.mean(ctrl_refresh_alphas)) if len(ctrl_refresh_alphas) > 0 else 0.0
         ctrl_local_alpha = float(np.mean(ctrl_local_alphas)) if len(ctrl_local_alphas) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | adapter_token_std={adapter_token_std:.4f} | adapter_map_std={adapter_map_std:.4f} | adapter_token_mean={adapter_token_mean:.4f} | "
             f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
-            f"ctrl_attn_std={ctrl_attn_std:.4f} | ctrl_local_std={ctrl_local_std:.4f} | ctrl_gate={ctrl_gate:.4f} | ctrl_alpha={ctrl_alpha:.4f} | ctrl_local_alpha={ctrl_local_alpha:.4f} | ctrl_tok_std={ctrl_tok_std:.4f} | "
+            f"ctrl_global_attn_std={ctrl_global_attn_std:.4f} | ctrl_refresh_std={ctrl_refresh_std:.4f} | ctrl_local_std={ctrl_local_std:.4f} | "
+            f"ctrl_attn_g={ctrl_attn_g:.4f} | ctrl_local_g={ctrl_local_g:.4f} | ctrl_global_alpha={ctrl_global_alpha:.4f} | ctrl_refresh_alpha={ctrl_refresh_alpha:.4f} | ctrl_local_alpha={ctrl_local_alpha:.4f} | ctrl_global_tok_std={ctrl_global_tok_std:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
@@ -2052,7 +2070,12 @@ def main():
             # [V8 Logic] V-Prediction Training
             t = sample_t(zh.shape[0], DEVICE, step)
             noise = torch.randn_like(zh)
-            zt = diffusion.q_sample(zh, t, noise)
+            tau_train = (t.float() / 1000.0).pow(1.5)
+            zt_hr = diffusion.q_sample(zh, t, noise)
+            zt_lr = diffusion.q_sample(zl, t, noise)
+            use_lq_mask = (torch.rand((zh.shape[0],), device=DEVICE) < tau_train).float().view(-1, 1, 1, 1)
+            zt = zt_hr * (1.0 - use_lq_mask) + zt_lr * use_lq_mask
+            tala_ratio = float(use_lq_mask.mean().item())
             
             aug_level_emb = torch.zeros((zh.shape[0],), device=DEVICE, dtype=torch.float32)
 
@@ -2182,22 +2205,28 @@ def main():
                 alpha_max = float(sft_stats.get("alpha_max", 0.0))
 
                 if len(control_stats) > 0:
-                    ctrl_tok_std = float(np.mean([v.get("control_tokens_std", 0.0) for v in control_stats.values()]))
-                    ctrl_attn_std = float(np.mean([v.get("control_out_std", 0.0) for v in control_stats.values()]))
-                    ctrl_local_std = float(np.mean([v.get("local_out_std", 0.0) for v in control_stats.values()]))
-                    ctrl_gate = float(np.mean([v.get("control_gate_mean", 0.0) for v in control_stats.values()]))
-                    ctrl_alpha = float(np.mean([v.get("control_alpha", 0.0) for v in control_stats.values()]))
+                    ctrl_global_tok_std = float(np.mean([v.get("control_global_tokens_std", 0.0) for v in control_stats.values()]))
+                    ctrl_global_attn_std = float(np.mean([v.get("global_attn_std", 0.0) for v in control_stats.values()]))
+                    ctrl_refresh_std = float(np.mean([v.get("global_refresh_std", 0.0) for v in control_stats.values()]))
+                    ctrl_local_std = float(np.mean([v.get("local_std", 0.0) for v in control_stats.values()]))
+                    ctrl_attn_g = float(np.mean([v.get("control_attn_gate_mean", 0.0) for v in control_stats.values()]))
+                    ctrl_local_g = float(np.mean([v.get("control_local_gate_mean", 0.0) for v in control_stats.values()]))
+                    ctrl_global_alpha = float(np.mean([v.get("control_global_alpha", 0.0) for v in control_stats.values()]))
+                    ctrl_refresh_alpha = float(np.mean([v.get("control_refresh_alpha", 0.0) for v in control_stats.values()]))
                     ctrl_local_alpha = float(np.mean([v.get("control_local_alpha", 0.0) for v in control_stats.values()]))
                 else:
-                    ctrl_tok_std = 0.0
-                    ctrl_attn_std = 0.0
+                    ctrl_global_tok_std = 0.0
+                    ctrl_global_attn_std = 0.0
+                    ctrl_refresh_std = 0.0
                     ctrl_local_std = 0.0
-                    ctrl_gate = 0.0
-                    ctrl_alpha = 0.0
+                    ctrl_attn_g = 0.0
+                    ctrl_local_g = 0.0
+                    ctrl_global_alpha = 0.0
+                    ctrl_refresh_alpha = 0.0
                     ctrl_local_alpha = 0.0
-                adapter_token_std = float(cond_in["cond_tokens"].detach().float().std().item())
+                adapter_token_std = float(cond_in["global_tokens"].detach().float().std().item())
                 adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
-                adapter_token_mean = float(cond_in["cond_tokens"].detach().float().mean().item())
+                adapter_token_mean = float(cond_in["global_tokens"].detach().float().mean().item())
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2217,12 +2246,16 @@ def main():
                     'val_psnr': f"{last_val_psnr:.2f}",
                     'sft_tau': f"{tau_mean:.3f}",
                     'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
-                    'ctrl_attn_std': f"{ctrl_attn_std:.4f}",
+                    'ctrl_global_attn_std': f"{ctrl_global_attn_std:.4f}",
+                    'ctrl_refresh_std': f"{ctrl_refresh_std:.4f}",
                     'ctrl_local_std': f"{ctrl_local_std:.4f}",
-                    'ctrl_gate': f"{ctrl_gate:.4f}",
-                    'ctrl_alpha': f"{ctrl_alpha:.4f}",
+                    'ctrl_attn_g': f"{ctrl_attn_g:.4f}",
+                    'ctrl_local_g': f"{ctrl_local_g:.4f}",
+                    'ctrl_global_alpha': f"{ctrl_global_alpha:.4f}",
+                    'ctrl_refresh_alpha': f"{ctrl_refresh_alpha:.4f}",
                     'ctrl_local_alpha': f"{ctrl_local_alpha:.4f}",
-                    'ctrl_tok_std': f"{ctrl_tok_std:.4f}",
+                    'ctrl_global_tok_std': f"{ctrl_global_tok_std:.4f}",
+                    'tala_r': f"{tala_ratio:.3f}",
                     'ad_tok_std': f"{adapter_token_std:.4f}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
                 }
@@ -2238,12 +2271,16 @@ def main():
                     "alpha_mean": alpha_mean_sft,
                     "alpha_min": alpha_min,
                     "alpha_max": alpha_max,
-                    "ctrl_attn_std": ctrl_attn_std,
+                    "ctrl_global_attn_std": ctrl_global_attn_std,
+                    "ctrl_refresh_std": ctrl_refresh_std,
                     "ctrl_local_std": ctrl_local_std,
-                    "ctrl_gate": ctrl_gate,
-                    "ctrl_alpha": ctrl_alpha,
+                    "ctrl_attn_g": ctrl_attn_g,
+                    "ctrl_local_g": ctrl_local_g,
+                    "ctrl_global_alpha": ctrl_global_alpha,
+                    "ctrl_refresh_alpha": ctrl_refresh_alpha,
                     "ctrl_local_alpha": ctrl_local_alpha,
-                    "ctrl_tok_std": ctrl_tok_std,
+                    "ctrl_global_tok_std": ctrl_global_tok_std,
+                    "tala_ratio": tala_ratio,
                     "adapter_token_std": adapter_token_std,
                     "adapter_map_std": adapter_map_std,
                     "adapter_token_mean": adapter_token_mean,

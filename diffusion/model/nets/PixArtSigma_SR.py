@@ -101,10 +101,12 @@ class PixArtSigmaSR(PixArtMS):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         cond_map = None
-        control_tokens = None
+        control_local_map = None
+        control_global_tokens = None
         if adapter_cond is not None:
             cond_map = adapter_cond.get("cond_map", None)
-            control_tokens = adapter_cond.get("cond_tokens", None)
+            control_local_map = adapter_cond.get("local_token_map", None)
+            control_global_tokens = adapter_cond.get("global_tokens", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -128,7 +130,8 @@ class PixArtSigmaSR(PixArtMS):
         t_norm = timestep.float() / 1000.0
         tau_scalar = t_norm.pow(1.5)
         tau_map = tau_scalar.view(-1, 1, 1, 1).to(x.dtype)
-        ctrl_gate = (1.0 - tau_scalar).view(-1, 1, 1).to(x.dtype)
+        control_local_gate = tau_scalar.view(-1, 1, 1).to(x.dtype)
+        control_attn_gate = (1.0 - tau_scalar).view(-1, 1, 1).to(x.dtype)
 
         control_stats = {}
         for i, block in enumerate(self.blocks):
@@ -143,16 +146,19 @@ class PixArtSigmaSR(PixArtMS):
                 x_map = x_map_pre + (x_map_post - x_map_pre) * (alpha_i * tau_map)
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
 
-            if (i in self.control_layers) and (control_tokens is not None):
-                x = auto_grad_checkpoint(
+            if (i in self.control_layers) and (control_global_tokens is not None) and (control_local_map is not None):
+                x, control_global_tokens = auto_grad_checkpoint(
                     block,
                     x,
                     y,
                     t0,
                     y_lens,
                     HW=(self.h, self.w),
-                    control_tokens=control_tokens.to(dtype=x.dtype),
-                    control_gate=ctrl_gate,
+                    control_global_tokens=control_global_tokens.to(dtype=x.dtype),
+                    control_local_map=control_local_map.to(dtype=x.dtype),
+                    control_attn_gate=control_attn_gate,
+                    control_local_gate=control_local_gate,
+                    update_control_tokens=True,
                     base_size=self.base_size,
                     pe_interpolation=self.pe_interpolation,
                     **kwargs,

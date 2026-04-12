@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from diffusion.model.nets.srconvnet_blocks import SRConvNetBlock
 from diffusion.model.nets.smfanet_blocks_official import FMB
+from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
 
 try:
     from mmcv.ops import CARAFEPack
@@ -251,10 +252,11 @@ def build_adapter_v7(in_channels=3, hidden_size=1152, injection_layers_map=None)
 
 
 class SRConvNetLSAAdapterV12(nn.Module):
-    def __init__(self, in_channels: int = 3, hidden_size: int = 1152):
+    def __init__(self, in_channels: int = 3, hidden_size: int = 1152, global_token_stride: int = 2):
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_size = int(hidden_size)
+        self.global_token_stride = int(global_token_stride)
 
         self.stem = nn.Conv2d(self.in_channels, 64, 3, 1, 1)
         self.stage1 = nn.Sequential(
@@ -322,6 +324,14 @@ class SRConvNetLSAAdapterV12(nn.Module):
         self.token_down = nn.Conv2d(288, self.hidden_size, kernel_size=3, stride=2, padding=1)
         self.token_norm = nn.LayerNorm(self.hidden_size)
         self.token_drop = nn.Dropout(0.0)
+        self.global_pool = nn.AvgPool2d(self.global_token_stride, self.global_token_stride)
+        self.global_proj = nn.Conv2d(self.hidden_size, self.hidden_size, kernel_size=1, stride=1, padding=0)
+        self.global_norm = nn.LayerNorm(self.hidden_size)
+        self.register_buffer(
+            "global_pos_embed_16",
+            torch.zeros(1, (32 // self.global_token_stride) * (32 // self.global_token_stride), self.hidden_size),
+            persistent=False,
+        )
 
         for m in [
             self.proj2_hi,
@@ -331,9 +341,20 @@ class SRConvNetLSAAdapterV12(nn.Module):
             self.fuse64[2],
             self.to32[1],
             self.token_down,
+            self.global_proj,
         ]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
+
+        token_hw = 32 // self.global_token_stride
+        global_pos = get_2d_sincos_pos_embed(
+            self.hidden_size,
+            (token_hw, token_hw),
+            pe_interpolation=1.0,
+            base_size=token_hw,
+        )
+        global_pos = torch.from_numpy(global_pos).float().unsqueeze(0)
+        self.global_pos_embed_16.copy_(global_pos)
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -367,16 +388,19 @@ class SRConvNetLSAAdapterV12(nn.Module):
 
         token_feat = self.token_refine(fused_64)
         token_map = self.token_down(token_feat)
-        cond_tokens = token_map.flatten(2).transpose(1, 2).contiguous()
-        cond_tokens = self.token_norm(cond_tokens)
-        cond_tokens = self.token_drop(cond_tokens)
+        local_token_map = token_map
+        global_token_map = self.global_proj(self.global_pool(token_map))
+        global_tokens = global_token_map.flatten(2).transpose(1, 2).contiguous()
+        global_tokens = global_tokens + self.global_pos_embed_16.to(global_tokens.device, dtype=global_tokens.dtype)
+        global_tokens = self.global_norm(global_tokens)
 
         return {
             "cond_map": cond_map,
-            "cond_tokens": cond_tokens,
+            "local_token_map": local_token_map,
+            "global_tokens": global_tokens,
             "token_map": token_map,
         }
 
 
-def build_adapter_v12(in_channels=3, hidden_size=1152):
-    return SRConvNetLSAAdapterV12(in_channels=in_channels, hidden_size=hidden_size)
+def build_adapter_v12(in_channels=3, hidden_size=1152, global_token_stride=2):
+    return SRConvNetLSAAdapterV12(in_channels=in_channels, hidden_size=hidden_size, global_token_stride=global_token_stride)
