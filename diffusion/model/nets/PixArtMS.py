@@ -17,7 +17,12 @@ from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint, to_2tuple
 from diffusion.model.nets.PixArt_blocks import t2i_modulate, CaptionEmbedder, AttentionKVCompress, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, SizeEmbedder
 from diffusion.model.nets.PixArt import PixArt, get_2d_sincos_pos_embed
-from diffusion.model.nets.dit4sr_control_blocks import zero_module
+
+
+def zero_module(module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
 
 
 class PatchEmbed(nn.Module):

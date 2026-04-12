@@ -1534,7 +1534,7 @@ def save_smart(
         adapter_token_head_counts = {
             "adapter.token_refine": int(sum(1 for k in adapter_sd.keys() if k.startswith("token_refine."))),
             "adapter.token_down": int(sum(1 for k in adapter_sd.keys() if k.startswith("token_down."))),
-            "adapter.token_norm": int(sum(1 for k in adapter_sd.keys() if k.startswith("token_norm."))),
+            "adapter.global_proj": int(sum(1 for k in adapter_sd.keys() if k.startswith("global_proj."))),
         }
         print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
 

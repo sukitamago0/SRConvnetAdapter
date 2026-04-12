@@ -13,6 +13,8 @@ except Exception:
 
 
 class SRConvNetLSAAdapter(nn.Module):
+    # Legacy adapter kept for backward compatibility.
+    # NOTE: build_adapter_v12() is the active mainline entry in current training/eval scripts.
     def __init__(self, hidden_size: int = 1152):
         super().__init__()
         self.hidden_size = int(hidden_size)
@@ -130,6 +132,8 @@ class NAFBlock(nn.Module):
 
 
 class SRConvNetLSAAdapterV8(nn.Module):
+    # Legacy adapter kept for backward compatibility experiments.
+    # NOTE: build_adapter_v12() is the active mainline entry in current training/eval scripts.
     def __init__(self, in_channels: int = 3, hidden_size: int = 1152, ref_token_hw: int = 32, structure_only: bool = True):
         super().__init__()
         self.in_channels = int(in_channels)
