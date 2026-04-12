@@ -121,6 +121,10 @@ class PixArtMSBlock(nn.Module):
         x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
 
         if self.has_internal_control and (control_global_tokens is not None) and (control_local_map is not None):
+            # Internal control order (kept explicit for future ablations):
+            # 1) x <- CA(x, c)
+            # 2) c <- CA(c, x_updated)
+            # 3) x <- local_dw(local_map)
             if (control_global_tokens.shape[2] != C):
                 raise RuntimeError(
                     f"Global control hidden mismatch: x={tuple(x.shape)}, control_global_tokens={tuple(control_global_tokens.shape)}"
@@ -156,6 +160,10 @@ class PixArtMSBlock(nn.Module):
                 H, W = side, side
             else:
                 H, W = int(HW[0]), int(HW[1])
+            if (control_local_map.shape[-2] != H) or (control_local_map.shape[-1] != W):
+                raise RuntimeError(
+                    f"Local control map spatial mismatch: expected ({H}, {W}), got ({control_local_map.shape[-2]}, {control_local_map.shape[-1]})"
+                )
             local_map = local_tokens.transpose(1, 2).reshape(B, C, H, W)
             local_map = self.control_local_dw(local_map)
             local_tokens_after_dw = local_map.flatten(2).transpose(1, 2).contiguous()

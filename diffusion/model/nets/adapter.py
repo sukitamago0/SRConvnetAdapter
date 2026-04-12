@@ -322,13 +322,11 @@ class SRConvNetLSAAdapterV12(nn.Module):
             FMB(288, ffn_scale=2.0),
         )
         self.token_down = nn.Conv2d(288, self.hidden_size, kernel_size=3, stride=2, padding=1)
-        self.token_norm = nn.LayerNorm(self.hidden_size)
-        self.token_drop = nn.Dropout(0.0)
         self.global_pool = nn.AvgPool2d(self.global_token_stride, self.global_token_stride)
         self.global_proj = nn.Conv2d(self.hidden_size, self.hidden_size, kernel_size=1, stride=1, padding=0)
         self.global_norm = nn.LayerNorm(self.hidden_size)
         self.register_buffer(
-            "global_pos_embed_16",
+            "global_pos_embed",
             torch.zeros(1, (32 // self.global_token_stride) * (32 // self.global_token_stride), self.hidden_size),
             persistent=False,
         )
@@ -354,7 +352,7 @@ class SRConvNetLSAAdapterV12(nn.Module):
             base_size=token_hw,
         )
         global_pos = torch.from_numpy(global_pos).float().unsqueeze(0)
-        self.global_pos_embed_16.copy_(global_pos)
+        self.global_pos_embed.copy_(global_pos)
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -391,7 +389,7 @@ class SRConvNetLSAAdapterV12(nn.Module):
         local_token_map = token_map
         global_token_map = self.global_proj(self.global_pool(token_map))
         global_tokens = global_token_map.flatten(2).transpose(1, 2).contiguous()
-        global_tokens = global_tokens + self.global_pos_embed_16.to(global_tokens.device, dtype=global_tokens.dtype)
+        global_tokens = global_tokens + self.global_pos_embed.to(global_tokens.device, dtype=global_tokens.dtype)
         global_tokens = self.global_norm(global_tokens)
 
         return {
