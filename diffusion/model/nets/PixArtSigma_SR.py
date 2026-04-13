@@ -64,10 +64,6 @@ class PixArtSigmaSR(PixArtMS):
         self.sft_candidate_layers = [2, 4, 6, 8]
         self.anchor_layers = set(self.sft_candidate_layers)
 
-        self.control_layers = [18, 22, 24, 26]
-        for i in self.control_layers:
-            self.blocks[i].enable_internal_control()
-
         self.sft_alpha = nn.ParameterDict({
             "2": nn.Parameter(torch.tensor(1.0)),
             "4": nn.Parameter(torch.tensor(1.0)),
@@ -101,12 +97,8 @@ class PixArtSigmaSR(PixArtMS):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         cond_map = None
-        control_local_map = None
-        control_global_tokens = None
         if adapter_cond is not None:
             cond_map = adapter_cond.get("cond_map", None)
-            control_local_map = adapter_cond.get("local_token_map", None)
-            control_global_tokens = adapter_cond.get("global_tokens", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -130,10 +122,6 @@ class PixArtSigmaSR(PixArtMS):
         t_norm = timestep.float() / 1000.0
         tau_scalar = t_norm.pow(1.5)
         tau_map = tau_scalar.view(-1, 1, 1, 1).to(x.dtype)
-        control_local_gate = tau_scalar.view(-1, 1, 1).to(x.dtype)
-        control_attn_gate = (1.0 - tau_scalar).view(-1, 1, 1).to(x.dtype)
-
-        control_stats = {}
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.anchor_layers:
                 b, n, c = x.shape
@@ -146,39 +134,17 @@ class PixArtSigmaSR(PixArtMS):
                 x_map = x_map_pre + (x_map_post - x_map_pre) * (alpha_i * tau_map)
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
 
-            if (i in self.control_layers) and (control_global_tokens is not None) and (control_local_map is not None):
-                x, control_global_tokens = auto_grad_checkpoint(
-                    block,
-                    x,
-                    y,
-                    t0,
-                    y_lens,
-                    HW=(self.h, self.w),
-                    control_global_tokens=control_global_tokens.to(dtype=x.dtype),
-                    control_local_map=control_local_map.to(dtype=x.dtype),
-                    control_attn_gate=control_attn_gate,
-                    control_local_gate=control_local_gate,
-                    update_control_tokens=True,
-                    base_size=self.base_size,
-                    pe_interpolation=self.pe_interpolation,
-                    **kwargs,
-                )
-            else:
-                x = auto_grad_checkpoint(
-                    block,
-                    x,
-                    y,
-                    t0,
-                    y_lens,
-                    HW=(self.h, self.w),
-                    base_size=self.base_size,
-                    pe_interpolation=self.pe_interpolation,
-                    **kwargs,
-                )
-
-            block_stats = getattr(block, "_last_control_stats", None)
-            if block_stats is not None:
-                control_stats[str(i)] = block_stats
+            x = auto_grad_checkpoint(
+                block,
+                x,
+                y,
+                t0,
+                y_lens,
+                HW=(self.h, self.w),
+                base_size=self.base_size,
+                pe_interpolation=self.pe_interpolation,
+                **kwargs,
+            )
 
         if len(self.anchor_layers) > 0:
             alpha_vals = [self.sft_alpha[str(i)].item() for i in self.sft_candidate_layers]
@@ -193,7 +159,7 @@ class PixArtSigmaSR(PixArtMS):
         else:
             self._last_sft_stats = None
 
-        self._last_control_stats = control_stats if len(control_stats) > 0 else None
+        self._last_control_stats = None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
