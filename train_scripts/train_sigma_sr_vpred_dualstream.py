@@ -1310,7 +1310,7 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
 def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module):
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
     sem_adapter_resampler_params = [p for n, p in sem_adapter.named_parameters() if p.requires_grad and ("resampler" in n)]
-    sem_adapter_proj_params = [p for n, p in sem_adapter.named_parameters() if p.requires_grad and (("proj_norm" in n) or ("proj." in n))]
+    sem_adapter_proj_params = [p for n, p in sem_adapter.named_parameters() if p.requires_grad and (("proj_norm" in n) or ("proj." in n) or ("out_scale" in n))]
 
     lora_params = []
     final_head_params = []
@@ -1722,12 +1722,17 @@ def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_
     sem_adapter_sd = ckpt.get("sem_adapter", ckpt.get("sem_prompt", None))
     if isinstance(sem_adapter_sd, dict):
         missing, unexpected = sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
+        missing_set = set(missing)
+        allow_legacy_out_scale_only = (missing_set == {"out_scale"}) and (len(unexpected) == 0)
         if len(missing) > 0 or len(unexpected) > 0:
-            msg = f"sem_adapter resume non-strict load: missing={len(missing)} unexpected={len(unexpected)}"
-            if ALLOW_SEM_ADAPTER_NONSTRICT_RESUME:
-                print(f"⚠️ {msg}")
+            if allow_legacy_out_scale_only:
+                print("ℹ️ sem_adapter legacy checkpoint detected (missing out_scale only); using default out_scale=1.0.")
             else:
-                raise RuntimeError(msg)
+                msg = f"sem_adapter resume non-strict load: missing={len(missing)} unexpected={len(unexpected)}"
+                if ALLOW_SEM_ADAPTER_NONSTRICT_RESUME:
+                    print(f"⚠️ {msg}")
+                else:
+                    raise RuntimeError(msg)
     else:
         print("ℹ️ sem_adapter state not found in checkpoint; continue with fresh semantic prompt branch.")
 

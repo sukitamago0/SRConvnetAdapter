@@ -571,8 +571,12 @@ def build_model_and_assets(args, device, compute_dtype):
     sem_adapter_sd = ckpt.get("sem_adapter", ckpt.get("sem_prompt", None))
     if isinstance(sem_adapter_sd, dict):
         missing, unexpected = sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
-        if len(missing) > 0 or len(unexpected) > 0:
+        missing_set = set(missing)
+        allow_legacy_out_scale_only = (missing_set == {"out_scale"}) and (len(unexpected) == 0)
+        if (len(missing) > 0 or len(unexpected) > 0) and (not allow_legacy_out_scale_only):
             raise RuntimeError(f"Strict sem_adapter eval load failed: missing={len(missing)} unexpected={len(unexpected)}")
+        if allow_legacy_out_scale_only:
+            print("ℹ️ sem_adapter legacy checkpoint detected (missing out_scale only); using default out_scale=1.0.")
     else:
         raise RuntimeError("Checkpoint missing sem_adapter state for strict eval.")
 
