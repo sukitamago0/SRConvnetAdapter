@@ -46,6 +46,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -57,7 +58,12 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "final_layer",
     "sft_cond_reduce",
     "sft_layers",
-    "kv_inject",
+    "sft_alpha",
+    "semantic_cross_attn",
+    "semantic_out_proj",
+    "semantic_alpha",
+    "local_fidelity_blocks",
+    "local_fid_alpha",
     "lora_A",
     "lora_B",
 )
@@ -74,6 +80,9 @@ def get_required_active_key_fragments_for_model(model: nn.Module):
     return tuple(required)
 
 # ================= 2. Hyper-parameters =================
+# LR only for shallow structure anchor.
+# Semantic prompt only through decoupled semantic branch.
+# Late local fidelity branch only for local correction, not detail generation.
 TRAIN_DF2K_HR_DIR = "/data/DF2K/DF2K_train_HR"
 TRAIN_DF2K_LR_DIR = "/data/DF2K/DF2K_train_LR_unknown"
 TRAIN_REALSR_DIRS = [
@@ -122,8 +131,12 @@ GRAD_ACCUM_STEPS = 16
 NUM_WORKERS = 8
 
 LR_BASE = 1e-5 
-LORA_RANK = 16
-LORA_ALPHA = 16
+LORA_RANK = 32
+LORA_ALPHA = 32
+SEMANTIC_ENCODER_NAME_OR_PATH = os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "openai/clip-vit-large-patch14")
+ALLOW_SEM_ADAPTER_NONSTRICT_RESUME = False
+USE_FIXED_HARD_PROMPT = True
+HARD_PROMPT_EMBED_PATH = "/home/hello/HJT/pretrained_models/pixart_prompts/restoration_hard_prompt_sigma_300.pth"
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
@@ -132,17 +145,9 @@ INJECT_R_END = 0.1
 INJECT_S_MIN = 0.1
 INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
-HARD_INJECTION_LAYERS = [2, 4, 6, 8, 10, 12]
-TRANSITION_INJECTION_LAYERS = []
-DETAIL_INJECTION_LAYERS = [14, 16, 18, 20, 22, 24]
-DEFAULT_INJECTION_LAYER_TO_LEVEL = {
-    14: "mid",
-    16: "mid",
-    18: "high",
-    20: "high",
-    22: "high",
-    24: "high",
-}
+ANCHOR_LAYERS = [2, 4, 6, 8]
+SEMANTIC_LAYERS = [18, 22, 24, 26]
+LOCAL_FIDELITY_LAYERS = [22, 26]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -191,10 +196,10 @@ LPIPS_T_MAX = 800
 LATENT_L1_WEIGHT_START = 0.08
 LATENT_L1_WEIGHT_END = 0.0
 
-LR_CONS_WEIGHT_START = 0.04
+LR_CONS_WEIGHT_START = 0.0
 LR_CONS_WEIGHT_END = 0.0
 
-GW_WEIGHT_START = 0.05
+GW_WEIGHT_START = 0.0
 GW_WEIGHT_END = 0.0
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
@@ -492,25 +497,6 @@ def compute_component_metrics(pred_m11: torch.Tensor, hr_m11: torch.Tensor, mask
     return psnr_v, ssim_v, lpips_v
 
 
-def _extract_adapter_cond_stats(cond):
-    gate_mean = 0.0
-    gate_std = 0.0
-    if isinstance(cond, (tuple, list)) and len(cond) >= 3 and isinstance(cond[2], dict) and len(cond[2]) > 0:
-        means = []
-        spatial_stds = []
-        for v in cond[2].values():
-            if torch.is_tensor(v):
-                flat = v.detach().float().reshape(v.shape[0], -1)
-                means.append(flat.mean(dim=1))
-                spatial_stds.append(flat.std(dim=1, unbiased=False))
-        if len(means) > 0:
-            gm = torch.stack(means, dim=0).mean(dim=0)
-            gs = torch.stack(spatial_stds, dim=0).mean(dim=0)
-            gate_mean = float(gm.mean().item())
-            gate_std = float(gs.mean().item())
-    return gate_mean, gate_std
-
-
 def seed_everything(seed: int):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
@@ -596,11 +582,24 @@ def mask_adapter_cond(cond, keep_mask: torch.Tensor):
 
     return _mask_obj(cond)
 
+
+
 def file_sha256(path):
     sha = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""): sha.update(chunk)
     return sha.hexdigest()
+
+
+def assert_finite_tensor(name: str, x: torch.Tensor, stats: dict):
+    if x is None:
+        return
+    if not torch.is_tensor(x):
+        return
+    if torch.isfinite(x).all():
+        return
+    stat_items = " | ".join([f"{k}={v}" for k, v in stats.items()])
+    raise RuntimeError(f"[NaNGuard] non-finite detected in {name}. {stat_items}")
 
 def _should_keep_fp32_on_save(param_name: str) -> bool:
     return any(tag in param_name for tag in FP32_SAVE_KEY_FRAGMENTS)
@@ -722,7 +721,23 @@ def get_config_snapshot():
         "lora_alpha": float(LORA_ALPHA),
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
-        "adapter_type": "SRConvNetLSAAdapterV8",
+        "adapter_type": "SRConvNetLSAAdapterV12",
+        "control_type": "structure_sft + decoupled_semantic + late_local_fidelity",
+        "adapter_backbone": "V12_with_official_SMFANet_FMB",
+        "adapter_token_head": "structure-only cond_map head",
+        "internal_control_type": "disabled",
+        "internal_control_layers": [],
+        "semantic_prompt_branch": "enabled",
+        "semantic_prompt_source": "CLIP + IP-Adapter Resampler + decoupled cross-attn",
+        "semantic_prompt_tokens": 16,
+        "use_native_text_path": True,
+        "hard_prompt_path": HARD_PROMPT_EMBED_PATH,
+        "lr_control_role": "structure_only",
+        "anchor_layers": list(ANCHOR_LAYERS),
+        "semantic_layers": list(SEMANTIC_LAYERS),
+        "local_fidelity_layers": list(LOCAL_FIDELITY_LAYERS),
+        "tala_lite": False,
+        "control_integration": "disabled",
         "seed": SEED,
         "lpips_enabled": bool(USE_LPIPS_PERCEP),
         "latent_l1_start": LATENT_L1_WEIGHT_START,
@@ -743,23 +758,6 @@ def validate_schedule_alignment():
 
 def validate_s2d_decoupling():
     return
-def load_resume_injection_config(default_cfg: dict):
-    cfg = dict(default_cfg)
-    if not os.path.exists(LAST_CKPT_PATH):
-        return cfg
-    try:
-        ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
-        inj = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
-        if not isinstance(inj, dict) or len(inj) == 0:
-            return cfg
-        cfg["hard_layers"] = list(inj.get("hard_layers", cfg["hard_layers"]))
-        cfg["detail_layers"] = list(inj.get("detail_layers", cfg["detail_layers"]))
-        cfg["injection_layer_to_level"] = dict(inj.get("injection_layer_to_level", cfg["injection_layer_to_level"]))
-        cfg["ref_token_hw"] = int(inj.get("ref_token_hw", cfg["ref_token_hw"]))
-        print("[ResumeConfig] injection_config loaded from LAST_CKPT_PATH")
-    except Exception as e:
-        print(f"⚠️ Failed to load injection_config from LAST_CKPT_PATH: {e}")
-    return cfg
 
 # ================= 4. Data Pipeline =================
 class DegradationPipeline:
@@ -1252,20 +1250,29 @@ def apply_lora(model):
 
 def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False):
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
-    for _, p in pixart.named_parameters():
-        p.requires_grad_(False)
+    for name, p in pixart.named_parameters():
+        p.requires_grad = False
 
-    for n, p in pixart.named_parameters():
         if (
-            ("final_layer" in n)
-            or ("lora_A" in n)
-            or ("lora_B" in n)
-            or ("kv_inject" in n)
-            or ("sft_cond_reduce" in n)
+            "final_layer" in name
+            or "lora_A" in name
+            or "lora_B" in name
+            or "sft_cond_reduce" in name
+            or "sft_alpha" in name
         ):
-            p.requires_grad_(True)
-        if ("sft_layers.2." in n) or ("sft_layers.4." in n) or ("sft_layers.6." in n):
-            p.requires_grad_(True)
+            p.requires_grad = True
+
+        if (
+            "sft_layers.2." in name
+            or "sft_layers.4." in name
+            or "sft_layers.6." in name
+            or "sft_layers.8." in name
+        ):
+            p.requires_grad = True
+        if ("semantic_cross_attn" in name) or ("semantic_out_proj" in name) or ("semantic_alpha" in name):
+            p.requires_grad = True
+        if ("local_fidelity_blocks" in name) or ("local_fid_alpha" in name):
+            p.requires_grad = True
 
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
@@ -1300,19 +1307,25 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
     return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
 
 
-def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module):
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
+    sem_adapter_resampler_params = [p for n, p in sem_adapter.named_parameters() if p.requires_grad and ("resampler" in n)]
+    sem_adapter_proj_params = [p for n, p in sem_adapter.named_parameters() if p.requires_grad and (("proj_norm" in n) or ("proj." in n))]
 
     lora_params = []
     final_head_params = []
     bridge_params = []
-    kv_params = []
+    alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha" in n]
+    semantic_attn_params = [p for n, p in pixart.named_parameters() if p.requires_grad and (("semantic_cross_attn" in n) or ("semantic_out_proj" in n))]
+    semantic_alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "semantic_alpha" in n]
+    local_fid_block_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "local_fidelity_blocks" in n]
+    local_fid_alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "local_fid_alpha" in n]
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if "kv_inject" in n:
-            kv_params.append(p)
+        if ("sft_alpha" in n) or ("semantic_cross_attn" in n) or ("semantic_out_proj" in n) or ("semantic_alpha" in n) or ("local_fidelity_blocks" in n) or ("local_fid_alpha" in n):
+            continue
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
         elif FINAL_LAYER_KEYWORD in n:
@@ -1328,17 +1341,29 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
         optim_groups.append({"params": bridge_and_head, "lr": 3e-4, "weight_decay": 0.01})
     if len(lora_params) > 0:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
-    if len(kv_params) > 0:
-        optim_groups.append({"params": kv_params, "lr": 2.0 * LR_BASE, "weight_decay": 0.0})
+    if len(alpha_params) > 0:
+        optim_groups.append({"params": alpha_params, "lr": 1.0 * LR_BASE, "weight_decay": 0.0})
+    if len(semantic_attn_params) > 0:
+        optim_groups.append({"params": semantic_attn_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.01})
+    if len(semantic_alpha_params) > 0:
+        optim_groups.append({"params": semantic_alpha_params, "lr": 10.0 * LR_BASE, "weight_decay": 0.0})
+    if len(local_fid_block_params) > 0:
+        optim_groups.append({"params": local_fid_block_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.01})
+    if len(local_fid_alpha_params) > 0:
+        optim_groups.append({"params": local_fid_alpha_params, "lr": 10.0 * LR_BASE, "weight_decay": 0.0})
+    if len(sem_adapter_resampler_params) > 0:
+        optim_groups.append({"params": sem_adapter_resampler_params, "lr": 1e-4, "weight_decay": 0.01})
+    if len(sem_adapter_proj_params) > 0:
+        optim_groups.append({"params": sem_adapter_proj_params, "lr": 1e-4, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + kv_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params + local_fid_block_params + local_fid_alpha_params + sem_adapter_resampler_params + sem_adapter_proj_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + kv_params
+    grouped = bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params + local_fid_block_params + local_fid_alpha_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1347,7 +1372,13 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     group_counts = {
         "bridge": len(bridge_params),
         "lora": len(lora_params),
-        "kv_inject": len(kv_params),
+        "sft_alpha": len(alpha_params),
+        "semantic_cross_attn": len(semantic_attn_params),
+        "semantic_alpha": len(semantic_alpha_params),
+        "local_fid_block": len(local_fid_block_params),
+        "local_fid_alpha": len(local_fid_alpha_params),
+        "sem_adapter_resampler": len(sem_adapter_resampler_params),
+        "sem_adapter_proj": len(sem_adapter_proj_params),
         "final_head": len(final_head_params),
         "adapter": len(adapter_params),
     }
@@ -1362,8 +1393,7 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.sft_layers.2.scale_conv1.weight", pix_named.get("sft_layers.2.scale_conv1.weight", None)),
-        ("pixart.kv_inject.8.k_proj.weight", pix_named.get("kv_inject.8.k_proj.weight", None)),
-        ("pixart.kv_inject.8.gamma", pix_named.get("kv_inject.8.gamma", None)),
+        ("pixart.sft_alpha.2", pix_named.get("sft_alpha.2", None)),
         ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
         ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
         ("adapter.to32.1.weight", ad_named.get("to32.1.weight", None)),
@@ -1414,6 +1444,7 @@ def save_smart(
     global_step,
     pixart,
     adapter,
+    sem_adapter,
     optimizer,
     best_records,
     metrics,
@@ -1499,13 +1530,22 @@ def save_smart(
             print(f"✅ LoRA save check: {lora_key_count} tensors")
         print("✅ active save check:", ", ".join([f"{k}={v}" for k, v in active_key_counts.items()]))
 
+        adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
+        sem_adapter_sd = {k: v.detach().float().cpu() for k, v in sem_adapter.state_dict().items()}
+        adapter_token_head_counts = {
+            "adapter.to32": int(sum(1 for k in adapter_sd.keys() if k.startswith("to32."))),
+        }
+        print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
+
         pixart_keep_sd = collect_state_dict_by_keys(pixart, keep_keys)
         state = {
             "epoch": epoch,
             "step": global_step,
             "lora_rank": int(LORA_RANK),
             "lora_alpha": float(LORA_ALPHA),
-            "adapter": {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()},
+            "adapter": adapter_sd,
+            "sem_adapter": sem_adapter_sd,
+            "adapter_token_head_counts": adapter_token_head_counts,
             "optimizer": optimizer.state_dict(),
             "rng_state": {
                 "torch": torch.get_rng_state(),
@@ -1528,11 +1568,10 @@ def save_smart(
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
             "best_eval_tag": str(eval_tag),
             "train_runtime_log": dict(LAST_TRAIN_LOG),
-            "injection_config": {
-                "hard_layers": sorted(list(getattr(pixart, "hard_injection_layers", HARD_INJECTION_LAYERS))),
-                "detail_layers": list(getattr(pixart, "detail_injection_layers", DETAIL_INJECTION_LAYERS)),
-                "injection_layer_to_level": dict(getattr(pixart, "injection_layer_to_level", {})),
-                "ref_token_hw": int(getattr(adapter, "ref_token_hw", 32)),
+            "layer_config": {
+                "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
+                "semantic_layers": list(getattr(pixart, "semantic_layers", SEMANTIC_LAYERS)),
+                "local_fidelity_layers": list(getattr(pixart, "local_fidelity_layers", LOCAL_FIDELITY_LAYERS)),
             },
         }
         return state
@@ -1658,9 +1697,9 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
     return True
 
 
-def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
+def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH):
-        return 0, 0, [], None, False, None, -1.0
+        return 0, 0, [], None, -1.0
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
     ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
     ckpt_role = str(ckpt.get("checkpoint_role", "last"))
@@ -1680,6 +1719,17 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
         adapter.load_state_dict(adapter_sd, strict=True)
     except RuntimeError as e:
         raise RuntimeError(f"Adapter strict load failed during resume: {e}") from e
+    sem_adapter_sd = ckpt.get("sem_adapter", ckpt.get("sem_prompt", None))
+    if isinstance(sem_adapter_sd, dict):
+        missing, unexpected = sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
+        if len(missing) > 0 or len(unexpected) > 0:
+            msg = f"sem_adapter resume non-strict load: missing={len(missing)} unexpected={len(unexpected)}"
+            if ALLOW_SEM_ADAPTER_NONSTRICT_RESUME:
+                print(f"⚠️ {msg}")
+            else:
+                raise RuntimeError(msg)
+    else:
+        print("ℹ️ sem_adapter state not found in checkpoint; continue with fresh semantic prompt branch.")
 
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="resume")
     try:
@@ -1718,10 +1768,10 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
 
 # ================= 9. Validation =================
 @torch.no_grad()
-def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
+def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, hard_prompt_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
     tag = str(val_tag).lower()
     print(f"🔎 Validating Epoch {epoch+1} [{tag}]...")
-    pixart.eval(); adapter.eval()
+    pixart.eval(); adapter.eval(); sem_adapter.eval()
     results = {}
     val_gen = torch.Generator(device=DEVICE); val_gen.manual_seed(SEED)
     
@@ -1746,8 +1796,13 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         flat_psnrs, flat_ssims, flat_lpipss = [], [], []
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
-        cond_deltas, alpha_means, alpha_stds, gate_means, gate_stds = [], [], [], [], []
-        sft_scale_means, sft_scale_stds, sft_shift_means, sft_shift_stds = [], [], [], []
+        cond_deltas = []
+        adapter_map_stds = []
+        guide_map_stds = []
+        sem_tok_stds, sem_out_stds, sem_alphas, sem_gates = [], [], [], []
+        sem_pre_stds, sem_post_stds, sem_out_scales = [], [], []
+        local_res_stds, local_alphas, local_gates = [], [], []
+        sft_tau_means, sft_alpha_means = [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
@@ -1766,37 +1821,45 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     cond = adapter(lr_small, t_embed=t_embed)
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                    if FORCE_DROP_TEXT: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.ones(latents.shape[0], device=DEVICE)
-                    else: drop_uncond = torch.ones(latents.shape[0], device=DEVICE); drop_cond = torch.zeros(latents.shape[0], device=DEVICE)
+                    drop_uncond = torch.ones(latents.shape[0], device=DEVICE, dtype=torch.long)
+                    drop_cond = torch.zeros(latents.shape[0], device=DEVICE, dtype=torch.long)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_embed, aug_level=aug_level, mask=None, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
+                    lr_01_for_semantics = ((batch["lr"].to(DEVICE, dtype=COMPUTE_DTYPE)) + 1.0) * 0.5
+                    sem_tokens = sem_adapter(lr_01_for_semantics)
+                    sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
+                    if USE_FIXED_HARD_PROMPT and hard_prompt_pack is not None:
+                        y_cond = hard_prompt_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                        y_mask_cond = hard_prompt_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                    else:
+                        y_cond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                        y_mask_cond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                    y_uncond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                    y_mask_uncond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond_zero, semantic_tokens=None, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_cond, aug_level=aug_level, mask=y_mask_cond, data_info=data_info, adapter_cond=cond, semantic_tokens=sem_tokens, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
+                    adapter_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
+                    if "guide_map" in cond:
+                        guide_map_stds.append(float(cond["guide_map"].detach().float().std().item()))
+                    sem_tok_stds.append(float(sem_tokens.detach().float().std().item()))
+                    sem_pre_stds.append(float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)))
+                    sem_post_stds.append(float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0)))
+                    sem_out_scales.append(float(sem_adapter_stats.get("sem_out_scale", 1.0)))
+                    sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
+                    sem_out_stds.append(float(sem_stats.get("semantic_out_std", 0.0)))
+                    sem_alphas.append(float(sem_stats.get("semantic_alpha", 0.0)))
+                    sem_gates.append(float(sem_stats.get("semantic_gate_mean", 0.0)))
+                    local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
+                    local_res_stds.append(float(local_stats.get("local_res_std", 0.0)))
+                    local_alphas.append(float(local_stats.get("local_alpha", 0.0)))
+                    local_gates.append(float(local_stats.get("local_gate_mean", 0.0)))
 
-                    a = getattr(pixart, "_last_adapter_alpha", None)
-                    if torch.is_tensor(a):
-                        a = a.detach().float().reshape(a.shape[0], -1)
-                        alpha_means.append(float(a.mean().item()))
-                        alpha_stds.append(float(a.std(unbiased=False).item()) if a.numel() > 1 else 0.0)
-                    elif isinstance(a, dict):
-                        vals = [float(v) for v in a.values()]
-                        if len(vals) > 0:
-                            alpha_means.append(float(np.mean(vals)))
-                            alpha_stds.append(float(np.std(vals)))
-
-                    gm, gs = _extract_adapter_cond_stats(cond)
-                    gate_means.append(gm)
-                    gate_stds.append(gs)
-
-                    sft_stats = getattr(pixart, "_last_sft_stats", None)
-                    if isinstance(sft_stats, dict):
-                        sft_scale_means.append(float(sft_stats.get("sft_scale_mean", 0.0)))
-                        sft_scale_stds.append(float(sft_stats.get("sft_scale_std", 0.0)))
-                        sft_shift_means.append(float(sft_stats.get("sft_shift_mean", 0.0)))
-                        sft_shift_stds.append(float(sft_stats.get("sft_shift_std", 0.0)))
+                    sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
+                    sft_tau_means.append(float(sft_stats.get("tau_mean", 0.0)))
+                    sft_alpha_means.append(float(sft_stats.get("alpha_mean", 0.0)))
 
                     if CFG_SCALE == 1.0:
                         out = out_cond
@@ -1839,24 +1902,29 @@ def validate(epoch, pixart, adapter, vae, val_loader, y_embed, data_info, lpips_
         res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
         results[int(steps)] = res
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
-        am = float(np.mean(alpha_means)) if len(alpha_means) > 0 else 0.0
-        ast = float(np.mean(alpha_stds)) if len(alpha_stds) > 0 else 0.0
-        gm = float(np.mean(gate_means)) if len(gate_means) > 0 else 0.0
-        gs = float(np.mean(gate_stds)) if len(gate_stds) > 0 else 0.0
-        sft_sm = float(np.mean(sft_scale_means)) if len(sft_scale_means) > 0 else 0.0
-        sft_ss = float(np.mean(sft_scale_stds)) if len(sft_scale_stds) > 0 else 0.0
-        sft_shm = float(np.mean(sft_shift_means)) if len(sft_shift_means) > 0 else 0.0
-        sft_shs = float(np.mean(sft_shift_stds)) if len(sft_shift_stds) > 0 else 0.0
+        adapter_map_std = float(np.mean(adapter_map_stds)) if len(adapter_map_stds) > 0 else 0.0
+        guide_map_std = float(np.mean(guide_map_stds)) if len(guide_map_stds) > 0 else 0.0
+        sem_tok_std = float(np.mean(sem_tok_stds)) if len(sem_tok_stds) > 0 else 0.0
+        sem_pre_std = float(np.mean(sem_pre_stds)) if len(sem_pre_stds) > 0 else 0.0
+        sem_post_std = float(np.mean(sem_post_stds)) if len(sem_post_stds) > 0 else 0.0
+        sem_out_scale = float(np.mean(sem_out_scales)) if len(sem_out_scales) > 0 else 1.0
+        sem_out_std = float(np.mean(sem_out_stds)) if len(sem_out_stds) > 0 else 0.0
+        sem_alpha = float(np.mean(sem_alphas)) if len(sem_alphas) > 0 else 0.0
+        sem_gate = float(np.mean(sem_gates)) if len(sem_gates) > 0 else 0.0
+        local_res_std = float(np.mean(local_res_stds)) if len(local_res_stds) > 0 else 0.0
+        local_alpha = float(np.mean(local_alphas)) if len(local_alphas) > 0 else 0.0
+        local_gate = float(np.mean(local_gates)) if len(local_gates) > 0 else 0.0
+        sft_tau_mean = float(np.mean(sft_tau_means)) if len(sft_tau_means) > 0 else 0.0
+        sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | α={am:.4f}±{ast:.4f} | gate={gm:.4f}±{gs:.4f} | "
-            f"sft_scale_mean={sft_sm:.4f} | sft_scale_std={sft_ss:.4f} | "
-            f"sft_shift_mean={sft_shm:.4f} | sft_shift_std={sft_shs:.4f} | "
+            f"CONDΔ={cdelta:.5f} | ad_map_std={adapter_map_std:.4f} | guide_map_std={guide_map_std:.4f} | sem_tok_std={sem_tok_std:.4f} | sem_pre_std={sem_pre_std:.4f} | sem_post_std={sem_post_std:.4f} | sem_out_scale={sem_out_scale:.4f} | sem_out_std={sem_out_std:.4f} | sem_alpha={sem_alpha:.4f} | sem_gate={sem_gate:.4f} | local_res_std={local_res_std:.4f} | local_alpha={local_alpha:.4f} | local_gate={local_gate:.4f} | sem_K={16} | "
+            f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
         print(msg)
-    pixart.train(); adapter.train()
+    pixart.train(); adapter.train(); sem_adapter.train()
     return results
 
 # ================= 10. Main =================
@@ -1867,6 +1935,8 @@ def main():
     validate_s2d_decoupling()
     print(f"[CUDA Allocator] PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')}")
     required_paths = [PIXART_PATH, VAE_PATH, NULL_T5_EMBED_PATH]
+    if USE_FIXED_HARD_PROMPT:
+        required_paths.append(HARD_PROMPT_EMBED_PATH)
     for pth in required_paths:
         if not os.path.exists(pth):
             raise FileNotFoundError(f"Required pretrained path missing: {pth}")
@@ -1896,18 +1966,12 @@ def main():
         "kv_compress_layer": list(KV_COMPRESS_LAYERS),
     } if KV_COMPRESS_ENABLE else None
 
-    inj_cfg = load_resume_injection_config({
-        "hard_layers": list(HARD_INJECTION_LAYERS),
-        "detail_layers": list(DETAIL_INJECTION_LAYERS),
-        "injection_layer_to_level": dict(DEFAULT_INJECTION_LAYER_TO_LEVEL),
-        "ref_token_hw": 32,
-    })
-
     pixart = PixArtSigmaSR_XL_2(
         input_size=64, in_channels=4, out_channels=4,
-        hard_injection_layers=list(inj_cfg["hard_layers"]),
-        detail_injection_layers=list(inj_cfg["detail_layers"]),
-        injection_layer_to_level=dict(inj_cfg.get("injection_layer_to_level", DEFAULT_INJECTION_LAYER_TO_LEVEL)),
+        force_null_caption=False,
+        anchor_layers=list(ANCHOR_LAYERS),
+        semantic_layers=list(SEMANTIC_LAYERS),
+        local_fidelity_layers=list(LOCAL_FIDELITY_LAYERS),
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
     set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
@@ -1933,6 +1997,15 @@ def main():
         in_channels=3,
         hidden_size=1152,
     ).to(DEVICE).train()
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=SEMANTIC_ENCODER_NAME_OR_PATH,
+        hidden_size=1152,
+        num_prompt_tokens=16,
+        clip_input_res=224,
+    ).to(DEVICE).train()
+    sem_adapter.image_encoder.eval()
+    for p in sem_adapter.image_encoder.parameters():
+        p.requires_grad_(False)
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
     vae = AutoencoderKL.from_pretrained(VAE_PATH, local_files_only=True).to(DEVICE).float().eval()
@@ -1949,12 +2022,19 @@ def main():
     if not os.path.exists(NULL_T5_EMBED_PATH):
         raise FileNotFoundError(f"Null T5 embed not found: {NULL_T5_EMBED_PATH}")
     null_pack = torch.load(NULL_T5_EMBED_PATH, map_location="cpu")
-    if "y" not in null_pack:
+    if ("y" not in null_pack) or ("mask" not in null_pack):
         raise KeyError(f"Invalid null T5 embed file (missing key 'y'): {NULL_T5_EMBED_PATH}")
-    y = null_pack["y"].to(DEVICE)
-    if y.ndim != 4:
-        raise RuntimeError(f"Invalid y shape from offline null T5 embed: {tuple(y.shape)} (expected [1,1,L,C])")
-    print(f"✅ Loaded offline null T5 embedding: y.shape={tuple(y.shape)}")
+    y_null = null_pack["y"].to(DEVICE)
+    mask_null = null_pack["mask"].to(DEVICE)
+    if y_null.ndim != 4:
+        raise RuntimeError(f"Invalid y shape from offline null T5 embed: {tuple(y_null.shape)} (expected [1,1,L,C])")
+    print(f"✅ Loaded offline null T5 embedding: y.shape={tuple(y_null.shape)}")
+    hard_prompt_pack = None
+    if USE_FIXED_HARD_PROMPT:
+        hard_prompt_pack = torch.load(HARD_PROMPT_EMBED_PATH, map_location="cpu")
+        if ("y" not in hard_prompt_pack) or ("mask" not in hard_prompt_pack):
+            raise KeyError(f"Invalid hard prompt embed file (missing key 'y' or 'mask'): {HARD_PROMPT_EMBED_PATH}")
+        print(f"✅ Loaded fixed hard prompt embedding: y.shape={tuple(hard_prompt_pack['y'].shape)}")
 
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
@@ -1986,9 +2066,14 @@ def main():
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     for p in adapter.parameters():
         p.requires_grad_(True)
+    for n, p in sem_adapter.named_parameters():
+        if ("resampler" in n) or ("proj_norm" in n) or ("proj." in n):
+            p.requires_grad_(True)
+        else:
+            p.requires_grad_(False)
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
-    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
+    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter, sem_adapter)
     print(f"✅ Optim groups(single-stage): {group_counts}")
     _maybe_empty_cuda_cache()
 
@@ -1996,7 +2081,7 @@ def main():
         ep_start, step, best, last_val_psnr = 0, 0, [], -1.0
     else:
         ep_start, step, best, _, last_val_psnr = resume(
-            pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params
+            pixart, adapter, sem_adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params
         )
     if ema is not None:
         ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
@@ -2040,15 +2125,76 @@ def main():
                 cond_in = mask_adapter_cond(cond, keep)
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                drop_uncond = torch.ones(zt.shape[0], device=DEVICE)
+                lr_01_for_semantics = (lr.to(COMPUTE_DTYPE) + 1.0) * 0.5
+                sem_tokens = sem_adapter(lr_01_for_semantics)
+                sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
+                if USE_FIXED_HARD_PROMPT:
+                    y_cond = hard_prompt_pack["y"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
+                    y_mask = hard_prompt_pack["mask"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
+                else:
+                    y_cond = y_null.repeat(zt.shape[0], 1, 1, 1)
+                    y_mask = mask_null.repeat(zt.shape[0], 1, 1, 1)
+                drop_cond = torch.zeros(zt.shape[0], device=DEVICE, dtype=torch.long)
                 sft_strength = get_sft_strength(epoch + 1)
-                kwargs = dict(x=zt, timestep=t, y=y, aug_level=aug_level_emb, data_info=d_info, adapter_cond=cond_in, sft_strength=sft_strength)
-                kwargs["force_drop_ids"] = drop_uncond
+                kwargs = dict(
+                    x=zt,
+                    timestep=t,
+                    y=y_cond,
+                    aug_level=aug_level_emb,
+                    mask=y_mask,
+                    data_info=d_info,
+                    adapter_cond=cond_in,
+                    semantic_tokens=sem_tokens,
+                    sft_strength=sft_strength,
+                )
+                kwargs["force_drop_ids"] = drop_cond
 
                 out = pixart(**kwargs)
                 if out.shape[1] != 4:
                     raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
                 model_pred = out.float()
+                sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
+                local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
+                guard_stats = {
+                    "sem_tok_std": float(sem_tokens.detach().float().std().item()),
+                    "sem_pre_std": float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)),
+                    "sem_post_std": float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0)),
+                    "sem_out_scale": float(sem_adapter_stats.get("sem_out_scale", 1.0)),
+                    "semantic_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
+                    "semantic_alpha": float(sem_stats.get("semantic_alpha", 0.0)),
+                    "semantic_gate_mean": float(sem_stats.get("semantic_gate_mean", 0.0)),
+                    "local_res_std": float(local_stats.get("local_res_std", 0.0)),
+                    "local_alpha": float(local_stats.get("local_alpha", 0.0)),
+                    "local_gate_mean": float(local_stats.get("local_gate_mean", 0.0)),
+                    "ad_map_std": float(cond_in["cond_map"].detach().float().std().item()),
+                    "guide_map_std": float(cond_in.get("guide_map", cond_in["cond_map"]).detach().float().std().item()),
+                    "sft_strength": float(sft_strength),
+                    "t_min": int(t.min().item()),
+                    "t_max": int(t.max().item()),
+                    "t_mean": float(t.float().mean().item()),
+                }
+                assert_finite_tensor("sem_tokens", sem_tokens, guard_stats)
+                assert_finite_tensor("cond_map", cond_in["cond_map"], guard_stats)
+                assert_finite_tensor("model_pred", model_pred, guard_stats)
+                drop_uncond_guard = torch.ones(zt.shape[0], device=DEVICE, dtype=torch.long)
+                cond_zero_guard = mask_adapter_cond(cond_in, torch.zeros((zt.shape[0],), device=DEVICE))
+                y_uncond_guard = null_pack["y"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
+                y_mask_uncond_guard = null_pack["mask"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
+                with torch.no_grad():
+                    out_uncond_guard = pixart(
+                        x=zt.detach(),
+                        timestep=t,
+                        y=y_uncond_guard,
+                        aug_level=aug_level_emb,
+                        mask=y_mask_uncond_guard,
+                        data_info=d_info,
+                        adapter_cond=cond_zero_guard,
+                        semantic_tokens=None,
+                        force_drop_ids=drop_uncond_guard,
+                        sft_strength=sft_strength,
+                    ).float()
+                assert_finite_tensor("out_uncond", out_uncond_guard, guard_stats)
+                cond_delta_curr = float((model_pred.detach() - out_uncond_guard).abs().mean().item())
 
                 # [V8 Logic] Calculate V-Target
                 # v = alpha * epsilon - sigma * x0
@@ -2081,10 +2227,12 @@ def main():
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
                 loss_gw = torch.tensor(0.0, device=DEVICE)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
+                lpips_num_samples = 0
 
                 need_patch_loss = (
-                    (w.get('lr_cons', 0.0) > 0) or
-                    (w.get('gw', 0.0) > 0)
+                    (w.get('lr_cons', 0.0) > 0)
+                    or (w.get('gw', 0.0) > 0)
+                    or (w.get('lpips', 0.0) > 0)
                 )
 
                 patch_t_mask = (t >= int(PIXEL_LOSS_T_MIN))
@@ -2109,6 +2257,7 @@ def main():
                         lpips_t_mask = (t.index_select(0, active_idx) <= int(LPIPS_T_MAX))
                         if float(lpips_t_mask.sum().item()) > 0:
                             lp_idx = torch.nonzero(lpips_t_mask, as_tuple=False).squeeze(1)
+                            lpips_num_samples = int(lp_idx.numel())
                             loss_lpips = perceptual_lpips_loss(
                                 lpips_fn_train,
                                 img_p_valid.index_select(0, lp_idx),
@@ -2127,6 +2276,7 @@ def main():
                     + w.get('lpips', 0.0) * loss_lpips
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
+                assert_finite_tensor("loss", loss, guard_stats)
 
             loss.backward()
             accum_micro_steps += 1
@@ -2142,25 +2292,35 @@ def main():
                 accum_micro_steps = 0
 
             if i % 10 == 0:
-                a = getattr(pixart, "_last_adapter_alpha", None)
-                if torch.is_tensor(a):
-                    alpha_mean = float(a.detach().float().mean().item())
-                elif isinstance(a, dict) and len(a) > 0:
-                    alpha_mean = float(np.mean([float(v) for v in a.values()]))
-                else:
-                    alpha_mean = 0.0
-                gate_mean, _ = _extract_adapter_cond_stats(cond_in)
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
-                kv_stats = getattr(pixart, "_last_kv_stats", {}) or {}
-                kv_gamma_mean = float(kv_stats.get("gamma_mean", 0.0))
-                kv_gamma_min = float(kv_stats.get("gamma_min", 0.0))
-                kv_gamma_max = float(kv_stats.get("gamma_max", 0.0))
+                tau_mean = float(sft_stats.get("tau_mean", 0.0))
+                alpha_mean_sft = float(sft_stats.get("alpha_mean", 0.0))
+                alpha_min = float(sft_stats.get("alpha_min", 0.0))
+                alpha_max = float(sft_stats.get("alpha_max", 0.0))
+                sft_strength_logged = float(sft_stats.get("sft_strength", sft_strength))
+                sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
+                local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
+                sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
+                sem_tok_std = float(sem_tokens.detach().float().std().item())
+                sem_pre_std = float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0))
+                sem_post_std = float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0))
+                sem_out_scale = float(sem_adapter_stats.get("sem_out_scale", 1.0))
+                sem_out_std = float(sem_stats.get("semantic_out_std", 0.0))
+                sem_alpha = float(sem_stats.get("semantic_alpha", 0.0))
+                sem_gate = float(sem_stats.get("semantic_gate_mean", 0.0))
+                local_res_std = float(local_stats.get("local_res_std", 0.0))
+                local_alpha = float(local_stats.get("local_alpha", 0.0))
+                local_gate = float(local_stats.get("local_gate_mean", 0.0))
+                adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
+                guide_map_std = float(cond_in.get("guide_map", cond_in["cond_map"]).detach().float().std().item())
+                cond_delta = float(cond_delta_curr)
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
                     'l1_tmin': f"{LATENT_L1_T_MIN}",
                     'gw': f"{loss_gw.item():.3f}",
                     'lp': f"{loss_lpips.item():.3f}",
+                    'lp_n': f"{lpips_num_samples}",
                     'w_lat': f"{w.get('latent_l1', 0.0):.3f}",
                     'w_gw': f"{w.get('gw', 0.0):.3f}",
                     'ireg': f"{inject_reg.item():.4f}",
@@ -2169,31 +2329,51 @@ def main():
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'lp_w': f"{w.get('lpips', 0.0):.3f}",
-                    'sft_s': f"{sft_strength:.3f}",
+                    'sft_s': f"{sft_strength_logged:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
-                    'tau': f"{float(sft_stats.get('tau_mean', 0.0)):.3f}",
-                    'kv_g': f"{kv_gamma_mean:.4f}",
-                    'alpha': f"{alpha_mean:.3f}",
-                    'gate': f"{gate_mean:.3f}",
+                    'sft_tau': f"{tau_mean:.3f}",
+                    'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
+                    'sem_tok_std': f"{sem_tok_std:.4f}",
+                    'sem_pre_std': f"{sem_pre_std:.4f}",
+                    'sem_post_std': f"{sem_post_std:.4f}",
+                    'sem_out_scale': f"{sem_out_scale:.4f}",
+                    'sem_out_std': f"{sem_out_std:.4f}",
+                    'sem_alpha': f"{sem_alpha:.4f}",
+                    'sem_gate': f"{sem_gate:.4f}",
+                    'local_res_std': f"{local_res_std:.4f}",
+                    'local_alpha': f"{local_alpha:.4f}",
+                    'local_gate': f"{local_gate:.4f}",
+                    'cond_delta': f"{cond_delta:.5f}",
+                    'sem_K': f"{16}",
+                    'ad_map_std': f"{adapter_map_std:.4f}",
+                    'guide_map_std': f"{guide_map_std:.4f}",
                 }
-                if getattr(pixart, "_last_sft_stats", None) is not None:
-                    log_dict["tau_min"] = f"{float(sft_stats.get('tau_min', 0.0)):.3f}"
-                    log_dict["tau_max"] = f"{float(sft_stats.get('tau_max', 0.0)):.3f}"
-                log_dict["kv_gmin"] = f"{kv_gamma_min:.4f}"
-                log_dict["kv_gmax"] = f"{kv_gamma_max:.4f}"
-                log_dict["sft_strength"] = f"{sft_strength:.3f}"
+                log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
-                    "sft_strength": float(sft_strength),
+                    "sft_strength": float(sft_strength_logged),
                     "lpips_train_weight": float(w.get('lpips', 0.0)),
+                    "lpips_num_samples": int(lpips_num_samples),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
-                    "tau_mean": float(sft_stats.get("tau_mean", 0.0)),
-                    "tau_min": float(sft_stats.get("tau_min", 0.0)),
-                    "tau_max": float(sft_stats.get("tau_max", 0.0)),
-                    "kv_gamma_mean": kv_gamma_mean,
-                    "kv_gamma_min": kv_gamma_min,
-                    "kv_gamma_max": kv_gamma_max,
+                    "tau_mean": tau_mean,
+                    "alpha_mean": alpha_mean_sft,
+                    "alpha_min": alpha_min,
+                    "alpha_max": alpha_max,
+                    "sem_tok_std": sem_tok_std,
+                    "sem_pre_std": sem_pre_std,
+                    "sem_post_std": sem_post_std,
+                    "sem_out_scale": sem_out_scale,
+                    "sem_out_std": sem_out_std,
+                    "sem_alpha": sem_alpha,
+                    "sem_gate": sem_gate,
+                    "local_res_std": local_res_std,
+                    "local_alpha": local_alpha,
+                    "local_gate": local_gate,
+                    "cond_delta": cond_delta,
+                    "sem_K": 16,
+                    "adapter_map_std": adapter_map_std,
+                    "guide_map_std": guide_map_std,
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
@@ -2209,7 +2389,7 @@ def main():
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
         validation_count += 1
         print(f"🔎 [VAL] Raw weights (validation #{validation_count})")
-        val_raw = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu, val_tag="raw")
+        val_raw = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, hard_prompt_pack, d_info, lpips_fn_val_cpu, val_tag="raw")
 
         run_ema_val = (
             (ema is not None)
@@ -2221,7 +2401,7 @@ def main():
         if run_ema_val:
             print(f"🔎 [VAL] EMA weights (validation #{validation_count})")
             ema.apply(ema_named_params)
-            val_ema = validate(epoch, pixart, adapter, vae, val_loader, y, d_info, lpips_fn_val_cpu, val_tag="ema")
+            val_ema = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, hard_prompt_pack, d_info, lpips_fn_val_cpu, val_tag="ema")
             ema.restore(ema_named_params)
 
         raw_metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
@@ -2253,6 +2433,7 @@ def main():
             step,
             pixart,
             adapter,
+            sem_adapter,
             optimizer,
             best,
             best_eval_metrics_this_round,

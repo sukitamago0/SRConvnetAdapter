@@ -17,6 +17,7 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 
 
 def randn_like_with_generator(tensor, generator):
@@ -151,19 +152,18 @@ def run(args):
     compute_dtype = torch.bfloat16 if (device == "cuda") else torch.float32
 
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
-    inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
-    hard_layers = list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12]))
-    detail_layers = list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24]))
-    injection_layer_to_level = dict(inj_cfg.get("injection_layer_to_level", {}))
-    ref_token_hw = int(inj_cfg.get("ref_token_hw", 32))
+    layer_cfg = ckpt.get("layer_config", {}) if isinstance(ckpt, dict) else {}
+    anchor_layers = list(layer_cfg.get("anchor_layers", [2, 4, 6, 8]))
+    semantic_layers = list(layer_cfg.get("semantic_layers", [18, 22, 24, 26]))
+    local_fidelity_layers = list(layer_cfg.get("local_fidelity_layers", [22, 26]))
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
-        hard_injection_layers=hard_layers,
-        detail_injection_layers=detail_layers,
-        injection_layer_to_level=injection_layer_to_level,
+        anchor_layers=anchor_layers,
+        semantic_layers=semantic_layers,
+        local_fidelity_layers=local_fidelity_layers,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -180,6 +180,11 @@ def run(args):
         in_channels=3,
         hidden_size=1152,
     ).to(device).float()
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=args.semantic_encoder_name_or_path,
+        hidden_size=1152,
+        num_prompt_tokens=16,
+    ).to(device).eval()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
 
@@ -197,12 +202,15 @@ def run(args):
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
+    sem_adapter_sd = ckpt.get("sem_adapter", ckpt.get("sem_prompt", None))
+    if isinstance(sem_adapter_sd, dict):
+        sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
 
     null_pack = torch.load(args.null_t5_embed_path, map_location="cpu")
-    y = null_pack["y"].to(device)
+    hard_prompt_pack = torch.load(args.hard_prompt_embed_path, map_location="cpu")
     data_info = {
         "img_hw": torch.tensor([[512.0, 512.0]], device=device),
         "aspect_ratio": torch.tensor([1.0], device=device),
@@ -210,6 +218,7 @@ def run(args):
 
     pixart.eval()
     adapter.eval()
+    sem_adapter.eval()
 
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
@@ -247,25 +256,32 @@ def run(args):
         run_timesteps = scheduler.timesteps
 
     adapter_in = build_adapter_struct_input(lr_small).to(device=device, dtype=torch.float32)
+    lr_01_for_sem = (lr.to(compute_dtype) + 1.0) * 0.5
     aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
 
     for t in run_timesteps:
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         cond = adapter(adapter_in, t_embed=t_embed.float())
+        sem_tokens = sem_adapter(lr_01_for_sem)
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
-            drop_uncond = torch.ones(latents.shape[0], device=device)
-            drop_cond = torch.ones(latents.shape[0], device=device)
+            drop_uncond = torch.ones(latents.shape[0], device=device, dtype=torch.long)
+            drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
             model_in = latents.to(compute_dtype)
+            y_cond = hard_prompt_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            mask_cond = hard_prompt_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            y_uncond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            mask_uncond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             if args.cfg_scale == 1.0:
                 out = pixart(
                     x=model_in,
                     timestep=t_b,
-                    y=y,
+                    y=y_cond,
                     aug_level=aug_level,
-                    mask=None,
+                    mask=mask_cond,
                     data_info=data_info,
                     adapter_cond=cond,
+                    semantic_tokens=sem_tokens,
                     force_drop_ids=drop_cond,
                     sft_strength=args.sft_strength,
                 )
@@ -274,22 +290,24 @@ def run(args):
                 out_uncond = pixart(
                     x=model_in,
                     timestep=t_b,
-                    y=y,
+                    y=y_uncond,
                     aug_level=aug_level,
-                    mask=None,
+                    mask=mask_uncond,
                     data_info=data_info,
                     adapter_cond=cond_zero,
+                    semantic_tokens=None,
                     force_drop_ids=drop_uncond,
                     sft_strength=args.sft_strength,
                 )
                 out_cond = pixart(
                     x=model_in,
                     timestep=t_b,
-                    y=y,
+                    y=y_cond,
                     aug_level=aug_level,
-                    mask=None,
+                    mask=mask_cond,
                     data_info=data_info,
                     adapter_cond=cond,
+                    semantic_tokens=sem_tokens,
                     force_drop_ids=drop_cond,
                     sft_strength=args.sft_strength,
                 )
@@ -317,6 +335,8 @@ def parse_args():
     parser.add_argument("--pixart-path", type=str, required=True)
     parser.add_argument("--vae-path", type=str, required=True)
     parser.add_argument("--null-t5-embed-path", type=str, required=True)
+    parser.add_argument("--hard-prompt-embed-path", type=str, required=True)
+    parser.add_argument("--semantic-encoder-name-or-path", type=str, default="openai/clip-vit-large-patch14")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--crop-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=3407)

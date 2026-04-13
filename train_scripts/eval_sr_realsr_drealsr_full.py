@@ -25,11 +25,10 @@ from tqdm import tqdm
 
 import lpips
 from diffusers import AutoencoderKL, DDIMScheduler
-from torchmetrics.functional import peak_signal_noise_ratio as psnr
-from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 
 
 
@@ -85,6 +84,53 @@ def build_component_masks_from_hr(hr_m11: torch.Tensor, corner_q: float = 0.95, 
 def rgb01_to_y01(rgb01):
     r, g, b = rgb01[:, 0:1], rgb01[:, 1:2], rgb01[:, 2:3]
     return (16.0 + 65.481 * r + 128.553 * g + 24.966 * b) / 255.0
+
+
+def reorder_to_y_and_shave(pred01: torch.Tensor, hr01: torch.Tensor, crop_border: int = 4):
+    py = rgb01_to_y01(pred01).clamp(0.0, 1.0)
+    hy = rgb01_to_y01(hr01).clamp(0.0, 1.0)
+    if crop_border > 0:
+        py = py[..., crop_border:-crop_border, crop_border:-crop_border]
+        hy = hy[..., crop_border:-crop_border, crop_border:-crop_border]
+    return py, hy
+
+
+def calculate_psnr_y(pred01: torch.Tensor, hr01: torch.Tensor, crop_border: int = 4):
+    py, hy = reorder_to_y_and_shave(pred01, hr01, crop_border=crop_border)
+    mse = torch.mean((py - hy) ** 2)
+    return float((-10.0 * torch.log10(mse.clamp_min(1e-12))).item())
+
+
+def _ssim_per_channel(img1: torch.Tensor, img2: torch.Tensor):
+    c1 = (0.01 ** 2)
+    c2 = (0.03 ** 2)
+    kernel = torch.tensor(
+        [[0.0001, 0.0007, 0.0022, 0.0039, 0.0044, 0.0039, 0.0022, 0.0007, 0.0001],
+         [0.0007, 0.0050, 0.0148, 0.0262, 0.0297, 0.0262, 0.0148, 0.0050, 0.0007],
+         [0.0022, 0.0148, 0.0439, 0.0779, 0.0885, 0.0779, 0.0439, 0.0148, 0.0022],
+         [0.0039, 0.0262, 0.0779, 0.1382, 0.1570, 0.1382, 0.0779, 0.0262, 0.0039],
+         [0.0044, 0.0297, 0.0885, 0.1570, 0.1784, 0.1570, 0.0885, 0.0297, 0.0044],
+         [0.0039, 0.0262, 0.0779, 0.1382, 0.1570, 0.1382, 0.0779, 0.0262, 0.0039],
+         [0.0022, 0.0148, 0.0439, 0.0779, 0.0885, 0.0779, 0.0439, 0.0148, 0.0022],
+         [0.0007, 0.0050, 0.0148, 0.0262, 0.0297, 0.0262, 0.0148, 0.0050, 0.0007],
+         [0.0001, 0.0007, 0.0022, 0.0039, 0.0044, 0.0039, 0.0022, 0.0007, 0.0001]],
+        dtype=img1.dtype, device=img1.device
+    ).view(1, 1, 9, 9)
+    mu1 = F.conv2d(img1, kernel, padding=4)
+    mu2 = F.conv2d(img2, kernel, padding=4)
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = F.conv2d(img1 * img1, kernel, padding=4) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, kernel, padding=4) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, kernel, padding=4) - mu1_mu2
+    ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2) + 1e-12)
+    return ssim_map.mean()
+
+
+def calculate_ssim_y(pred01: torch.Tensor, hr01: torch.Tensor, crop_border: int = 4):
+    py, hy = reorder_to_y_and_shave(pred01, hr01, crop_border=crop_border)
+    return float(_ssim_per_channel(py, hy).item())
 
 
 def randn_like_with_generator(tensor, generator):
@@ -351,13 +397,13 @@ class MetricSuite:
 
         try:
             import pyiqa
-            for name in ["maniqa", "musiq", "clipiqa"]:
+            for name in ["maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign"]:
                 try:
                     self.iqa[name] = pyiqa.create_metric(name, device="cpu")
                 except Exception as e_metric:
                     print(f"⚠️ pyiqa metric '{name}' unavailable, will output NaN: {e_metric}")
         except Exception as e:
-            print(f"⚠️ pyiqa unavailable, MANIQA/MUSIQ/CLIPIQA will output NaN: {e}")
+            print(f"⚠️ pyiqa unavailable, no-reference IQA metrics will output NaN: {e}")
 
     @torch.no_grad()
     def compute(self, pred_m11: torch.Tensor, hr_m11: torch.Tensor):
@@ -366,17 +412,17 @@ class MetricSuite:
         pred01 = (pred_cpu + 1.0) / 2.0
         hr01 = (hr_cpu + 1.0) / 2.0
 
-        py = rgb01_to_y01(pred01)[..., 4:-4, 4:-4]
-        hy = rgb01_to_y01(hr01)[..., 4:-4, 4:-4]
-
         out = {
-            "psnr": float(psnr(py, hy, data_range=1.0).item()),
-            "ssim": float(ssim(py, hy, data_range=1.0).item()),
+            "psnr": calculate_psnr_y(pred01, hr01, crop_border=4),
+            "ssim": calculate_ssim_y(pred01, hr01, crop_border=4),
             "lpips": float(self.lpips_fn(pred_cpu, hr_cpu).mean().item()),
             "dists": float("nan"),
             "maniqa": float("nan"),
             "musiq": float("nan"),
             "clipiqa": float("nan"),
+            "liqe": float("nan"),
+            "topiq_nr": float("nan"),
+            "qalign": float("nan"),
         }
 
         if self.dists_fn is not None:
@@ -386,7 +432,7 @@ class MetricSuite:
                 print(f"⚠️ DISTS compute failed, writing NaN: {e}")
 
         pred01_clamp = pred01.clamp(0.0, 1.0)
-        for name in ["maniqa", "musiq", "clipiqa"]:
+        for name in ["maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign"]:
             fn = self.iqa.get(name, None)
             if fn is None:
                 continue
@@ -438,11 +484,9 @@ def build_model_and_assets(args, device, compute_dtype):
     if pixart_state is None:
         raise KeyError("Checkpoint must contain pixart_keep or pixart_trainable")
 
-    inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
-    if not isinstance(inj_cfg, dict):
-        inj_cfg = {}
-    injection_layer_to_level = dict(inj_cfg.get("injection_layer_to_level", {}))
-    ref_token_hw = int(inj_cfg.get("ref_token_hw", 32))
+    layer_cfg = ckpt.get("layer_config", {}) if isinstance(ckpt, dict) else {}
+    if not isinstance(layer_cfg, dict):
+        layer_cfg = {}
 
     cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
 
@@ -450,9 +494,9 @@ def build_model_and_assets(args, device, compute_dtype):
         input_size=64,
         in_channels=4,
         out_channels=4,
-        hard_injection_layers=list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12])),
-        detail_injection_layers=list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24])),
-        injection_layer_to_level=injection_layer_to_level,
+        anchor_layers=list(layer_cfg.get("anchor_layers", [2, 4, 6, 8])),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [18, 22, 24, 26])),
+        local_fidelity_layers=list(layer_cfg.get("local_fidelity_layers", [22, 26])),
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -519,14 +563,28 @@ def build_model_and_assets(args, device, compute_dtype):
         hidden_size=1152,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=args.semantic_encoder_name_or_path,
+        hidden_size=1152,
+        num_prompt_tokens=16,
+    ).to(device).eval()
+    sem_adapter_sd = ckpt.get("sem_adapter", ckpt.get("sem_prompt", None))
+    if isinstance(sem_adapter_sd, dict):
+        missing, unexpected = sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
+        if len(missing) > 0 or len(unexpected) > 0:
+            raise RuntimeError(f"Strict sem_adapter eval load failed: missing={len(missing)} unexpected={len(unexpected)}")
+    else:
+        raise RuntimeError("Checkpoint missing sem_adapter state for strict eval.")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
 
     null_pack = torch.load(args.null_t5_embed_path, map_location="cpu")
-    if "y" not in null_pack:
-        raise KeyError("Null T5 embed file missing key 'y'")
-    y_embed = null_pack["y"].to(device)
+    if ("y" not in null_pack) or ("mask" not in null_pack):
+        raise KeyError("Null T5 embed file missing key 'y' or 'mask'")
+    hard_prompt_pack = torch.load(args.hard_prompt_embed_path, map_location="cpu")
+    if ("y" not in hard_prompt_pack) or ("mask" not in hard_prompt_pack):
+        raise KeyError("Hard prompt embed file missing key 'y' or 'mask'")
 
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
@@ -540,11 +598,12 @@ def build_model_and_assets(args, device, compute_dtype):
 
     pixart.eval()
     adapter.eval()
-    return pixart, adapter, vae, y_embed, scheduler
+    sem_adapter.eval()
+    return pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler
 
 
 @torch.no_grad()
-def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, device, compute_dtype, gen):
+def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, batch, args, device, compute_dtype, gen):
     hr = batch["hr"].to(device)
     lr = batch["lr"].to(device)
     lr_small = batch["lr_small"].to(device)
@@ -572,21 +631,67 @@ def run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, devi
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
-            out = pixart(
-                x=latents.to(compute_dtype),
-                timestep=t_b,
-                y=y_embed,
-                aug_level=aug_level,
-                mask=None,
-                data_info=data_info,
-                adapter_cond=cond,
-                force_drop_ids=torch.ones(latents.shape[0], device=device),
-                sft_strength=args.sft_strength,
-            )
+            sem_tokens = sem_adapter((lr.to(compute_dtype) + 1.0) * 0.5)
+            y_cond = hard_prompt_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            mask_cond = hard_prompt_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            y_uncond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            mask_uncond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
+            drop_uncond = torch.ones(latents.shape[0], device=device, dtype=torch.long)
+            if args.cfg_scale == 1.0:
+                out = pixart(
+                    x=latents.to(compute_dtype),
+                    timestep=t_b,
+                    y=y_cond,
+                    aug_level=aug_level,
+                    mask=mask_cond,
+                    data_info=data_info,
+                    adapter_cond=cond,
+                    semantic_tokens=sem_tokens,
+                    force_drop_ids=drop_cond,
+                    sft_strength=args.sft_strength,
+                )
+            else:
+                cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=device))
+                out_uncond = pixart(
+                    x=latents.to(compute_dtype),
+                    timestep=t_b,
+                    y=y_uncond,
+                    aug_level=aug_level,
+                    mask=mask_uncond,
+                    data_info=data_info,
+                    adapter_cond=cond_zero,
+                    semantic_tokens=None,
+                    force_drop_ids=drop_uncond,
+                    sft_strength=args.sft_strength,
+                )
+                out_cond = pixart(
+                    x=latents.to(compute_dtype),
+                    timestep=t_b,
+                    y=y_cond,
+                    aug_level=aug_level,
+                    mask=mask_cond,
+                    data_info=data_info,
+                    adapter_cond=cond,
+                    semantic_tokens=sem_tokens,
+                    force_drop_ids=drop_cond,
+                    sft_strength=args.sft_strength,
+                )
+                out = out_uncond + args.cfg_scale * (out_cond - out_uncond)
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
     pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
-    return pred, hr, lr
+    sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
+    local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
+    sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
+    debug_stats = {
+        "guide_map_std": float(cond.get("guide_map", cond["cond_map"]).detach().float().std().item()),
+        "local_res_std": float(local_stats.get("local_res_std", 0.0)),
+        "sem_tok_std": float(sem_tokens.detach().float().std().item()),
+        "sem_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
+        "sem_out_scale": float(sem_adapter_stats.get("sem_out_scale", 1.0)),
+    }
+    return pred, hr, lr, debug_stats
 
 
 def tensor_m11_to_pil(x: torch.Tensor):
@@ -628,12 +733,16 @@ def nanmean(xs):
     return float(sum(vals) / len(vals))
 
 
-def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, vae, y_embed, scheduler, device, compute_dtype):
+def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, device, compute_dtype):
     base_out = Path(args.output_dir) / dataset_name
     preds_dir = base_out / "preds"
     trip_dir = base_out / "triptychs"
-    preds_dir.mkdir(parents=True, exist_ok=True)
-    trip_dir.mkdir(parents=True, exist_ok=True)
+    base_out.mkdir(parents=True, exist_ok=True)
+    print(f"[Eval] Writing outputs to: {base_out}")
+    if args.save_preds:
+        preds_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_triptychs:
+        trip_dir.mkdir(parents=True, exist_ok=True)
 
     gen = torch.Generator(device=device)
     gen.manual_seed(int(args.seed))
@@ -644,7 +753,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.max_samples > 0 and idx >= args.max_samples:
             break
 
-        pred, hr, lr = run_ddim_predict(pixart, adapter, vae, y_embed, scheduler, batch, args, device, compute_dtype, gen)
+        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, batch, args, device, compute_dtype, gen)
         m = metric_suite.compute(pred, hr)
         m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
         m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
@@ -660,7 +769,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.save_preds:
             tensor_m11_to_pil(pred[0]).save(pred_path)
 
-        if args.save_triptychs and (idx % 5 == 0):
+        if args.save_triptychs and (not args.paper_only) and (idx % 5 == 0):
             tri_path = trip_dir / f"{idx:04d}_{stem}_steps{args.steps}.png"
             save_triptych(lr, hr, pred, str(tri_path), args.steps)
             comp_path = trip_dir / f"{idx:04d}_{stem}_comp_steps{args.steps}.png"
@@ -679,6 +788,9 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "maniqa": m["maniqa"],
             "musiq": m["musiq"],
             "clipiqa": m["clipiqa"],
+            "liqe": m["liqe"],
+            "topiq_nr": m["topiq_nr"],
+            "qalign": m["qalign"],
             "flat_psnr": m_flat_c["psnr"],
             "flat_ssim": m_flat_c["ssim"],
             "flat_lpips": m_flat_c["lpips"],
@@ -688,6 +800,11 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "corner_psnr": m_corner_c["psnr"],
             "corner_ssim": m_corner_c["ssim"],
             "corner_lpips": m_corner_c["lpips"],
+            "guide_map_std": debug_stats["guide_map_std"],
+            "local_res_std": debug_stats["local_res_std"],
+            "sem_tok_std": debug_stats["sem_tok_std"],
+            "sem_out_std": debug_stats["sem_out_std"],
+            "sem_out_scale": debug_stats["sem_out_scale"],
         }
         rows.append(row)
 
@@ -695,27 +812,52 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "psnr": f"{row['psnr']:.2f}",
             "lpips": f"{row['lpips']:.4f}",
             "c_lp": f"{row['corner_lpips']:.4f}",
+            "guide": f"{row['guide_map_std']:.3f}",
+            "local": f"{row['local_res_std']:.3f}",
         })
 
     csv_path = base_out / "per_image_metrics.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "dataset", "image_name", "hr_path", "lr_path", "pred_path",
-        "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa",
+        "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign",
         "flat_psnr", "flat_ssim", "flat_lpips",
         "edge_psnr", "edge_ssim", "edge_lpips",
-        "corner_psnr", "corner_ssim", "corner_lpips"
+        "corner_psnr", "corner_ssim", "corner_lpips",
+        "guide_map_std", "local_res_std", "sem_tok_std", "sem_out_std", "sem_out_scale",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
+    paper_fieldnames = [
+        "dataset", "image_name",
+        "psnr", "ssim", "lpips", "dists",
+        "maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign"
+    ]
+    paper_csv_path = base_out / "paper_metrics.csv"
+    paper_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(paper_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=paper_fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, float("nan")) for k in paper_fieldnames})
+
+    protocol = {
+        "dataset_crop": "center crop, LR 128x128 / HR 512x512",
+        "psnr_ssim": "Y channel, border shave 4",
+        "lpips": "RGB [-1,1]",
+        "dists": "RGB [0,1]",
+        "nr_iqa": ["MANIQA", "MUSIQ", "CLIPIQA", "LIQE", "TOPIQ_NR", "QALIGN"],
+    }
     summary = {
         "dataset": dataset_name,
         "num_images": len(rows),
         "steps": int(args.steps),
         "use_lq_init": bool(args.use_lq_init),
         "lq_init_strength": float(args.lq_init_strength),
+        "protocol": protocol,
         "mean": {
             "psnr": nanmean([r["psnr"] for r in rows]),
             "ssim": nanmean([r["ssim"] for r in rows]),
@@ -724,6 +866,11 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "maniqa": nanmean([r["maniqa"] for r in rows]),
             "musiq": nanmean([r["musiq"] for r in rows]),
             "clipiqa": nanmean([r["clipiqa"] for r in rows]),
+            "liqe": nanmean([r["liqe"] for r in rows]),
+            "topiq_nr": nanmean([r["topiq_nr"] for r in rows]),
+            "qalign": nanmean([r["qalign"] for r in rows]),
+        },
+        "analysis_mean": {
             "flat_psnr": nanmean([r["flat_psnr"] for r in rows]),
             "flat_ssim": nanmean([r["flat_ssim"] for r in rows]),
             "flat_lpips": nanmean([r["flat_lpips"] for r in rows]),
@@ -735,14 +882,55 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "corner_lpips": nanmean([r["corner_lpips"] for r in rows]),
         }
     }
+    paper_summary = {
+        "dataset": dataset_name,
+        "num_images": len(rows),
+        "steps": int(args.steps),
+        "protocol": protocol,
+        "mean": {
+            "psnr": summary["mean"]["psnr"],
+            "ssim": summary["mean"]["ssim"],
+            "lpips": summary["mean"]["lpips"],
+            "dists": summary["mean"]["dists"],
+            "maniqa": summary["mean"]["maniqa"],
+            "musiq": summary["mean"]["musiq"],
+            "clipiqa": summary["mean"]["clipiqa"],
+            "liqe": summary["mean"]["liqe"],
+            "topiq_nr": summary["mean"]["topiq_nr"],
+            "qalign": summary["mean"]["qalign"],
+        },
+    }
 
-    with open(base_out / "summary.json", "w", encoding="utf-8") as f:
+    summary_path = base_out / "summary.json"
+    summary_txt_path = base_out / "summary.txt"
+    paper_summary_json_path = base_out / "paper_summary.json"
+    paper_summary_csv = base_out / "paper_summary.csv"
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-    with open(base_out / "summary.txt", "w", encoding="utf-8") as f:
+    summary_txt_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_txt_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(summary, indent=2, ensure_ascii=False))
+    paper_summary_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(paper_summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(paper_summary, f, indent=2, ensure_ascii=False)
+    paper_summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(paper_summary_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["dataset", "num_images", "steps", "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign"])
+        writer.writeheader()
+        writer.writerow({
+            "dataset": dataset_name,
+            "num_images": len(rows),
+            "steps": int(args.steps),
+            **paper_summary["mean"],
+        })
 
     print(f"✅ [{dataset_name}] wrote: {csv_path}")
+    print(f"✅ [{dataset_name}] wrote: {paper_csv_path}")
+    print(f"✅ [{dataset_name}] wrote: {paper_summary_csv}")
     print(f"✅ [{dataset_name}] mean: {summary['mean']}")
+    return paper_summary
 
 
 def parse_args():
@@ -753,6 +941,8 @@ def parse_args():
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--vae_path", type=str, default="/home/hello/HJT/PixArt-sigma/output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers/vae")
     parser.add_argument("--null_t5_embed_path", type=str, default="/home/hello/HJT/PixArt-sigma/output/pretrained_models/null_t5_embed_sigma_300.pth")
+    parser.add_argument("--hard_prompt_embed_path", type=str, required=True)
+    parser.add_argument("--semantic_encoder_name_or_path", type=str, default="openai/clip-vit-large-patch14")
 
     parser.add_argument("--realsr_roots", type=str, nargs="*", default=["/data/RealSR/Nikon/Test/4", "/data/RealSR/Canon/Test/4"])
     parser.add_argument("--drealsr_hr_dir", type=str, default="/data/DRealSR/HR")
@@ -768,10 +958,20 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--sft_strength", type=float, default=1.0)
+    parser.add_argument("--cfg_scale", type=float, default=1.0)
 
     parser.add_argument("--output_dir", type=str, default="/home/hello/HJT/SRConvnetAdapter/experiments_results")
-    parser.add_argument("--save_preds", action="store_true", default=True)
-    parser.add_argument("--save_triptychs", action="store_true", default=True)
+    parser.add_argument("--save_preds", dest="save_preds", action="store_true")
+    parser.add_argument("--no-save_preds", dest="save_preds", action="store_false")
+    parser.set_defaults(save_preds=False)
+
+    parser.add_argument("--save_triptychs", dest="save_triptychs", action="store_true")
+    parser.add_argument("--no-save_triptychs", dest="save_triptychs", action="store_false")
+    parser.set_defaults(save_triptychs=False)
+
+    parser.add_argument("--paper_only", dest="paper_only", action="store_true")
+    parser.add_argument("--no-paper_only", dest="paper_only", action="store_false")
+    parser.set_defaults(paper_only=False)
     return parser.parse_args()
 
 
@@ -788,18 +988,35 @@ def main():
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    pixart, adapter, vae, y_embed, scheduler = build_model_and_assets(args, device, compute_dtype)
+    pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
     metric_suite = MetricSuite()
 
+    paper_rows = []
     if args.dataset in ("realsr", "both"):
         realsr_ds = RealSRValPairedDataset(roots=args.realsr_roots, crop_size=args.crop_size)
         realsr_loader = DataLoader(realsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, vae, y_embed, scheduler, device, compute_dtype)
+        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, device, compute_dtype))
 
     if args.dataset in ("drealsr", "both"):
         drealsr_ds = DRealSRPairedDataset(args.drealsr_hr_dir, args.drealsr_lr_dir, crop_size=args.crop_size)
         drealsr_loader = DataLoader(drealsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, vae, y_embed, scheduler, device, compute_dtype)
+        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, device, compute_dtype))
+
+    if args.dataset == "both" and len(paper_rows) > 0:
+        ckpt_name = Path(args.ckpt_path).stem
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        paper_table_path = Path(args.output_dir) / "paper_table.csv"
+        with open(paper_table_path, "w", newline="", encoding="utf-8") as f:
+            fieldnames = ["dataset", "ckpt_name", "psnr", "ssim", "lpips", "dists", "maniqa", "musiq", "clipiqa", "liqe", "topiq_nr", "qalign"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in paper_rows:
+                writer.writerow({
+                    "dataset": row["dataset"],
+                    "ckpt_name": ckpt_name,
+                    **row["mean"],
+                })
+        print(f"✅ wrote combined paper table: {paper_table_path}")
 
 
 if __name__ == "__main__":
