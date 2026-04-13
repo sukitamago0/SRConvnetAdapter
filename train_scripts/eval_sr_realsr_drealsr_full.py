@@ -496,7 +496,6 @@ def build_model_and_assets(args, device, compute_dtype):
         out_channels=4,
         anchor_layers=list(layer_cfg.get("anchor_layers", [2, 4, 6, 8])),
         semantic_layers=list(layer_cfg.get("semantic_layers", [18, 22, 24, 26])),
-        local_fidelity_layers=list(layer_cfg.get("local_fidelity_layers", [22, 26])),
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -686,11 +685,9 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_p
 
     pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
     sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
-    local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
     sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
     debug_stats = {
-        "guide_map_std": float(cond.get("guide_map", cond["cond_map"]).detach().float().std().item()),
-        "local_res_std": float(local_stats.get("local_res_std", 0.0)),
+        "cond_map_std": float(cond["cond_map"].detach().float().std().item()),
         "sem_tok_std": float(sem_tokens.detach().float().std().item()),
         "sem_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
         "sem_out_scale": float(sem_adapter_stats.get("sem_out_scale", 1.0)),
@@ -804,8 +801,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "corner_psnr": m_corner_c["psnr"],
             "corner_ssim": m_corner_c["ssim"],
             "corner_lpips": m_corner_c["lpips"],
-            "guide_map_std": debug_stats["guide_map_std"],
-            "local_res_std": debug_stats["local_res_std"],
+            "cond_map_std": debug_stats["cond_map_std"],
             "sem_tok_std": debug_stats["sem_tok_std"],
             "sem_out_std": debug_stats["sem_out_std"],
             "sem_out_scale": debug_stats["sem_out_scale"],
@@ -816,8 +812,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "psnr": f"{row['psnr']:.2f}",
             "lpips": f"{row['lpips']:.4f}",
             "c_lp": f"{row['corner_lpips']:.4f}",
-            "guide": f"{row['guide_map_std']:.3f}",
-            "local": f"{row['local_res_std']:.3f}",
+            "cond": f"{row['cond_map_std']:.3f}",
         })
 
     csv_path = base_out / "per_image_metrics.csv"
@@ -828,7 +823,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         "flat_psnr", "flat_ssim", "flat_lpips",
         "edge_psnr", "edge_ssim", "edge_lpips",
         "corner_psnr", "corner_ssim", "corner_lpips",
-        "guide_map_std", "local_res_std", "sem_tok_std", "sem_out_std", "sem_out_scale",
+        "cond_map_std", "sem_tok_std", "sem_out_std", "sem_out_scale",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

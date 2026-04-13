@@ -62,8 +62,6 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "semantic_cross_attn",
     "semantic_out_proj",
     "semantic_alpha",
-    "local_fidelity_blocks",
-    "local_fid_alpha",
     "lora_A",
     "lora_B",
 )
@@ -82,7 +80,6 @@ def get_required_active_key_fragments_for_model(model: nn.Module):
 # ================= 2. Hyper-parameters =================
 # LR only for shallow structure anchor.
 # Semantic prompt only through decoupled semantic branch.
-# Late local fidelity branch only for local correction, not detail generation.
 TRAIN_DF2K_HR_DIR = "/data/DF2K/DF2K_train_HR"
 TRAIN_DF2K_LR_DIR = "/data/DF2K/DF2K_train_LR_unknown"
 TRAIN_REALSR_DIRS = [
@@ -147,7 +144,6 @@ INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
 ANCHOR_LAYERS = [2, 4, 6, 8]
 SEMANTIC_LAYERS = [18, 22, 24, 26]
-LOCAL_FIDELITY_LAYERS = [22, 26]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -722,7 +718,7 @@ def get_config_snapshot():
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV12",
-        "control_type": "structure_sft + decoupled_semantic + late_local_fidelity",
+        "control_type": "structure_sft + decoupled_semantic",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
         "adapter_token_head": "structure-only cond_map head",
         "internal_control_type": "disabled",
@@ -735,7 +731,6 @@ def get_config_snapshot():
         "lr_control_role": "structure_only",
         "anchor_layers": list(ANCHOR_LAYERS),
         "semantic_layers": list(SEMANTIC_LAYERS),
-        "local_fidelity_layers": list(LOCAL_FIDELITY_LAYERS),
         "tala_lite": False,
         "control_integration": "disabled",
         "seed": SEED,
@@ -1271,8 +1266,6 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             p.requires_grad = True
         if ("semantic_cross_attn" in name) or ("semantic_out_proj" in name) or ("semantic_alpha" in name):
             p.requires_grad = True
-        if ("local_fidelity_blocks" in name) or ("local_fid_alpha" in name):
-            p.requires_grad = True
 
     if not train_x_embedder:
         for n, p in pixart.named_parameters():
@@ -1318,13 +1311,11 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
     alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha" in n]
     semantic_attn_params = [p for n, p in pixart.named_parameters() if p.requires_grad and (("semantic_cross_attn" in n) or ("semantic_out_proj" in n))]
     semantic_alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "semantic_alpha" in n]
-    local_fid_block_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "local_fidelity_blocks" in n]
-    local_fid_alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "local_fid_alpha" in n]
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if ("sft_alpha" in n) or ("semantic_cross_attn" in n) or ("semantic_out_proj" in n) or ("semantic_alpha" in n) or ("local_fidelity_blocks" in n) or ("local_fid_alpha" in n):
+        if ("sft_alpha" in n) or ("semantic_cross_attn" in n) or ("semantic_out_proj" in n) or ("semantic_alpha" in n):
             continue
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
@@ -1347,10 +1338,6 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
         optim_groups.append({"params": semantic_attn_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.01})
     if len(semantic_alpha_params) > 0:
         optim_groups.append({"params": semantic_alpha_params, "lr": 10.0 * LR_BASE, "weight_decay": 0.0})
-    if len(local_fid_block_params) > 0:
-        optim_groups.append({"params": local_fid_block_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.01})
-    if len(local_fid_alpha_params) > 0:
-        optim_groups.append({"params": local_fid_alpha_params, "lr": 10.0 * LR_BASE, "weight_decay": 0.0})
     if len(sem_adapter_resampler_params) > 0:
         optim_groups.append({"params": sem_adapter_resampler_params, "lr": 1e-4, "weight_decay": 0.01})
     if len(sem_adapter_proj_params) > 0:
@@ -1360,10 +1347,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params + local_fid_block_params + local_fid_alpha_params + sem_adapter_resampler_params + sem_adapter_proj_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params + sem_adapter_resampler_params + sem_adapter_proj_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params + local_fid_block_params + local_fid_alpha_params
+    grouped = bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1375,8 +1362,6 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
         "sft_alpha": len(alpha_params),
         "semantic_cross_attn": len(semantic_attn_params),
         "semantic_alpha": len(semantic_alpha_params),
-        "local_fid_block": len(local_fid_block_params),
-        "local_fid_alpha": len(local_fid_alpha_params),
         "sem_adapter_resampler": len(sem_adapter_resampler_params),
         "sem_adapter_proj": len(sem_adapter_proj_params),
         "final_head": len(final_head_params),
@@ -1571,7 +1556,6 @@ def save_smart(
             "layer_config": {
                 "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
                 "semantic_layers": list(getattr(pixart, "semantic_layers", SEMANTIC_LAYERS)),
-                "local_fidelity_layers": list(getattr(pixart, "local_fidelity_layers", LOCAL_FIDELITY_LAYERS)),
             },
         }
         return state
@@ -1803,10 +1787,9 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
         cond_deltas = []
         adapter_map_stds = []
-        guide_map_stds = []
+        cond_map_stds = []
         sem_tok_stds, sem_out_stds, sem_alphas, sem_gates = [], [], [], []
         sem_pre_stds, sem_post_stds, sem_out_scales = [], [], []
-        local_res_stds, local_alphas, local_gates = [], [], []
         sft_tau_means, sft_alpha_means = [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
@@ -1847,8 +1830,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
                     adapter_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
-                    if "guide_map" in cond:
-                        guide_map_stds.append(float(cond["guide_map"].detach().float().std().item()))
+                    cond_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
                     sem_tok_stds.append(float(sem_tokens.detach().float().std().item()))
                     sem_pre_stds.append(float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)))
                     sem_post_stds.append(float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0)))
@@ -1857,10 +1839,6 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
                     sem_out_stds.append(float(sem_stats.get("semantic_out_std", 0.0)))
                     sem_alphas.append(float(sem_stats.get("semantic_alpha", 0.0)))
                     sem_gates.append(float(sem_stats.get("semantic_gate_mean", 0.0)))
-                    local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
-                    local_res_stds.append(float(local_stats.get("local_res_std", 0.0)))
-                    local_alphas.append(float(local_stats.get("local_alpha", 0.0)))
-                    local_gates.append(float(local_stats.get("local_gate_mean", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                     sft_tau_means.append(float(sft_stats.get("tau_mean", 0.0)))
@@ -1908,7 +1886,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
         results[int(steps)] = res
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
         adapter_map_std = float(np.mean(adapter_map_stds)) if len(adapter_map_stds) > 0 else 0.0
-        guide_map_std = float(np.mean(guide_map_stds)) if len(guide_map_stds) > 0 else 0.0
+        cond_map_std = float(np.mean(cond_map_stds)) if len(cond_map_stds) > 0 else 0.0
         sem_tok_std = float(np.mean(sem_tok_stds)) if len(sem_tok_stds) > 0 else 0.0
         sem_pre_std = float(np.mean(sem_pre_stds)) if len(sem_pre_stds) > 0 else 0.0
         sem_post_std = float(np.mean(sem_post_stds)) if len(sem_post_stds) > 0 else 0.0
@@ -1916,14 +1894,11 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
         sem_out_std = float(np.mean(sem_out_stds)) if len(sem_out_stds) > 0 else 0.0
         sem_alpha = float(np.mean(sem_alphas)) if len(sem_alphas) > 0 else 0.0
         sem_gate = float(np.mean(sem_gates)) if len(sem_gates) > 0 else 0.0
-        local_res_std = float(np.mean(local_res_stds)) if len(local_res_stds) > 0 else 0.0
-        local_alpha = float(np.mean(local_alphas)) if len(local_alphas) > 0 else 0.0
-        local_gate = float(np.mean(local_gates)) if len(local_gates) > 0 else 0.0
         sft_tau_mean = float(np.mean(sft_tau_means)) if len(sft_tau_means) > 0 else 0.0
         sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | ad_map_std={adapter_map_std:.4f} | guide_map_std={guide_map_std:.4f} | sem_tok_std={sem_tok_std:.4f} | sem_pre_std={sem_pre_std:.4f} | sem_post_std={sem_post_std:.4f} | sem_out_scale={sem_out_scale:.4f} | sem_out_std={sem_out_std:.4f} | sem_alpha={sem_alpha:.4f} | sem_gate={sem_gate:.4f} | local_res_std={local_res_std:.4f} | local_alpha={local_alpha:.4f} | local_gate={local_gate:.4f} | sem_K={16} | "
+            f"CONDΔ={cdelta:.5f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | sem_tok_std={sem_tok_std:.4f} | sem_pre_std={sem_pre_std:.4f} | sem_post_std={sem_post_std:.4f} | sem_out_scale={sem_out_scale:.4f} | sem_out_std={sem_out_std:.4f} | sem_alpha={sem_alpha:.4f} | sem_gate={sem_gate:.4f} | sem_K={16} | "
             f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
@@ -1976,7 +1951,6 @@ def main():
         force_null_caption=False,
         anchor_layers=list(ANCHOR_LAYERS),
         semantic_layers=list(SEMANTIC_LAYERS),
-        local_fidelity_layers=list(LOCAL_FIDELITY_LAYERS),
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
     set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
@@ -2159,7 +2133,6 @@ def main():
                     raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
                 model_pred = out.float()
                 sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
-                local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
                 guard_stats = {
                     "sem_tok_std": float(sem_tokens.detach().float().std().item()),
                     "sem_pre_std": float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)),
@@ -2168,11 +2141,8 @@ def main():
                     "semantic_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
                     "semantic_alpha": float(sem_stats.get("semantic_alpha", 0.0)),
                     "semantic_gate_mean": float(sem_stats.get("semantic_gate_mean", 0.0)),
-                    "local_res_std": float(local_stats.get("local_res_std", 0.0)),
-                    "local_alpha": float(local_stats.get("local_alpha", 0.0)),
-                    "local_gate_mean": float(local_stats.get("local_gate_mean", 0.0)),
                     "ad_map_std": float(cond_in["cond_map"].detach().float().std().item()),
-                    "guide_map_std": float(cond_in.get("guide_map", cond_in["cond_map"]).detach().float().std().item()),
+                    "cond_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "sft_strength": float(sft_strength),
                     "t_min": int(t.min().item()),
                     "t_max": int(t.max().item()),
@@ -2304,7 +2274,6 @@ def main():
                 alpha_max = float(sft_stats.get("alpha_max", 0.0))
                 sft_strength_logged = float(sft_stats.get("sft_strength", sft_strength))
                 sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
-                local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
                 sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                 sem_tok_std = float(sem_tokens.detach().float().std().item())
                 sem_pre_std = float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0))
@@ -2313,11 +2282,8 @@ def main():
                 sem_out_std = float(sem_stats.get("semantic_out_std", 0.0))
                 sem_alpha = float(sem_stats.get("semantic_alpha", 0.0))
                 sem_gate = float(sem_stats.get("semantic_gate_mean", 0.0))
-                local_res_std = float(local_stats.get("local_res_std", 0.0))
-                local_alpha = float(local_stats.get("local_alpha", 0.0))
-                local_gate = float(local_stats.get("local_gate_mean", 0.0))
                 adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
-                guide_map_std = float(cond_in.get("guide_map", cond_in["cond_map"]).detach().float().std().item())
+                cond_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_delta = float(cond_delta_curr)
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
@@ -2345,13 +2311,10 @@ def main():
                     'sem_out_std': f"{sem_out_std:.4f}",
                     'sem_alpha': f"{sem_alpha:.4f}",
                     'sem_gate': f"{sem_gate:.4f}",
-                    'local_res_std': f"{local_res_std:.4f}",
-                    'local_alpha': f"{local_alpha:.4f}",
-                    'local_gate': f"{local_gate:.4f}",
                     'cond_delta': f"{cond_delta:.5f}",
                     'sem_K': f"{16}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
-                    'guide_map_std': f"{guide_map_std:.4f}",
+                    'cond_map_std': f"{cond_map_std:.4f}",
                 }
                 log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
                 pbar.set_postfix(log_dict)
@@ -2372,13 +2335,10 @@ def main():
                     "sem_out_std": sem_out_std,
                     "sem_alpha": sem_alpha,
                     "sem_gate": sem_gate,
-                    "local_res_std": local_res_std,
-                    "local_alpha": local_alpha,
-                    "local_gate": local_gate,
                     "cond_delta": cond_delta,
                     "sem_K": 16,
                     "adapter_map_std": adapter_map_std,
-                    "guide_map_std": guide_map_std,
+                    "cond_map_std": cond_map_std,
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:

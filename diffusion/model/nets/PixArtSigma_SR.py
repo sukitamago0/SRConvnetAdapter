@@ -6,7 +6,6 @@ from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
 from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
-from diffusion.model.nets.adapter import NAFBlock
 
 
 class SFTLayer(nn.Module):
@@ -26,22 +25,6 @@ class SFTLayer(nn.Module):
         return feat * (1 + gain * scale) + gain * shift, scale, shift
 
 
-class NAFLocalFidelityFusion(nn.Module):
-    def __init__(self, feat_nc=1152, guide_nc=1152, mid_nc=128):
-        super().__init__()
-        self.feat_proj = nn.Conv2d(feat_nc, mid_nc, 1)
-        self.guide_proj = nn.Conv2d(guide_nc, mid_nc, 1)
-        self.fuse = nn.Sequential(NAFBlock(mid_nc), NAFBlock(mid_nc))
-        self.out_proj = nn.Conv2d(mid_nc, feat_nc, 1)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
-
-    def forward(self, x_map: torch.Tensor, guide_map: torch.Tensor) -> torch.Tensor:
-        h = self.feat_proj(x_map) + self.guide_proj(guide_map)
-        h = self.fuse(h)
-        return self.out_proj(h)
-
-
 @MODELS.register_module()
 class PixArtSigmaSR(PixArtMS):
     def __init__(
@@ -49,7 +32,6 @@ class PixArtSigmaSR(PixArtMS):
         force_null_caption: bool = True,
         anchor_layers=None,
         semantic_layers=None,
-        local_fidelity_layers=None,
         **kwargs
     ):
         kwargs.setdefault("model_max_length", 300)
@@ -78,20 +60,9 @@ class PixArtSigmaSR(PixArtMS):
         self.sft_candidate_layers = list(anchor_layers) if anchor_layers is not None else [2, 4, 6, 8]
         self.anchor_layers = set(self.sft_candidate_layers)
         self.semantic_layers = list(semantic_layers) if semantic_layers is not None else [18, 22, 24, 26]
-        self.local_fidelity_layers = list(local_fidelity_layers) if local_fidelity_layers is not None else [22, 26]
         for i in self.semantic_layers:
             if 0 <= i < self.depth:
                 self.blocks[i].enable_semantic_adapter()
-        self.local_fidelity_blocks = nn.ModuleDict({
-            str(i): NAFLocalFidelityFusion(feat_nc=self.hidden_size, guide_nc=self.hidden_size, mid_nc=128)
-            for i in self.local_fidelity_layers
-            if 0 <= i < self.depth
-        })
-        self.local_fid_alpha = nn.ParameterDict({
-            str(i): nn.Parameter(torch.tensor(1.0))
-            for i in self.local_fidelity_layers
-            if 0 <= i < self.depth
-        })
 
         default_alpha_init = {2: 1.0, 4: 1.0, 6: 0.5, 8: 0.25}
         self.sft_alpha = nn.ParameterDict({
@@ -101,7 +72,6 @@ class PixArtSigmaSR(PixArtMS):
 
         self._last_sft_stats = None
         self._last_semantic_stats = None
-        self._last_local_fidelity_stats = None
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, semantic_tokens=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
@@ -126,10 +96,8 @@ class PixArtSigmaSR(PixArtMS):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         cond_map = None
-        guide_map = None
         if adapter_cond is not None:
             cond_map = adapter_cond.get("cond_map", None)
-            guide_map = adapter_cond.get("guide_map", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -154,9 +122,7 @@ class PixArtSigmaSR(PixArtMS):
         tau_scalar = t_norm.pow(1.5)
         tau_map = tau_scalar.view(-1, 1, 1, 1).to(x.dtype)
         semantic_gate = (1.0 - tau_scalar).view(-1, 1, 1).to(x.dtype)
-        late_gate = (1.0 - tau_scalar).view(-1, 1, 1, 1).to(x.dtype)
         sem_stats = []
-        local_stats = []
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.anchor_layers:
                 b, n, c = x.shape
@@ -168,24 +134,6 @@ class PixArtSigmaSR(PixArtMS):
                 alpha_i = self.sft_alpha[str(i)].to(x_map_pre.dtype)
                 x_map = x_map_pre + (x_map_post - x_map_pre) * (alpha_i * tau_map)
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
-
-            # Local fidelity correction:
-            # - guide_map is dedicated for late high-resolution fidelity.
-            # - cond_map remains dedicated to shallow SFT structure anchors.
-            curr_guide = guide_map if guide_map is not None else cond_map
-            if curr_guide is not None and str(i) in self.local_fidelity_blocks:
-                b, n, c = x.shape
-                x_map_pre = x.transpose(1, 2).reshape(b, c, self.h, self.w)
-                guide_for_local = curr_guide.to(dtype=x.dtype)
-                local_res = self.local_fidelity_blocks[str(i)](x_map_pre, guide_for_local)
-                alpha_local = self.local_fid_alpha[str(i)].to(x_map_pre.dtype)
-                x_map = x_map_pre + (alpha_local * late_gate) * local_res
-                x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
-                local_stats.append({
-                    "local_res_std": float(local_res.detach().float().std().item()),
-                    "local_alpha": float(alpha_local.detach().float().item()),
-                    "local_gate_mean": float(late_gate.detach().float().mean().item()),
-                })
 
             block_kwargs = dict(
                 HW=(self.h, self.w),
@@ -223,15 +171,6 @@ class PixArtSigmaSR(PixArtMS):
             }
         else:
             self._last_semantic_stats = None
-
-        if len(local_stats) > 0:
-            self._last_local_fidelity_stats = {
-                "local_res_std": float(sum(s["local_res_std"] for s in local_stats) / len(local_stats)),
-                "local_alpha": float(sum(s["local_alpha"] for s in local_stats) / len(local_stats)),
-                "local_gate_mean": float(sum(s["local_gate_mean"] for s in local_stats) / len(local_stats)),
-            }
-        else:
-            self._last_local_fidelity_stats = None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)

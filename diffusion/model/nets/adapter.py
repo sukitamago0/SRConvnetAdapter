@@ -318,20 +318,6 @@ class SRConvNetLSAAdapterV12(nn.Module):
             nn.PixelUnshuffle(2),
             nn.Conv2d(1152, self.hidden_size, 1),
         )
-        self.guide_proj1 = nn.Conv2d(64, 128, 1)
-        self.guide_proj2 = nn.Conv2d(128, 128, 1)
-        self.guide_proj3 = nn.Conv2d(256, 128, 1)
-        self.guide_proj4 = nn.Conv2d(256, 128, 1)
-        self.guide_fuse = nn.Sequential(
-            nn.Conv2d(512, 512, 1),
-            nn.GELU(),
-            NAFBlock(512),
-            nn.Conv2d(512, self.hidden_size, 3, 1, 1),
-        )
-        self.guide_to32 = nn.Sequential(
-            nn.PixelUnshuffle(4),
-            nn.Conv2d(self.hidden_size * 16, self.hidden_size, 1),
-        )
 
         for m in [
             self.proj2_hi,
@@ -340,13 +326,6 @@ class SRConvNetLSAAdapterV12(nn.Module):
             self.fuse64[0],
             self.fuse64[2],
             self.to32[1],
-            self.guide_proj1,
-            self.guide_proj2,
-            self.guide_proj3,
-            self.guide_proj4,
-            self.guide_fuse[0],
-            self.guide_fuse[3],
-            self.guide_to32[1],
         ]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
@@ -381,19 +360,8 @@ class SRConvNetLSAAdapterV12(nn.Module):
         fused_64 = self.fuse64(fused_64)
         cond_map = self.to32(fused_64)
 
-        f2_up = F.interpolate(f2, size=f1.shape[-2:], mode="bilinear", align_corners=False)
-        f3_up = F.interpolate(f3, size=f1.shape[-2:], mode="bilinear", align_corners=False)
-        f4_up = F.interpolate(f4, size=f1.shape[-2:], mode="bilinear", align_corners=False)
-        g1 = self.guide_proj1(f1)
-        g2 = self.guide_proj2(f2_up)
-        g3 = self.guide_proj3(f3_up)
-        g4 = self.guide_proj4(f4_up)
-        guide_hr = self.guide_fuse(torch.cat([g1, g2, g3, g4], dim=1))
-        guide_map = self.guide_to32(guide_hr)
-
         return {
             "cond_map": cond_map,
-            "guide_map": guide_map,
         }
 
 

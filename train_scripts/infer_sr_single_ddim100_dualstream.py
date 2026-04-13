@@ -155,7 +155,6 @@ def run(args):
     layer_cfg = ckpt.get("layer_config", {}) if isinstance(ckpt, dict) else {}
     anchor_layers = list(layer_cfg.get("anchor_layers", [2, 4, 6, 8]))
     semantic_layers = list(layer_cfg.get("semantic_layers", [18, 22, 24, 26]))
-    local_fidelity_layers = list(layer_cfg.get("local_fidelity_layers", [22, 26]))
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
@@ -163,7 +162,6 @@ def run(args):
         out_channels=4,
         anchor_layers=anchor_layers,
         semantic_layers=semantic_layers,
-        local_fidelity_layers=local_fidelity_layers,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
