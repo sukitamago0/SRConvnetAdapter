@@ -57,14 +57,14 @@ class PixArtSigmaSR(PixArtMS):
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
-        self.sft_candidate_layers = list(anchor_layers) if anchor_layers is not None else [2, 4, 6, 8]
+        self.sft_candidate_layers = list(anchor_layers) if anchor_layers is not None else list(range(0, 8))
         self.anchor_layers = set(self.sft_candidate_layers)
-        self.semantic_layers = list(semantic_layers) if semantic_layers is not None else [18, 22, 24, 26]
+        self.semantic_layers = list(semantic_layers) if semantic_layers is not None else list(range(20, 28))
         for i in self.semantic_layers:
             if 0 <= i < self.depth:
                 self.blocks[i].enable_semantic_adapter()
 
-        default_alpha_init = {2: 1.0, 4: 1.0, 6: 0.5, 8: 0.25}
+        default_alpha_init = {i: 1.0 for i in self.sft_candidate_layers}
         self.sft_alpha = nn.ParameterDict({
             str(i): nn.Parameter(torch.tensor(float(default_alpha_init.get(int(i), 1.0))))
             for i in sorted(self.anchor_layers)

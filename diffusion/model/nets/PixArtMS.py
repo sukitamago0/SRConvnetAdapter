@@ -76,7 +76,7 @@ class PixArtMSBlock(nn.Module):
 
     def enable_semantic_adapter(self):
         self.has_semantic_adapter = True
-        self.semantic_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+        self.semantic_norm = nn.Identity()
         self.semantic_cross_attn = MultiHeadCrossAttention(self.hidden_size, self.attn.num_heads)
         self.semantic_out_proj = nn.Linear(self.hidden_size, self.hidden_size)
         nn.init.zeros_(self.semantic_out_proj.weight)
@@ -103,24 +103,24 @@ class PixArtMSBlock(nn.Module):
         h = self.norm1(x)
         if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
             h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
-        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
+        x_ca = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
+        text_out = self.cross_attn(x_ca, y, mask)
 
         if self.has_semantic_adapter and semantic_tokens is not None:
             sem = semantic_tokens.to(dtype=x.dtype)
             gate = 1.0 if semantic_gate is None else semantic_gate
-            hs = self.semantic_norm(x)
+            hs = self.semantic_norm(x_ca)
             sem_out = self.semantic_cross_attn(hs, sem, None)
             sem_out = self.semantic_out_proj(sem_out)
-            x = x + self.drop_path((self.semantic_alpha.to(x.dtype) * gate) * sem_out)
+            x = x_ca + text_out + self.drop_path((self.semantic_alpha.to(x.dtype) * gate) * sem_out)
             self._last_semantic_stats = {
                 "semantic_out_std": float(sem_out.detach().float().std().item()),
                 "semantic_alpha": float(self.semantic_alpha.detach().float().item()),
                 "semantic_gate_mean": float(torch.as_tensor(gate, dtype=x.dtype, device=x.device).mean().item()),
             }
         else:
+            x = x_ca + text_out
             self._last_semantic_stats = None
-
-        x = x + self.cross_attn(x, y, mask)
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
         return x
 

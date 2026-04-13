@@ -81,6 +81,9 @@ def get_required_active_key_fragments_for_model(model: nn.Module):
 # LR-derived cond_map is for shallow structure anchoring only.
 # native text path uses null prompt in this experiment.
 # semantic adapter is the only late semantic/detail guidance.
+# early band is for LR-derived structure anchoring only.
+# late band is for semantic/detail guidance only.
+# mid band remains largely prior-driven.
 # fine details should be generated mainly by semantic guidance + pretrained PixArt prior.
 TRAIN_DF2K_HR_DIR = "/data/DF2K/DF2K_train_HR"
 TRAIN_DF2K_LR_DIR = "/data/DF2K/DF2K_train_LR_unknown"
@@ -143,8 +146,8 @@ INJECT_R_END = 0.1
 INJECT_S_MIN = 0.1
 INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
-ANCHOR_LAYERS = [2, 4, 6, 8]
-SEMANTIC_LAYERS = [18, 22, 24, 26]
+ANCHOR_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7]
+SEMANTIC_LAYERS = [20, 21, 22, 23, 24, 25, 26, 27]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -719,7 +722,7 @@ def get_config_snapshot():
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV12",
-        "control_type": "structure_only_lr + null_text + decoupled_semantic",
+        "control_type": "structure_early_band + null_text + semantic_late_band",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
         "adapter_token_head": "structure-only cond_map head",
         "internal_control_type": "disabled",
@@ -729,6 +732,7 @@ def get_config_snapshot():
         "semantic_prompt_tokens": 16,
         "use_native_text_path": True,
         "native_text_is_null": True,
+        "semantic_fusion": "parallel_decoupled",
         "lr_control_role": "structure_only",
         "anchor_layers": list(ANCHOR_LAYERS),
         "semantic_layers": list(SEMANTIC_LAYERS),
