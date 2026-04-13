@@ -63,6 +63,10 @@ class PixArtSigmaSR(PixArtMS):
         _ = injection_layer_to_level
         self.sft_candidate_layers = [2, 4, 6, 8]
         self.anchor_layers = set(self.sft_candidate_layers)
+        self.semantic_layers = [18, 22, 24, 26]
+        for i in self.semantic_layers:
+            if 0 <= i < self.depth:
+                self.blocks[i].enable_semantic_adapter()
 
         self.sft_alpha = nn.ParameterDict({
             "2": nn.Parameter(torch.tensor(1.0)),
@@ -72,9 +76,9 @@ class PixArtSigmaSR(PixArtMS):
         })
 
         self._last_sft_stats = None
-        self._last_control_stats = None
+        self._last_semantic_stats = None
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
+    def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, semantic_tokens=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
         _ = kwargs.pop("sft_strength", 1.0)
         bs = x.shape[0]
@@ -122,6 +126,8 @@ class PixArtSigmaSR(PixArtMS):
         t_norm = timestep.float() / 1000.0
         tau_scalar = t_norm.pow(1.5)
         tau_map = tau_scalar.view(-1, 1, 1, 1).to(x.dtype)
+        semantic_gate = (1.0 - tau_scalar).view(-1, 1, 1).to(x.dtype)
+        sem_stats = []
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.anchor_layers:
                 b, n, c = x.shape
@@ -134,17 +140,19 @@ class PixArtSigmaSR(PixArtMS):
                 x_map = x_map_pre + (x_map_post - x_map_pre) * (alpha_i * tau_map)
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
 
-            x = auto_grad_checkpoint(
-                block,
-                x,
-                y,
-                t0,
-                y_lens,
+            block_kwargs = dict(
                 HW=(self.h, self.w),
                 base_size=self.base_size,
                 pe_interpolation=self.pe_interpolation,
                 **kwargs,
             )
+            if (i in self.semantic_layers) and (semantic_tokens is not None):
+                block_kwargs["semantic_tokens"] = semantic_tokens
+                block_kwargs["semantic_gate"] = semantic_gate
+            x = auto_grad_checkpoint(block, x, y, t0, y_lens, **block_kwargs)
+            blk_stats = getattr(block, "_last_semantic_stats", None)
+            if blk_stats is not None:
+                sem_stats.append(blk_stats)
 
         if len(self.anchor_layers) > 0:
             alpha_vals = [self.sft_alpha[str(i)].item() for i in self.sft_candidate_layers]
@@ -159,7 +167,14 @@ class PixArtSigmaSR(PixArtMS):
         else:
             self._last_sft_stats = None
 
-        self._last_control_stats = None
+        if len(sem_stats) > 0:
+            self._last_semantic_stats = {
+                "semantic_out_std": float(sum(s["semantic_out_std"] for s in sem_stats) / len(sem_stats)),
+                "semantic_alpha": float(sum(s["semantic_alpha"] for s in sem_stats) / len(sem_stats)),
+                "semantic_gate_mean": float(sum(s["semantic_gate_mean"] for s in sem_stats) / len(sem_stats)),
+            }
+        else:
+            self._last_semantic_stats = None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
