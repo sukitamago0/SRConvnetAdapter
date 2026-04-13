@@ -147,7 +147,7 @@ INJECT_S_MIN = 0.1
 INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
 ANCHOR_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7]
-SEMANTIC_LAYERS = [20, 21, 22, 23, 24, 25, 26, 27]
+SEMANTIC_LAYERS = [24, 25, 26, 27]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -2155,6 +2155,10 @@ def main():
                     "semantic_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
                     "semantic_alpha": float(sem_stats.get("semantic_alpha", 0.0)),
                     "semantic_gate_mean": float(sem_stats.get("semantic_gate_mean", 0.0)),
+                    "semantic_q_std": float(sem_stats.get("semantic_q_std", 0.0)),
+                    "semantic_attn_out_std": float(sem_stats.get("semantic_attn_out_std", 0.0)),
+                    "semantic_proj_out_std": float(sem_stats.get("semantic_proj_out_std", 0.0)),
+                    "semantic_block_ids_active": str(list(sem_stats.get("semantic_block_ids_active", []))),
                     "ad_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "cond_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "sft_strength": float(sft_strength),

@@ -518,7 +518,7 @@ def build_model_and_assets(args, device, compute_dtype):
         in_channels=4,
         out_channels=4,
         anchor_layers=list(layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7])),
-        semantic_layers=list(layer_cfg.get("semantic_layers", [20, 21, 22, 23, 24, 25, 26, 27])),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")

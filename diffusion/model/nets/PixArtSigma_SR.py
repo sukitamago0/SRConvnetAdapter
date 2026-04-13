@@ -59,7 +59,7 @@ class PixArtSigmaSR(PixArtMS):
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
         self.sft_candidate_layers = list(anchor_layers) if anchor_layers is not None else list(range(0, 8))
         self.anchor_layers = set(self.sft_candidate_layers)
-        self.semantic_layers = list(semantic_layers) if semantic_layers is not None else list(range(20, 28))
+        self.semantic_layers = list(semantic_layers) if semantic_layers is not None else list(range(24, 28))
         for i in self.semantic_layers:
             if 0 <= i < self.depth:
                 self.blocks[i].enable_semantic_adapter()
@@ -121,7 +121,7 @@ class PixArtSigmaSR(PixArtMS):
         t_norm = timestep.float() / 1000.0
         tau_scalar = t_norm.pow(1.5)
         tau_map = tau_scalar.view(-1, 1, 1, 1).to(x.dtype)
-        semantic_gate = (1.0 - tau_scalar).view(-1, 1, 1).to(x.dtype)
+        semantic_gate = (1.0 - tau_scalar).pow(2.0).view(-1, 1, 1).to(x.dtype)
         sem_stats = []
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.anchor_layers:
@@ -144,6 +144,7 @@ class PixArtSigmaSR(PixArtMS):
             if (i in self.semantic_layers) and (semantic_tokens is not None):
                 block_kwargs["semantic_tokens"] = semantic_tokens
                 block_kwargs["semantic_gate"] = semantic_gate
+                block_kwargs["semantic_block_id"] = i
             x = auto_grad_checkpoint(block, x, y, t0, y_lens, **block_kwargs)
             blk_stats = getattr(block, "_last_semantic_stats", None)
             if blk_stats is not None:
@@ -164,10 +165,17 @@ class PixArtSigmaSR(PixArtMS):
             self._last_sft_stats = None
 
         if len(sem_stats) > 0:
+            active_ids = [int(s.get("semantic_block_id", -1)) for s in sem_stats if int(s.get("semantic_block_id", -1)) >= 0]
+            nonfinite_ids = [int(s.get("semantic_block_id", -1)) for s in sem_stats if bool(s.get("semantic_nonfinite", False)) and int(s.get("semantic_block_id", -1)) >= 0]
             self._last_semantic_stats = {
                 "semantic_out_std": float(sum(s["semantic_out_std"] for s in sem_stats) / len(sem_stats)),
                 "semantic_alpha": float(sum(s["semantic_alpha"] for s in sem_stats) / len(sem_stats)),
                 "semantic_gate_mean": float(sum(s["semantic_gate_mean"] for s in sem_stats) / len(sem_stats)),
+                "semantic_q_std": float(sum(float(s.get("semantic_q_std", 0.0)) for s in sem_stats) / len(sem_stats)),
+                "semantic_attn_out_std": float(sum(float(s.get("semantic_attn_out_std", 0.0)) for s in sem_stats) / len(sem_stats)),
+                "semantic_proj_out_std": float(sum(float(s.get("semantic_proj_out_std", 0.0)) for s in sem_stats) / len(sem_stats)),
+                "semantic_block_ids_active": sorted(list(set(active_ids))),
+                "semantic_block_ids_nonfinite": sorted(list(set(nonfinite_ids))),
             }
         else:
             self._last_semantic_stats = None
