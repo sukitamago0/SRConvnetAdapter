@@ -69,6 +69,7 @@ class PixArtMSBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
         self.semantic_norm = None
         self.semantic_cross_attn = None
+        self.semantic_out_proj = None
         self.semantic_alpha = None
         self.has_semantic_adapter = False
         self._last_semantic_stats = None
@@ -77,7 +78,10 @@ class PixArtMSBlock(nn.Module):
         self.has_semantic_adapter = True
         self.semantic_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
         self.semantic_cross_attn = MultiHeadCrossAttention(self.hidden_size, self.attn.num_heads)
-        self.semantic_alpha = nn.Parameter(torch.tensor(1e-3))
+        self.semantic_out_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        nn.init.zeros_(self.semantic_out_proj.weight)
+        nn.init.zeros_(self.semantic_out_proj.bias)
+        self.semantic_alpha = nn.Parameter(torch.tensor(1.0))
 
     def forward(
         self,
@@ -106,6 +110,7 @@ class PixArtMSBlock(nn.Module):
             gate = 1.0 if semantic_gate is None else semantic_gate
             hs = self.semantic_norm(x)
             sem_out = self.semantic_cross_attn(hs, sem, None)
+            sem_out = self.semantic_out_proj(sem_out)
             x = x + self.drop_path((self.semantic_alpha.to(x.dtype) * gate) * sem_out)
             self._last_semantic_stats = {
                 "semantic_out_std": float(sem_out.detach().float().std().item()),

@@ -60,7 +60,10 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "sft_layers",
     "sft_alpha",
     "semantic_cross_attn",
+    "semantic_out_proj",
     "semantic_alpha",
+    "local_fidelity_blocks",
+    "local_fid_alpha",
     "lora_A",
     "lora_B",
 )
@@ -77,6 +80,9 @@ def get_required_active_key_fragments_for_model(model: nn.Module):
     return tuple(required)
 
 # ================= 2. Hyper-parameters =================
+# LR only for shallow structure anchor.
+# Semantic prompt only through decoupled semantic branch.
+# Late local fidelity branch only for local correction, not detail generation.
 TRAIN_DF2K_HR_DIR = "/data/DF2K/DF2K_train_HR"
 TRAIN_DF2K_LR_DIR = "/data/DF2K/DF2K_train_LR_unknown"
 TRAIN_REALSR_DIRS = [
@@ -138,17 +144,9 @@ INJECT_R_END = 0.1
 INJECT_S_MIN = 0.1
 INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
-HARD_INJECTION_LAYERS = [2, 4, 6, 8, 10, 12]
-TRANSITION_INJECTION_LAYERS = []
-DETAIL_INJECTION_LAYERS = [14, 16, 18, 20, 22, 24]
-DEFAULT_INJECTION_LAYER_TO_LEVEL = {
-    14: "mid",
-    16: "mid",
-    18: "high",
-    20: "high",
-    22: "high",
-    24: "high",
-}
+ANCHOR_LAYERS = [2, 4, 6, 8]
+SEMANTIC_LAYERS = [18, 22, 24, 26]
+LOCAL_FIDELITY_LAYERS = [22, 26]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -591,6 +589,17 @@ def file_sha256(path):
         for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""): sha.update(chunk)
     return sha.hexdigest()
 
+
+def assert_finite_tensor(name: str, x: torch.Tensor, stats: dict):
+    if x is None:
+        return
+    if not torch.is_tensor(x):
+        return
+    if torch.isfinite(x).all():
+        return
+    stat_items = " | ".join([f"{k}={v}" for k, v in stats.items()])
+    raise RuntimeError(f"[NaNGuard] non-finite detected in {name}. {stat_items}")
+
 def _should_keep_fp32_on_save(param_name: str) -> bool:
     return any(tag in param_name for tag in FP32_SAVE_KEY_FRAGMENTS)
 
@@ -712,10 +721,10 @@ def get_config_snapshot():
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV12",
-        "control_type": "PixArt-native internal control",
+        "control_type": "structure_sft + decoupled_semantic + late_local_fidelity",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
         "adapter_token_head": "structure-only cond_map head",
-        "internal_control_type": "disabled in this experiment path",
+        "internal_control_type": "disabled",
         "internal_control_layers": [],
         "semantic_prompt_branch": "enabled",
         "semantic_prompt_source": "CLIP + IP-Adapter Resampler + decoupled cross-attn",
@@ -723,7 +732,9 @@ def get_config_snapshot():
         "use_native_text_path": True,
         "hard_prompt_path": HARD_PROMPT_EMBED_PATH,
         "lr_control_role": "structure_only",
-        "semantic_layers": [18, 22, 24, 26],
+        "anchor_layers": list(ANCHOR_LAYERS),
+        "semantic_layers": list(SEMANTIC_LAYERS),
+        "local_fidelity_layers": list(LOCAL_FIDELITY_LAYERS),
         "tala_lite": False,
         "control_integration": "disabled",
         "seed": SEED,
@@ -746,23 +757,6 @@ def validate_schedule_alignment():
 
 def validate_s2d_decoupling():
     return
-def load_resume_injection_config(default_cfg: dict):
-    cfg = dict(default_cfg)
-    if not os.path.exists(LAST_CKPT_PATH):
-        return cfg
-    try:
-        ckpt = torch.load(LAST_CKPT_PATH, map_location="cpu")
-        inj = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
-        if not isinstance(inj, dict) or len(inj) == 0:
-            return cfg
-        cfg["hard_layers"] = list(inj.get("hard_layers", cfg["hard_layers"]))
-        cfg["detail_layers"] = list(inj.get("detail_layers", cfg["detail_layers"]))
-        cfg["injection_layer_to_level"] = dict(inj.get("injection_layer_to_level", cfg["injection_layer_to_level"]))
-        cfg["ref_token_hw"] = int(inj.get("ref_token_hw", cfg["ref_token_hw"]))
-        print("[ResumeConfig] injection_config loaded from LAST_CKPT_PATH")
-    except Exception as e:
-        print(f"⚠️ Failed to load injection_config from LAST_CKPT_PATH: {e}")
-    return cfg
 
 # ================= 4. Data Pipeline =================
 class DegradationPipeline:
@@ -1274,7 +1268,9 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             or "sft_layers.8." in name
         ):
             p.requires_grad = True
-        if ("semantic_cross_attn" in name) or ("semantic_alpha" in name):
+        if ("semantic_cross_attn" in name) or ("semantic_out_proj" in name) or ("semantic_alpha" in name):
+            p.requires_grad = True
+        if ("local_fidelity_blocks" in name) or ("local_fid_alpha" in name):
             p.requires_grad = True
 
     if not train_x_embedder:
@@ -1319,13 +1315,15 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
     final_head_params = []
     bridge_params = []
     alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha" in n]
-    semantic_attn_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "semantic_cross_attn" in n]
+    semantic_attn_params = [p for n, p in pixart.named_parameters() if p.requires_grad and (("semantic_cross_attn" in n) or ("semantic_out_proj" in n))]
     semantic_alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "semantic_alpha" in n]
+    local_fid_block_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "local_fidelity_blocks" in n]
+    local_fid_alpha_params = [p for n, p in pixart.named_parameters() if p.requires_grad and "local_fid_alpha" in n]
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if ("sft_alpha" in n) or ("semantic_cross_attn" in n) or ("semantic_alpha" in n):
+        if ("sft_alpha" in n) or ("semantic_cross_attn" in n) or ("semantic_out_proj" in n) or ("semantic_alpha" in n) or ("local_fidelity_blocks" in n) or ("local_fid_alpha" in n):
             continue
         elif ("lora_A" in n) or ("lora_B" in n):
             lora_params.append(p)
@@ -1348,6 +1346,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
         optim_groups.append({"params": semantic_attn_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.01})
     if len(semantic_alpha_params) > 0:
         optim_groups.append({"params": semantic_alpha_params, "lr": 10.0 * LR_BASE, "weight_decay": 0.0})
+    if len(local_fid_block_params) > 0:
+        optim_groups.append({"params": local_fid_block_params, "lr": 5.0 * LR_BASE, "weight_decay": 0.01})
+    if len(local_fid_alpha_params) > 0:
+        optim_groups.append({"params": local_fid_alpha_params, "lr": 10.0 * LR_BASE, "weight_decay": 0.0})
     if len(sem_adapter_resampler_params) > 0:
         optim_groups.append({"params": sem_adapter_resampler_params, "lr": 1e-4, "weight_decay": 0.01})
     if len(sem_adapter_proj_params) > 0:
@@ -1357,10 +1359,10 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
         raise RuntimeError("No optimizer groups built; check stage trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params + sem_adapter_resampler_params + sem_adapter_proj_params
+    params_to_clip = adapter_params + bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params + local_fid_block_params + local_fid_alpha_params + sem_adapter_resampler_params + sem_adapter_proj_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params
+    grouped = bridge_params + final_head_params + lora_params + alpha_params + semantic_attn_params + semantic_alpha_params + local_fid_block_params + local_fid_alpha_params
     if len({id(p) for p in grouped}) != len(grouped):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
     if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
@@ -1372,6 +1374,8 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
         "sft_alpha": len(alpha_params),
         "semantic_cross_attn": len(semantic_attn_params),
         "semantic_alpha": len(semantic_alpha_params),
+        "local_fid_block": len(local_fid_block_params),
+        "local_fid_alpha": len(local_fid_alpha_params),
         "sem_adapter_resampler": len(sem_adapter_resampler_params),
         "sem_adapter_proj": len(sem_adapter_proj_params),
         "final_head": len(final_head_params),
@@ -1563,11 +1567,10 @@ def save_smart(
             "best_eval_metrics": {"psnr": float(psnr_v), "ssim": float(ssim_v), "lpips": float(lpips_v)},
             "best_eval_tag": str(eval_tag),
             "train_runtime_log": dict(LAST_TRAIN_LOG),
-            "injection_config": {
-                "hard_layers": sorted(list(getattr(pixart, "anchor_layers", HARD_INJECTION_LAYERS))),
-                "detail_layers": list(getattr(pixart, "detail_injection_layers", DETAIL_INJECTION_LAYERS)),
-                "injection_layer_to_level": dict(getattr(pixart, "injection_layer_to_level", {})),
-                "ref_token_hw": int(getattr(adapter, "ref_token_hw", 32)),
+            "layer_config": {
+                "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
+                "semantic_layers": list(getattr(pixart, "semantic_layers", SEMANTIC_LAYERS)),
+                "local_fidelity_layers": list(getattr(pixart, "local_fidelity_layers", LOCAL_FIDELITY_LAYERS)),
             },
         }
         return state
@@ -1791,6 +1794,8 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
         cond_deltas = []
         adapter_map_stds = []
         sem_tok_stds, sem_out_stds, sem_alphas, sem_gates = [], [], [], []
+        sem_pre_stds, sem_post_stds = [], []
+        local_res_stds, local_alphas, local_gates = [], [], []
         sft_tau_means, sft_alpha_means = [], []
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
@@ -1816,6 +1821,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
                     lr_01_for_semantics = ((batch["lr"].to(DEVICE, dtype=COMPUTE_DTYPE)) + 1.0) * 0.5
                     sem_tokens = sem_adapter(lr_01_for_semantics)
+                    sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                     if USE_FIXED_HARD_PROMPT and hard_prompt_pack is not None:
                         y_cond = hard_prompt_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                         y_mask_cond = hard_prompt_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
@@ -1831,10 +1837,16 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
                     adapter_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
                     sem_tok_stds.append(float(sem_tokens.detach().float().std().item()))
+                    sem_pre_stds.append(float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)))
+                    sem_post_stds.append(float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0)))
                     sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
                     sem_out_stds.append(float(sem_stats.get("semantic_out_std", 0.0)))
                     sem_alphas.append(float(sem_stats.get("semantic_alpha", 0.0)))
                     sem_gates.append(float(sem_stats.get("semantic_gate_mean", 0.0)))
+                    local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
+                    local_res_stds.append(float(local_stats.get("local_res_std", 0.0)))
+                    local_alphas.append(float(local_stats.get("local_alpha", 0.0)))
+                    local_gates.append(float(local_stats.get("local_gate_mean", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                     sft_tau_means.append(float(sft_stats.get("tau_mean", 0.0)))
@@ -1883,14 +1895,19 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
         adapter_map_std = float(np.mean(adapter_map_stds)) if len(adapter_map_stds) > 0 else 0.0
         sem_tok_std = float(np.mean(sem_tok_stds)) if len(sem_tok_stds) > 0 else 0.0
+        sem_pre_std = float(np.mean(sem_pre_stds)) if len(sem_pre_stds) > 0 else 0.0
+        sem_post_std = float(np.mean(sem_post_stds)) if len(sem_post_stds) > 0 else 0.0
         sem_out_std = float(np.mean(sem_out_stds)) if len(sem_out_stds) > 0 else 0.0
         sem_alpha = float(np.mean(sem_alphas)) if len(sem_alphas) > 0 else 0.0
         sem_gate = float(np.mean(sem_gates)) if len(sem_gates) > 0 else 0.0
+        local_res_std = float(np.mean(local_res_stds)) if len(local_res_stds) > 0 else 0.0
+        local_alpha = float(np.mean(local_alphas)) if len(local_alphas) > 0 else 0.0
+        local_gate = float(np.mean(local_gates)) if len(local_gates) > 0 else 0.0
         sft_tau_mean = float(np.mean(sft_tau_means)) if len(sft_tau_means) > 0 else 0.0
         sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | ad_map_std={adapter_map_std:.4f} | sem_tok_std={sem_tok_std:.4f} | sem_out_std={sem_out_std:.4f} | sem_alpha={sem_alpha:.4f} | sem_gate={sem_gate:.4f} | sem_K={16} | "
+            f"CONDΔ={cdelta:.5f} | ad_map_std={adapter_map_std:.4f} | sem_tok_std={sem_tok_std:.4f} | sem_pre_std={sem_pre_std:.4f} | sem_post_std={sem_post_std:.4f} | sem_out_std={sem_out_std:.4f} | sem_alpha={sem_alpha:.4f} | sem_gate={sem_gate:.4f} | local_res_std={local_res_std:.4f} | local_alpha={local_alpha:.4f} | local_gate={local_gate:.4f} | sem_K={16} | "
             f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
@@ -1938,19 +1955,12 @@ def main():
         "kv_compress_layer": list(KV_COMPRESS_LAYERS),
     } if KV_COMPRESS_ENABLE else None
 
-    inj_cfg = load_resume_injection_config({
-        "hard_layers": list(HARD_INJECTION_LAYERS),
-        "detail_layers": list(DETAIL_INJECTION_LAYERS),
-        "injection_layer_to_level": dict(DEFAULT_INJECTION_LAYER_TO_LEVEL),
-        "ref_token_hw": 32,
-    })
-
     pixart = PixArtSigmaSR_XL_2(
         input_size=64, in_channels=4, out_channels=4,
         force_null_caption=False,
-        hard_injection_layers=list(inj_cfg["hard_layers"]),
-        detail_injection_layers=list(inj_cfg["detail_layers"]),
-        injection_layer_to_level=dict(inj_cfg.get("injection_layer_to_level", DEFAULT_INJECTION_LAYER_TO_LEVEL)),
+        anchor_layers=list(ANCHOR_LAYERS),
+        semantic_layers=list(SEMANTIC_LAYERS),
+        local_fidelity_layers=list(LOCAL_FIDELITY_LAYERS),
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
     set_grad_checkpoint(pixart, use_fp32_attention=False, gc_step=1)
@@ -2106,6 +2116,7 @@ def main():
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 lr_01_for_semantics = (lr.to(COMPUTE_DTYPE) + 1.0) * 0.5
                 sem_tokens = sem_adapter(lr_01_for_semantics)
+                sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                 if USE_FIXED_HARD_PROMPT:
                     y_cond = hard_prompt_pack["y"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
                     y_mask = hard_prompt_pack["mask"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
@@ -2131,6 +2142,46 @@ def main():
                 if out.shape[1] != 4:
                     raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
                 model_pred = out.float()
+                sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
+                local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
+                guard_stats = {
+                    "sem_tok_std": float(sem_tokens.detach().float().std().item()),
+                    "sem_pre_std": float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)),
+                    "sem_post_std": float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0)),
+                    "semantic_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
+                    "semantic_alpha": float(sem_stats.get("semantic_alpha", 0.0)),
+                    "semantic_gate_mean": float(sem_stats.get("semantic_gate_mean", 0.0)),
+                    "local_res_std": float(local_stats.get("local_res_std", 0.0)),
+                    "local_alpha": float(local_stats.get("local_alpha", 0.0)),
+                    "local_gate_mean": float(local_stats.get("local_gate_mean", 0.0)),
+                    "ad_map_std": float(cond_in["cond_map"].detach().float().std().item()),
+                    "sft_strength": float(sft_strength),
+                    "t_min": int(t.min().item()),
+                    "t_max": int(t.max().item()),
+                    "t_mean": float(t.float().mean().item()),
+                }
+                assert_finite_tensor("sem_tokens", sem_tokens, guard_stats)
+                assert_finite_tensor("cond_map", cond_in["cond_map"], guard_stats)
+                assert_finite_tensor("model_pred", model_pred, guard_stats)
+                drop_uncond_guard = torch.ones(zt.shape[0], device=DEVICE, dtype=torch.long)
+                cond_zero_guard = mask_adapter_cond(cond_in, torch.zeros((zt.shape[0],), device=DEVICE))
+                y_uncond_guard = null_pack["y"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
+                y_mask_uncond_guard = null_pack["mask"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
+                with torch.no_grad():
+                    out_uncond_guard = pixart(
+                        x=zt.detach(),
+                        timestep=t,
+                        y=y_uncond_guard,
+                        aug_level=aug_level_emb,
+                        mask=y_mask_uncond_guard,
+                        data_info=d_info,
+                        adapter_cond=cond_zero_guard,
+                        semantic_tokens=None,
+                        force_drop_ids=drop_uncond_guard,
+                        sft_strength=sft_strength,
+                    ).float()
+                assert_finite_tensor("out_uncond", out_uncond_guard, guard_stats)
+                cond_delta_curr = float((model_pred.detach() - out_uncond_guard).abs().mean().item())
 
                 # [V8 Logic] Calculate V-Target
                 # v = alpha * epsilon - sigma * x0
@@ -2212,6 +2263,7 @@ def main():
                     + w.get('lpips', 0.0) * loss_lpips
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
+                assert_finite_tensor("loss", loss, guard_stats)
 
             loss.backward()
             accum_micro_steps += 1
@@ -2232,12 +2284,21 @@ def main():
                 alpha_mean_sft = float(sft_stats.get("alpha_mean", 0.0))
                 alpha_min = float(sft_stats.get("alpha_min", 0.0))
                 alpha_max = float(sft_stats.get("alpha_max", 0.0))
+                sft_strength_logged = float(sft_stats.get("sft_strength", sft_strength))
                 sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
+                local_stats = getattr(pixart, "_last_local_fidelity_stats", {}) or {}
+                sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                 sem_tok_std = float(sem_tokens.detach().float().std().item())
+                sem_pre_std = float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0))
+                sem_post_std = float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0))
                 sem_out_std = float(sem_stats.get("semantic_out_std", 0.0))
                 sem_alpha = float(sem_stats.get("semantic_alpha", 0.0))
                 sem_gate = float(sem_stats.get("semantic_gate_mean", 0.0))
+                local_res_std = float(local_stats.get("local_res_std", 0.0))
+                local_alpha = float(local_stats.get("local_alpha", 0.0))
+                local_gate = float(local_stats.get("local_gate_mean", 0.0))
                 adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
+                cond_delta = float(cond_delta_curr)
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2253,21 +2314,27 @@ def main():
                     'px_n': f"{patch_loss_num_samples}",
                     'w_lr': f"{w.get('lr_cons', 0.0):.3f}",
                     'lp_w': f"{w.get('lpips', 0.0):.3f}",
-                    'sft_s': f"{sft_strength:.3f}",
+                    'sft_s': f"{sft_strength_logged:.3f}",
                     'val_psnr': f"{last_val_psnr:.2f}",
                     'sft_tau': f"{tau_mean:.3f}",
                     'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
                     'sem_tok_std': f"{sem_tok_std:.4f}",
+                    'sem_pre_std': f"{sem_pre_std:.4f}",
+                    'sem_post_std': f"{sem_post_std:.4f}",
                     'sem_out_std': f"{sem_out_std:.4f}",
                     'sem_alpha': f"{sem_alpha:.4f}",
                     'sem_gate': f"{sem_gate:.4f}",
+                    'local_res_std': f"{local_res_std:.4f}",
+                    'local_alpha': f"{local_alpha:.4f}",
+                    'local_gate': f"{local_gate:.4f}",
+                    'cond_delta': f"{cond_delta:.5f}",
                     'sem_K': f"{16}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
                 }
-                log_dict["sft_strength"] = f"{sft_strength:.3f}"
+                log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
-                    "sft_strength": float(sft_strength),
+                    "sft_strength": float(sft_strength_logged),
                     "lpips_train_weight": float(w.get('lpips', 0.0)),
                     "lpips_num_samples": int(lpips_num_samples),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
@@ -2277,9 +2344,15 @@ def main():
                     "alpha_min": alpha_min,
                     "alpha_max": alpha_max,
                     "sem_tok_std": sem_tok_std,
+                    "sem_pre_std": sem_pre_std,
+                    "sem_post_std": sem_post_std,
                     "sem_out_std": sem_out_std,
                     "sem_alpha": sem_alpha,
                     "sem_gate": sem_gate,
+                    "local_res_std": local_res_std,
+                    "local_alpha": local_alpha,
+                    "local_gate": local_gate,
+                    "cond_delta": cond_delta,
                     "sem_K": 16,
                     "adapter_map_std": adapter_map_std,
                 }

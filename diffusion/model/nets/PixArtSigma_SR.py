@@ -25,14 +25,35 @@ class SFTLayer(nn.Module):
         return feat * (1 + gain * scale) + gain * shift, scale, shift
 
 
+class LocalFidelityFusion(nn.Module):
+    def __init__(self, feat_nc=1152, cond_nc=64, mid_nc=128):
+        super().__init__()
+        self.cond_proj = nn.Conv2d(cond_nc, mid_nc, 1)
+        self.fuse_in = nn.Conv2d(feat_nc + mid_nc, mid_nc, 1)
+        self.dw = nn.Conv2d(mid_nc, mid_nc, 3, padding=1, groups=mid_nc)
+        self.act = nn.GELU()
+        self.fuse_out = nn.Conv2d(mid_nc, feat_nc, 1)
+        nn.init.zeros_(self.fuse_out.weight)
+        nn.init.zeros_(self.fuse_out.bias)
+
+    def forward(self, x_map: torch.Tensor, cond_red: torch.Tensor) -> torch.Tensor:
+        cond_feat = self.cond_proj(cond_red)
+        h = torch.cat([x_map, cond_feat], dim=1)
+        h = self.fuse_in(h)
+        h = self.dw(h)
+        h = self.act(h)
+        h = self.fuse_out(h)
+        return h
+
+
 @MODELS.register_module()
 class PixArtSigmaSR(PixArtMS):
     def __init__(
         self,
         force_null_caption: bool = True,
-        hard_injection_layers=None,
-        detail_injection_layers=None,
-        injection_layer_to_level=None,
+        anchor_layers=None,
+        semantic_layers=None,
+        local_fidelity_layers=None,
         **kwargs
     ):
         kwargs.setdefault("model_max_length", 300)
@@ -58,15 +79,23 @@ class PixArtSigmaSR(PixArtMS):
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
-        _ = hard_injection_layers
-        _ = detail_injection_layers
-        _ = injection_layer_to_level
-        self.sft_candidate_layers = [2, 4, 6, 8]
+        self.sft_candidate_layers = list(anchor_layers) if anchor_layers is not None else [2, 4, 6, 8]
         self.anchor_layers = set(self.sft_candidate_layers)
-        self.semantic_layers = [18, 22, 24, 26]
+        self.semantic_layers = list(semantic_layers) if semantic_layers is not None else [18, 22, 24, 26]
+        self.local_fidelity_layers = list(local_fidelity_layers) if local_fidelity_layers is not None else [22, 26]
         for i in self.semantic_layers:
             if 0 <= i < self.depth:
                 self.blocks[i].enable_semantic_adapter()
+        self.local_fidelity_blocks = nn.ModuleDict({
+            str(i): LocalFidelityFusion(feat_nc=self.hidden_size, cond_nc=64, mid_nc=128)
+            for i in self.local_fidelity_layers
+            if 0 <= i < self.depth
+        })
+        self.local_fid_alpha = nn.ParameterDict({
+            str(i): nn.Parameter(torch.tensor(1.0))
+            for i in self.local_fidelity_layers
+            if 0 <= i < self.depth
+        })
 
         self.sft_alpha = nn.ParameterDict({
             "2": nn.Parameter(torch.tensor(1.0)),
@@ -77,10 +106,11 @@ class PixArtSigmaSR(PixArtMS):
 
         self._last_sft_stats = None
         self._last_semantic_stats = None
+        self._last_local_fidelity_stats = None
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, semantic_tokens=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
-        _ = kwargs.pop("sft_strength", 1.0)
+        sft_strength = float(kwargs.pop("sft_strength", 1.0))
         bs = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
@@ -127,18 +157,33 @@ class PixArtSigmaSR(PixArtMS):
         tau_scalar = t_norm.pow(1.5)
         tau_map = tau_scalar.view(-1, 1, 1, 1).to(x.dtype)
         semantic_gate = (1.0 - tau_scalar).view(-1, 1, 1).to(x.dtype)
+        late_gate = (1.0 - tau_scalar).view(-1, 1, 1, 1).to(x.dtype)
         sem_stats = []
+        local_stats = []
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.anchor_layers:
                 b, n, c = x.shape
                 if n != self.h * self.w:
                     raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w} from input/patch rule")
                 x_map_pre = x.transpose(1, 2).reshape(b, c, self.h, self.w)
-                x_map_post, _, _ = self.sft_layers[i](x_map_pre, cond_red, strength=1.0)
+                x_map_post, _, _ = self.sft_layers[i](x_map_pre, cond_red, strength=sft_strength)
 
                 alpha_i = self.sft_alpha[str(i)].to(x_map_pre.dtype)
                 x_map = x_map_pre + (x_map_post - x_map_pre) * (alpha_i * tau_map)
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
+
+            if cond_red is not None and str(i) in self.local_fidelity_blocks:
+                b, n, c = x.shape
+                x_map_pre = x.transpose(1, 2).reshape(b, c, self.h, self.w)
+                local_res = self.local_fidelity_blocks[str(i)](x_map_pre, cond_red)
+                alpha_local = self.local_fid_alpha[str(i)].to(x_map_pre.dtype)
+                x_map = x_map_pre + (alpha_local * late_gate) * local_res
+                x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
+                local_stats.append({
+                    "local_res_std": float(local_res.detach().float().std().item()),
+                    "local_alpha": float(alpha_local.detach().float().item()),
+                    "local_gate_mean": float(late_gate.detach().float().mean().item()),
+                })
 
             block_kwargs = dict(
                 HW=(self.h, self.w),
@@ -155,14 +200,15 @@ class PixArtSigmaSR(PixArtMS):
                 sem_stats.append(blk_stats)
 
         if len(self.anchor_layers) > 0:
-            alpha_vals = [self.sft_alpha[str(i)].item() for i in self.sft_candidate_layers]
+            alpha_vals = [self.sft_alpha[str(i)].item() for i in self.sft_candidate_layers if str(i) in self.sft_alpha]
             self._last_sft_stats = {
                 "tau_mean": float(tau_scalar.mean().item()),
                 "tau_min": float(tau_scalar.min().item()),
                 "tau_max": float(tau_scalar.max().item()),
-                "alpha_mean": float(sum(alpha_vals) / len(alpha_vals)),
-                "alpha_min": float(min(alpha_vals)),
-                "alpha_max": float(max(alpha_vals)),
+                "alpha_mean": float(sum(alpha_vals) / max(1, len(alpha_vals))),
+                "alpha_min": float(min(alpha_vals) if len(alpha_vals) > 0 else 0.0),
+                "alpha_max": float(max(alpha_vals) if len(alpha_vals) > 0 else 0.0),
+                "sft_strength": float(sft_strength),
             }
         else:
             self._last_sft_stats = None
@@ -175,6 +221,15 @@ class PixArtSigmaSR(PixArtMS):
             }
         else:
             self._last_semantic_stats = None
+
+        if len(local_stats) > 0:
+            self._last_local_fidelity_stats = {
+                "local_res_std": float(sum(s["local_res_std"] for s in local_stats) / len(local_stats)),
+                "local_alpha": float(sum(s["local_alpha"] for s in local_stats) / len(local_stats)),
+                "local_gate_mean": float(sum(s["local_gate_mean"] for s in local_stats) / len(local_stats)),
+            }
+        else:
+            self._last_local_fidelity_stats = None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
