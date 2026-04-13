@@ -137,6 +137,29 @@ def randn_like_with_generator(tensor, generator):
     return torch.randn(tensor.shape, device=tensor.device, dtype=tensor.dtype, generator=generator)
 
 
+def load_prompt_pack(path: str, pack_name: str = "prompt") -> dict:
+    pack = torch.load(path, map_location="cpu")
+    legacy_converted = False
+    if "y" not in pack:
+        if "hidden" in pack:
+            pack["y"] = pack["hidden"].unsqueeze(1)
+            legacy_converted = True
+        else:
+            raise KeyError(f"Invalid {pack_name} prompt pack: missing both 'y' and legacy 'hidden'")
+    if "mask" not in pack:
+        if "attention_mask" in pack:
+            pack["mask"] = pack["attention_mask"].unsqueeze(1).unsqueeze(1)
+            legacy_converted = True
+        else:
+            raise KeyError(f"Invalid {pack_name} prompt pack: missing both 'mask' and legacy 'attention_mask'")
+    if pack["y"].dim() != 4:
+        raise RuntimeError(f"Invalid {pack_name} prompt pack: y must be 4D, got shape={tuple(pack['y'].shape)}")
+    if pack["mask"].dim() != 4:
+        raise RuntimeError(f"Invalid {pack_name} prompt pack: mask must be 4D, got shape={tuple(pack['mask'].shape)}")
+    pack["_legacy_converted"] = bool(legacy_converted)
+    return pack
+
+
 def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     strength = float(max(0.0, min(1.0, strength)))
     scheduler.set_timesteps(steps, device=z_lr.device)
@@ -582,9 +605,11 @@ def build_model_and_assets(args, device, compute_dtype):
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
 
-    null_pack = torch.load(args.null_t5_embed_path, map_location="cpu")
-    if ("y" not in null_pack) or ("mask" not in null_pack):
-        raise KeyError("Null T5 embed file missing key 'y' or 'mask'")
+    null_pack = load_prompt_pack(args.null_t5_embed_path, pack_name="null")
+    print(f"[null-pack] loaded from: {args.null_t5_embed_path}")
+    print(f"[null-pack] y shape: {tuple(null_pack['y'].shape)}")
+    print(f"[null-pack] mask shape: {tuple(null_pack['mask'].shape)}")
+    print(f"[null-pack] legacy converted: {bool(null_pack.get('_legacy_converted', False))}")
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
         beta_start=0.0001,

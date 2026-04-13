@@ -510,6 +510,29 @@ def randn_like_with_generator(tensor, generator):
     return torch.randn(tensor.shape, device=tensor.device, dtype=tensor.dtype, generator=generator)
 
 
+def load_prompt_pack(path: str, pack_name: str = "prompt") -> dict:
+    pack = torch.load(path, map_location="cpu")
+    legacy_converted = False
+    if "y" not in pack:
+        if "hidden" in pack:
+            pack["y"] = pack["hidden"].unsqueeze(1)
+            legacy_converted = True
+        else:
+            raise KeyError(f"Invalid {pack_name} prompt pack: missing both 'y' and legacy 'hidden'")
+    if "mask" not in pack:
+        if "attention_mask" in pack:
+            pack["mask"] = pack["attention_mask"].unsqueeze(1).unsqueeze(1)
+            legacy_converted = True
+        else:
+            raise KeyError(f"Invalid {pack_name} prompt pack: missing both 'mask' and legacy 'attention_mask'")
+    if pack["y"].dim() != 4:
+        raise RuntimeError(f"Invalid {pack_name} prompt pack: y must be 4D, got shape={tuple(pack['y'].shape)}")
+    if pack["mask"].dim() != 4:
+        raise RuntimeError(f"Invalid {pack_name} prompt pack: mask must be 4D, got shape={tuple(pack['mask'].shape)}")
+    pack["_legacy_converted"] = bool(legacy_converted)
+    return pack
+
+
 def _decode_vae_sample_checkpointed(vae: nn.Module, latents: torch.Tensor) -> torch.Tensor:
     """Decode latents with non-reentrant activation checkpoint to reduce peak memory."""
     def _decode_fn(z):
@@ -1999,14 +2022,15 @@ def main():
 
     if not os.path.exists(NULL_T5_EMBED_PATH):
         raise FileNotFoundError(f"Null T5 embed not found: {NULL_T5_EMBED_PATH}")
-    null_pack = torch.load(NULL_T5_EMBED_PATH, map_location="cpu")
-    if ("y" not in null_pack) or ("mask" not in null_pack):
-        raise KeyError(f"Invalid null T5 embed file (missing key 'y'): {NULL_T5_EMBED_PATH}")
+    null_pack = load_prompt_pack(NULL_T5_EMBED_PATH, pack_name="null")
     y_null = null_pack["y"].to(DEVICE)
     mask_null = null_pack["mask"].to(DEVICE)
     if y_null.ndim != 4:
         raise RuntimeError(f"Invalid y shape from offline null T5 embed: {tuple(y_null.shape)} (expected [1,1,L,C])")
-    print(f"✅ Loaded offline null T5 embedding: y.shape={tuple(y_null.shape)}")
+    print(f"[null-pack] loaded from: {NULL_T5_EMBED_PATH}")
+    print(f"[null-pack] y shape: {tuple(y_null.shape)}")
+    print(f"[null-pack] mask shape: {tuple(mask_null.shape)}")
+    print(f"[null-pack] legacy converted: {bool(null_pack.get('_legacy_converted', False))}")
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
     # Single-stage optimizer is built once.
