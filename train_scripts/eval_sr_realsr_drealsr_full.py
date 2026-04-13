@@ -585,10 +585,6 @@ def build_model_and_assets(args, device, compute_dtype):
     null_pack = torch.load(args.null_t5_embed_path, map_location="cpu")
     if ("y" not in null_pack) or ("mask" not in null_pack):
         raise KeyError("Null T5 embed file missing key 'y' or 'mask'")
-    hard_prompt_pack = torch.load(args.hard_prompt_embed_path, map_location="cpu")
-    if ("y" not in hard_prompt_pack) or ("mask" not in hard_prompt_pack):
-        raise KeyError("Hard prompt embed file missing key 'y' or 'mask'")
-
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
         beta_start=0.0001,
@@ -602,11 +598,11 @@ def build_model_and_assets(args, device, compute_dtype):
     pixart.eval()
     adapter.eval()
     sem_adapter.eval()
-    return pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler
+    return pixart, adapter, sem_adapter, vae, null_pack, scheduler
 
 
 @torch.no_grad()
-def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, batch, args, device, compute_dtype, gen):
+def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen):
     hr = batch["hr"].to(device)
     lr = batch["lr"].to(device)
     lr_small = batch["lr_small"].to(device)
@@ -634,9 +630,13 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_p
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
+            # LR-derived cond_map is for shallow structure anchoring only.
+            # native text path uses null prompt in this experiment.
+            # semantic adapter is the only late semantic/detail guidance.
             sem_tokens = sem_adapter((lr.to(compute_dtype) + 1.0) * 0.5)
-            y_cond = hard_prompt_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
-            mask_cond = hard_prompt_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            # native text path uses null prompt in this experiment
+            y_cond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            mask_cond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             y_uncond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_uncond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
@@ -734,7 +734,7 @@ def nanmean(xs):
     return float(sum(vals) / len(vals))
 
 
-def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, device, compute_dtype):
+def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype):
     base_out = Path(args.output_dir) / dataset_name
     preds_dir = base_out / "preds"
     trip_dir = base_out / "triptychs"
@@ -754,7 +754,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.max_samples > 0 and idx >= args.max_samples:
             break
 
-        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, batch, args, device, compute_dtype, gen)
+        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen)
         m = metric_suite.compute(pred, hr)
         m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
         m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
@@ -940,7 +940,6 @@ def parse_args():
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--vae_path", type=str, default="/home/hello/HJT/PixArt-sigma/output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers/vae")
     parser.add_argument("--null_t5_embed_path", type=str, default="/home/hello/HJT/PixArt-sigma/output/pretrained_models/null_t5_embed_sigma_300.pth")
-    parser.add_argument("--hard_prompt_embed_path", type=str, required=True)
     parser.add_argument("--semantic_encoder_name_or_path", type=str, default="openai/clip-vit-large-patch14")
 
     parser.add_argument("--realsr_roots", type=str, nargs="*", default=["/data/RealSR/Nikon/Test/4", "/data/RealSR/Canon/Test/4"])
@@ -987,19 +986,19 @@ def main():
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
+    pixart, adapter, sem_adapter, vae, null_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
     metric_suite = MetricSuite()
 
     paper_rows = []
     if args.dataset in ("realsr", "both"):
         realsr_ds = RealSRValPairedDataset(roots=args.realsr_roots, crop_size=args.crop_size)
         realsr_loader = DataLoader(realsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, device, compute_dtype))
+        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype))
 
     if args.dataset in ("drealsr", "both"):
         drealsr_ds = DRealSRPairedDataset(args.drealsr_hr_dir, args.drealsr_lr_dir, crop_size=args.crop_size)
         drealsr_loader = DataLoader(drealsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, hard_prompt_pack, scheduler, device, compute_dtype))
+        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype))
 
     if args.dataset == "both" and len(paper_rows) > 0:
         ckpt_name = Path(args.ckpt_path).stem

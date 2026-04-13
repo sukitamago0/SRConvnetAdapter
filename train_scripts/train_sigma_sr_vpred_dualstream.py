@@ -78,8 +78,10 @@ def get_required_active_key_fragments_for_model(model: nn.Module):
     return tuple(required)
 
 # ================= 2. Hyper-parameters =================
-# LR only for shallow structure anchor.
-# Semantic prompt only through decoupled semantic branch.
+# LR-derived cond_map is for shallow structure anchoring only.
+# native text path uses null prompt in this experiment.
+# semantic adapter is the only late semantic/detail guidance.
+# fine details should be generated mainly by semantic guidance + pretrained PixArt prior.
 TRAIN_DF2K_HR_DIR = "/data/DF2K/DF2K_train_HR"
 TRAIN_DF2K_LR_DIR = "/data/DF2K/DF2K_train_LR_unknown"
 TRAIN_REALSR_DIRS = [
@@ -132,8 +134,7 @@ LORA_RANK = 32
 LORA_ALPHA = 32
 SEMANTIC_ENCODER_NAME_OR_PATH = os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "openai/clip-vit-large-patch14")
 ALLOW_SEM_ADAPTER_NONSTRICT_RESUME = False
-USE_FIXED_HARD_PROMPT = True
-HARD_PROMPT_EMBED_PATH = "/home/hello/HJT/pretrained_models/pixart_prompts/restoration_hard_prompt_sigma_300.pth"
+USE_FIXED_HARD_PROMPT = False
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
@@ -718,7 +719,7 @@ def get_config_snapshot():
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV12",
-        "control_type": "structure_sft + decoupled_semantic",
+        "control_type": "structure_only_lr + null_text + decoupled_semantic",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
         "adapter_token_head": "structure-only cond_map head",
         "internal_control_type": "disabled",
@@ -727,7 +728,7 @@ def get_config_snapshot():
         "semantic_prompt_source": "CLIP + IP-Adapter Resampler + decoupled cross-attn",
         "semantic_prompt_tokens": 16,
         "use_native_text_path": True,
-        "hard_prompt_path": HARD_PROMPT_EMBED_PATH,
+        "native_text_is_null": True,
         "lr_control_role": "structure_only",
         "anchor_layers": list(ANCHOR_LAYERS),
         "semantic_layers": list(SEMANTIC_LAYERS),
@@ -1757,7 +1758,7 @@ def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_
 
 # ================= 9. Validation =================
 @torch.no_grad()
-def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, hard_prompt_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
+def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
     tag = str(val_tag).lower()
     print(f"🔎 Validating Epoch {epoch+1} [{tag}]...")
     pixart.eval(); adapter.eval(); sem_adapter.eval()
@@ -1816,12 +1817,8 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, ha
                     lr_01_for_semantics = ((batch["lr"].to(DEVICE, dtype=COMPUTE_DTYPE)) + 1.0) * 0.5
                     sem_tokens = sem_adapter(lr_01_for_semantics)
                     sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
-                    if USE_FIXED_HARD_PROMPT and hard_prompt_pack is not None:
-                        y_cond = hard_prompt_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
-                        y_mask_cond = hard_prompt_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
-                    else:
-                        y_cond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
-                        y_mask_cond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                    y_cond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                    y_mask_cond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_uncond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_uncond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     out_uncond = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond_zero, semantic_tokens=None, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
@@ -1915,8 +1912,6 @@ def main():
     validate_s2d_decoupling()
     print(f"[CUDA Allocator] PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')}")
     required_paths = [PIXART_PATH, VAE_PATH, NULL_T5_EMBED_PATH]
-    if USE_FIXED_HARD_PROMPT:
-        required_paths.append(HARD_PROMPT_EMBED_PATH)
     for pth in required_paths:
         if not os.path.exists(pth):
             raise FileNotFoundError(f"Required pretrained path missing: {pth}")
@@ -2008,13 +2003,6 @@ def main():
     if y_null.ndim != 4:
         raise RuntimeError(f"Invalid y shape from offline null T5 embed: {tuple(y_null.shape)} (expected [1,1,L,C])")
     print(f"✅ Loaded offline null T5 embedding: y.shape={tuple(y_null.shape)}")
-    hard_prompt_pack = None
-    if USE_FIXED_HARD_PROMPT:
-        hard_prompt_pack = torch.load(HARD_PROMPT_EMBED_PATH, map_location="cpu")
-        if ("y" not in hard_prompt_pack) or ("mask" not in hard_prompt_pack):
-            raise KeyError(f"Invalid hard prompt embed file (missing key 'y' or 'mask'): {HARD_PROMPT_EMBED_PATH}")
-        print(f"✅ Loaded fixed hard prompt embedding: y.shape={tuple(hard_prompt_pack['y'].shape)}")
-
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
     # Single-stage optimizer is built once.
@@ -2104,15 +2092,13 @@ def main():
                 cond_in = mask_adapter_cond(cond, keep)
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+                # semantic adapter is the only late semantic/detail guidance
                 lr_01_for_semantics = (lr.to(COMPUTE_DTYPE) + 1.0) * 0.5
                 sem_tokens = sem_adapter(lr_01_for_semantics)
                 sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
-                if USE_FIXED_HARD_PROMPT:
-                    y_cond = hard_prompt_pack["y"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
-                    y_mask = hard_prompt_pack["mask"].to(DEVICE).repeat(zt.shape[0], 1, 1, 1)
-                else:
-                    y_cond = y_null.repeat(zt.shape[0], 1, 1, 1)
-                    y_mask = mask_null.repeat(zt.shape[0], 1, 1, 1)
+                # native text path uses null prompt in this experiment
+                y_cond = y_null.repeat(zt.shape[0], 1, 1, 1)
+                y_mask = mask_null.repeat(zt.shape[0], 1, 1, 1)
                 drop_cond = torch.zeros(zt.shape[0], device=DEVICE, dtype=torch.long)
                 sft_strength = get_sft_strength(epoch + 1)
                 kwargs = dict(
@@ -2354,7 +2340,7 @@ def main():
         log_injection_scale_stats(pixart, prefix=f"[InjectScale][Ep{epoch+1}]")
         validation_count += 1
         print(f"🔎 [VAL] Raw weights (validation #{validation_count})")
-        val_raw = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, hard_prompt_pack, d_info, lpips_fn_val_cpu, val_tag="raw")
+        val_raw = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="raw")
 
         run_ema_val = (
             (ema is not None)
@@ -2366,7 +2352,7 @@ def main():
         if run_ema_val:
             print(f"🔎 [VAL] EMA weights (validation #{validation_count})")
             ema.apply(ema_named_params)
-            val_ema = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, hard_prompt_pack, d_info, lpips_fn_val_cpu, val_tag="ema")
+            val_ema = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="ema")
             ema.restore(ema_named_params)
 
         raw_metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
