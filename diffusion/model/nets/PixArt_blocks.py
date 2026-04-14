@@ -22,6 +22,7 @@ from einops import rearrange
 from timm.models.vision_transformer import Mlp, Attention as Attention_
 
 _XFORMERS_FALLBACK_WARNED = False
+_PACKED_TEXT_SAFE_FALLBACK_WARNED = False
 
 
 def modulate(x, shift, scale):
@@ -169,6 +170,8 @@ class DecoupledImageTextCrossAttention(nn.Module):
         return out
 
     def _text_attention_fallback_per_sample(self, q_heads, k_text_heads, v_text_heads, text_lens, dropout_p=0.0):
+        # this path is the only safe fallback for packed text attention.
+        # it avoids cross-sample leakage when xformers packed attention is unavailable or fails.
         b = q_heads.shape[0]
         outs = []
         for bi in range(b):
@@ -186,21 +189,28 @@ class DecoupledImageTextCrossAttention(nn.Module):
         return torch.cat(outs, dim=0)
 
     def forward(self, x, text_cond, image_cond=None, text_mask=None, image_gate=None):
+        global _PACKED_TEXT_SAFE_FALLBACK_WARNED
         b, n, c = x.shape
         q_heads = rearrange(self.q_linear(x), "b n (h d) -> b h n d", h=self.num_heads)
 
         text_ctx_heads = None
+        # packed text attention must not use generic fallback helper, because BlockDiagonalMask
+        # cannot be converted to a valid SDPA mask by the generic helper. if packed xformers
+        # fails, fall back to per-sample safe attention instead.
         if XFORMERS_AVAILABLE and (text_mask is not None) and (text_cond.shape[0] == 1):
             try:
                 q_pack = rearrange(q_heads, "b h n d -> 1 (b n) h d")
                 k_pack = self.k_text_linear(text_cond).view(1, -1, self.num_heads, self.head_dim)
                 v_pack = self.v_text_linear(text_cond).view(1, -1, self.num_heads, self.head_dim)
                 attn_bias = xops.fmha.BlockDiagonalMask.from_seqlens([n] * b, text_mask)
-                text_ctx_pack = memory_efficient_attention_fallback(q_pack, k_pack, v_pack, p=self.attn_drop.p, attn_bias=attn_bias)
+                text_ctx_pack = xops.memory_efficient_attention(q_pack, k_pack, v_pack, p=self.attn_drop.p, attn_bias=attn_bias)
                 text_ctx_heads = rearrange(text_ctx_pack, "1 (b n) h d -> b h n d", b=b, n=n, h=self.num_heads)
             except Exception:
                 text_ctx_heads = None
         if text_ctx_heads is None:
+            if text_mask is not None and text_cond.shape[0] == 1 and (not _PACKED_TEXT_SAFE_FALLBACK_WARNED):
+                print("⚠️ Packed text xFormers failed; switched to per-sample safe fallback to avoid cross-sample leakage.")
+                _PACKED_TEXT_SAFE_FALLBACK_WARNED = True
             if text_mask is None:
                 raise RuntimeError("Packed text fallback requires per-sample text lengths to avoid cross-sample leakage.")
             text_padded = self._packed_to_padded(text_cond, text_mask, b)
