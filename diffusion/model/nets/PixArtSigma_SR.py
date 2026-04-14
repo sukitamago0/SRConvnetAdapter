@@ -57,8 +57,10 @@ class PixArtSigmaSR(PixArtMS):
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
+        # anchor_layers = early structure-only band.
         self.sft_candidate_layers = list(anchor_layers) if anchor_layers is not None else list(range(0, 8))
         self.anchor_layers = set(self.sft_candidate_layers)
+        # semantic_layers = late semantic-only band.
         self.semantic_layers = list(semantic_layers) if semantic_layers is not None else list(range(24, 28))
         for i in self.semantic_layers:
             if 0 <= i < self.depth:
@@ -177,6 +179,15 @@ class PixArtSigmaSR(PixArtMS):
                 "semantic_block_ids_active": sorted(list(set(active_ids))),
                 "semantic_block_ids_nonfinite": sorted(list(set(nonfinite_ids))),
             }
+            if len(nonfinite_ids) > 0:
+                sem_tok_std = float(semantic_tokens.detach().float().std().item()) if semantic_tokens is not None else 0.0
+                print(
+                    f"[Semantic-NonFinite] timestep_min={float(timestep.float().min().item()):.1f} "
+                    f"timestep_max={float(timestep.float().max().item()):.1f} sem_tok_std={sem_tok_std:.5f} "
+                    f"sem_out_std={self._last_semantic_stats['semantic_out_std']:.5f} "
+                    f"semantic_gate_mean={self._last_semantic_stats['semantic_gate_mean']:.5f} "
+                    f"nonfinite_blocks={self._last_semantic_stats['semantic_block_ids_nonfinite']}"
+                )
         else:
             self._last_semantic_stats = None
 

@@ -702,20 +702,22 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
-            # LR-derived cond_map is for shallow structure anchoring only.
-            # native text path uses null prompt in this experiment.
-            # semantic adapter is the only late semantic/detail guidance.
+            # LR is early structural condition only.
+            # semantic/text are late-detail semantic conditions.
+            # no late LR detail control.
             sem_tokens = sem_adapter((lr.to(compute_dtype) + 1.0) * 0.5)
-            # native text path uses null prompt in this experiment
+            # conditional prompt source = adaptive cache (if enabled); unconditional prompt source = null prompt.
             y_cond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_cond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             if USE_ADAPTIVE_TEXT_PROMPT and ADAPTIVE_PROMPT_CACHE_ROOT:
                 prompt_packs, prompt_cache_hit_rate, avg_prompt_token_count, avg_prompt_nonpad_ratio = load_adaptive_prompt_batch(
                     sample_keys, ADAPTIVE_PROMPT_CACHE_ROOT, prompt_cache_mem
                 )
-                if all(p is not None for p in prompt_packs):
-                    y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(device)
-                    mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(device)
+                if not all(p is not None for p in prompt_packs):
+                    num_missing = int(sum(1 for p in prompt_packs if p is None))
+                    raise RuntimeError(f"Adaptive prompt cache miss during full-eval: missing={num_missing}/{len(prompt_packs)}")
+                y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(device)
+                mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(device)
             y_uncond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_uncond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
@@ -1032,7 +1034,12 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
     print(f"✅ [{dataset_name}] wrote: {csv_path}")
     print(f"✅ [{dataset_name}] wrote: {paper_csv_path}")
     print(f"✅ [{dataset_name}] wrote: {paper_summary_csv}")
-    print(f"✅ [{dataset_name}] mean: {summary['mean']}")
+    label = "RealSR" if dataset_name.lower() == "realsr" else ("DRealSR" if dataset_name.lower() == "drealsr" else dataset_name)
+    print(
+        f"✅ [{label}] PSNR={summary['mean']['psnr']:.3f} SSIM={summary['mean']['ssim']:.4f} "
+        f"LPIPS={summary['mean']['lpips']:.4f} DISTS={summary['mean']['dists']:.4f} "
+        f"MANIQA={summary['mean']['maniqa']:.4f} MUSIQ={summary['mean']['musiq']:.4f} CLIPIQA={summary['mean']['clipiqa']:.4f}"
+    )
     return paper_summary
 
 

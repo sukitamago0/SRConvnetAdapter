@@ -111,6 +111,11 @@ class CLIPSemanticAdapter(nn.Module):
         sem_tokens = self.proj(sem_tokens)
         sem_tokens = torch.clamp(self.out_scale.to(dtype=sem_tokens.dtype) * sem_tokens, -6.0, 6.0)
         postproj_std = float(sem_tokens.detach().float().std().item())
+        if not torch.isfinite(sem_tokens).all():
+            print(
+                f"[SemanticAdapter-NonFinite] sem_tokens_preproj_std={preproj_std:.6f} "
+                f"sem_tokens_postproj_std={postproj_std:.6f} sem_out_scale={float(self.out_scale.detach().float().item()):.6f}"
+            )
         self._last_sem_adapter_stats = {
             "sem_tokens_preproj_std": preproj_std,
             "sem_tokens_postproj_std": postproj_std,
