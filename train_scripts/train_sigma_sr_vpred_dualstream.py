@@ -111,7 +111,7 @@ NULL_T5_EMBED_PATH = os.path.join(PRETRAINED_ROOT, "null_t5_embed_sigma_300.pth"
 
 OUT_BASE = os.getenv("DTSR_OUT_BASE", os.path.join(PROJECT_ROOT, "experiments_results"))
 INIT_CKPT_PATH = os.getenv("DTSR_INIT_CKPT", "")  # optional bootstrap ckpt (weights only)
-OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_lora16_cassr_like")
+OUT_DIR = os.path.join(OUT_BASE, "train_sigma_sr_vpred_dualstream_lora32_cassr_like")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 VIS_DIR  = os.path.join(OUT_DIR, "vis")
@@ -170,9 +170,10 @@ CFG_SCALE = 1.0
 USE_LQ_INIT = True 
 LQ_INIT_STRENGTH = 0.3
 USE_TALA_TRAIN = True
-TALA_TRAIN_MAX_TIMESTEP = 400
 TALA_TRAIN_BLEND_POW = 1.0
 TALA_TRAIN_DETACH_LR_LATENT = True
+TALA_TRAIN_ALIGN_TO_LQ_INIT = True
+TALA_TRAIN_MIN_TIMESTEP = 400
 
 INIT_NOISE_STD = 0.0
 USE_ADAPTER_CFDROPOUT = True
@@ -592,23 +593,48 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     return latents.to(dtype=dtype), timesteps[start_index:]
 
 
-def apply_tala_train_blend(zt, z_lr, timesteps, max_timestep=400, blend_pow=1.0, detach_lr_latent=True):
-    """
-    训练早期 timestep，将 noisy HR latent 向 LR latent 轻度拉近。
-    目的是缩小训练时随机 noisy latent 与推理时 LQ-init latent 的 gap。
-    不改变监督 target，只改变训练输入 latent。
-    """
-    if detach_lr_latent:
-        z_lr = z_lr.detach()
-    active = (timesteps <= int(max_timestep)).float()
-    ratio = (1.0 - timesteps.float() / float(max_timestep)).clamp(0.0, 1.0)
-    ratio = ratio.pow(float(blend_pow)) * active
-    ratio_map = ratio.view(-1, 1, 1, 1).to(dtype=zt.dtype, device=zt.device)
-    zt_blend = (1.0 - ratio_map) * zt + ratio_map * z_lr
-    assert zt_blend.shape == zt.shape
-    assert float(ratio.min().item()) >= 0.0
-    assert float(ratio.max().item()) <= 1.0
-    return zt_blend, ratio
+def get_tala_train_interval():
+    if TALA_TRAIN_ALIGN_TO_LQ_INIT:
+        min_t = int(round(float(LQ_INIT_STRENGTH) * 999.0))
+    else:
+        min_t = int(TALA_TRAIN_MIN_TIMESTEP)
+    if TALA_TRAIN_MIN_TIMESTEP is not None and int(TALA_TRAIN_MIN_TIMESTEP) >= 0:
+        min_t = int(TALA_TRAIN_MIN_TIMESTEP) if (not TALA_TRAIN_ALIGN_TO_LQ_INIT) else max(min_t, int(TALA_TRAIN_MIN_TIMESTEP))
+    min_t = max(0, min(999, int(min_t)))
+    return min_t, 999
+
+
+def build_tala_train_latent_and_target(zh, zl, t, noise, diffusion, use_tala=True):
+    zt_hr = diffusion.q_sample(zh, t, noise)
+    alpha_t = _extract_into_tensor(diffusion.sqrt_alphas_cumprod, t, zh.shape)
+    sigma_t = _extract_into_tensor(diffusion.sqrt_one_minus_alphas_cumprod, t, zh.shape)
+    if not use_tala:
+        target_v = alpha_t * noise - sigma_t * zh.float()
+        ratio = torch.zeros((zh.shape[0],), device=zh.device, dtype=zh.dtype)
+        return zt_hr, target_v, alpha_t, sigma_t, ratio, {
+            "tala_mode": "disabled",
+            "tala_t_min": 0,
+            "tala_t_max": 0,
+            "tala_effective_eps_std": float(noise.detach().float().std().item()),
+        }
+
+    zl_src = zl.detach() if TALA_TRAIN_DETACH_LR_LATENT else zl
+    zt_lr = diffusion.q_sample(zl_src, t, noise)
+    t_min, t_max = get_tala_train_interval()
+    active = (t >= int(t_min)).float()
+    denom = max(1.0, float(t_max - t_min))
+    ratio = ((t.float() - float(t_min)) / denom).clamp(0.0, 1.0)
+    ratio = ratio.pow(float(TALA_TRAIN_BLEND_POW)) * active
+    ratio_map = ratio.view(-1, 1, 1, 1).to(dtype=zt_hr.dtype, device=zt_hr.device)
+    zt_mix = (1.0 - ratio_map) * zt_hr + ratio_map * zt_lr
+    eps_eff = (zt_mix - alpha_t * zh) / sigma_t.clamp_min(1e-6)
+    target_v = alpha_t * eps_eff - sigma_t * zh.float()
+    return zt_mix, target_v, alpha_t, sigma_t, ratio, {
+        "tala_mode": "align_to_lq_init" if TALA_TRAIN_ALIGN_TO_LQ_INIT else "min_timestep",
+        "tala_t_min": int(t_min),
+        "tala_t_max": int(t_max),
+        "tala_effective_eps_std": float(eps_eff.detach().float().std().item()),
+    }
 
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     if cond is None:
@@ -810,9 +836,10 @@ def get_config_snapshot():
         "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
         "adaptive_prompt_cache_root": ADAPTIVE_PROMPT_CACHE_ROOT,
         "use_tala_train": bool(USE_TALA_TRAIN),
-        "tala_train_max_timestep": int(TALA_TRAIN_MAX_TIMESTEP),
         "tala_train_blend_pow": float(TALA_TRAIN_BLEND_POW),
         "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
+        "tala_train_align_to_lq_init": bool(TALA_TRAIN_ALIGN_TO_LQ_INIT),
+        "tala_train_min_timestep": int(TALA_TRAIN_MIN_TIMESTEP),
         "semantic_fusion": "parallel_decoupled",
         "lr_control_role": "structure_only",
         "anchor_layers": list(ANCHOR_LAYERS),
@@ -1331,6 +1358,7 @@ def apply_lora(model):
 
 def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False):
     total_trainable_before = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
+    anchor_ids = sorted([int(i) for i in getattr(pixart, "anchor_layers", ANCHOR_LAYERS)])
     for name, p in pixart.named_parameters():
         p.requires_grad = False
 
@@ -1339,16 +1367,11 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             or "lora_A" in name
             or "lora_B" in name
             or "sft_cond_reduce" in name
-            or "sft_alpha" in name
         ):
             p.requires_grad = True
-
-        if (
-            "sft_layers.2." in name
-            or "sft_layers.4." in name
-            or "sft_layers.6." in name
-            or "sft_layers.8." in name
-        ):
+        if any(f"sft_alpha.{i}" in name for i in anchor_ids):
+            p.requires_grad = True
+        if any(f"sft_layers.{i}." in name for i in anchor_ids):
             p.requires_grad = True
         if ("semantic_cross_attn" in name) or ("semantic_out_proj" in name) or ("semantic_alpha" in name):
             p.requires_grad = True
@@ -1371,6 +1394,13 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
+    trainable_sft_layer_ids = sorted(list({int(n.split("sft_layers.")[1].split(".")[0]) for n, p in pixart.named_parameters() if p.requires_grad and "sft_layers." in n}))
+    outside_anchor = sorted(list(set(trainable_sft_layer_ids) - set(anchor_ids)))
+    print(f"[SFT-Trainable] anchor_layers={anchor_ids}")
+    print(f"[SFT-Trainable] trainable_sft_layers={trainable_sft_layer_ids}")
+    print(f"[SFT-Trainable] outside_anchor={outside_anchor}")
+    if outside_anchor:
+        raise RuntimeError(f"SFT trainable mismatch: found trainable SFT layers not in anchor_layers: {outside_anchor}")
     print(f"✅ PixArt trainable configured(single-stage): before={total_trainable_before}, after={total_trainable_after}")
 
 
