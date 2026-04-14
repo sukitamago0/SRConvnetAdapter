@@ -169,6 +169,10 @@ CFG_SCALE = 1.0
 # [V8 Change] Default to LQ-Init for validation
 USE_LQ_INIT = True 
 LQ_INIT_STRENGTH = 0.3
+USE_TALA_TRAIN = True
+TALA_TRAIN_MAX_TIMESTEP = 400
+TALA_TRAIN_BLEND_POW = 1.0
+TALA_TRAIN_DETACH_LR_LATENT = True
 
 INIT_NOISE_STD = 0.0
 USE_ADAPTER_CFDROPOUT = True
@@ -587,6 +591,25 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
         latents = z_lr + noise 
     return latents.to(dtype=dtype), timesteps[start_index:]
 
+
+def apply_tala_train_blend(zt, z_lr, timesteps, max_timestep=400, blend_pow=1.0, detach_lr_latent=True):
+    """
+    训练早期 timestep，将 noisy HR latent 向 LR latent 轻度拉近。
+    目的是缩小训练时随机 noisy latent 与推理时 LQ-init latent 的 gap。
+    不改变监督 target，只改变训练输入 latent。
+    """
+    if detach_lr_latent:
+        z_lr = z_lr.detach()
+    active = (timesteps <= int(max_timestep)).float()
+    ratio = (1.0 - timesteps.float() / float(max_timestep)).clamp(0.0, 1.0)
+    ratio = ratio.pow(float(blend_pow)) * active
+    ratio_map = ratio.view(-1, 1, 1, 1).to(dtype=zt.dtype, device=zt.device)
+    zt_blend = (1.0 - ratio_map) * zt + ratio_map * z_lr
+    assert zt_blend.shape == zt.shape
+    assert float(ratio.min().item()) >= 0.0
+    assert float(ratio.max().item()) <= 1.0
+    return zt_blend, ratio
+
 def mask_adapter_cond(cond, keep_mask: torch.Tensor):
     if cond is None:
         return None
@@ -774,7 +797,7 @@ def get_config_snapshot():
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV12",
-        "control_type": "structure_early_band + null_text + semantic_late_band",
+        "control_type": "structure_early_band + adaptive_text + image_semantic + tala_train_consistency",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
         "adapter_token_head": "structure-only cond_map head",
         "internal_control_type": "disabled",
@@ -786,6 +809,10 @@ def get_config_snapshot():
         "native_text_is_null": True,
         "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
         "adaptive_prompt_cache_root": ADAPTIVE_PROMPT_CACHE_ROOT,
+        "use_tala_train": bool(USE_TALA_TRAIN),
+        "tala_train_max_timestep": int(TALA_TRAIN_MAX_TIMESTEP),
+        "tala_train_blend_pow": float(TALA_TRAIN_BLEND_POW),
+        "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
         "semantic_fusion": "parallel_decoupled",
         "lr_control_role": "structure_only",
         "anchor_layers": list(ANCHOR_LAYERS),
@@ -1615,6 +1642,10 @@ def save_smart(
             "layer_config": {
                 "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
                 "semantic_layers": list(getattr(pixart, "semantic_layers", SEMANTIC_LAYERS)),
+                "use_tala_train": bool(USE_TALA_TRAIN),
+                "tala_train_max_timestep": int(TALA_TRAIN_MAX_TIMESTEP),
+                "tala_train_blend_pow": float(TALA_TRAIN_BLEND_POW),
+                "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
             },
         }
         return state
@@ -1819,6 +1850,12 @@ def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_
 def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
     tag = str(val_tag).lower()
     print(f"🔎 Validating Epoch {epoch+1} [{tag}]...")
+    print(
+        f"[VAL-CONFIG] use_tala_train={int(USE_TALA_TRAIN)} "
+        f"tala_train_max_timestep={int(TALA_TRAIN_MAX_TIMESTEP)} "
+        f"tala_train_blend_pow={float(TALA_TRAIN_BLEND_POW):.3f} "
+        f"tala_train_detach_lr_latent={bool(TALA_TRAIN_DETACH_LR_LATENT)}"
+    )
     pixart.eval(); adapter.eval(); sem_adapter.eval()
     results = {}
     val_gen = torch.Generator(device=DEVICE); val_gen.manual_seed(SEED)
@@ -2190,6 +2227,16 @@ def main():
             t = sample_t(zh.shape[0], DEVICE, step)
             noise = torch.randn_like(zh)
             zt = diffusion.q_sample(zh, t, noise)
+            tala_ratio = None
+            if USE_TALA_TRAIN:
+                zt, tala_ratio = apply_tala_train_blend(
+                    zt,
+                    zl,
+                    t,
+                    max_timestep=TALA_TRAIN_MAX_TIMESTEP,
+                    blend_pow=TALA_TRAIN_BLEND_POW,
+                    detach_lr_latent=TALA_TRAIN_DETACH_LR_LATENT,
+                )
             
             aug_level_emb = torch.zeros((zh.shape[0],), device=DEVICE, dtype=torch.float32)
 
@@ -2243,6 +2290,14 @@ def main():
                     raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
                 model_pred = out.float()
                 sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
+                if tala_ratio is not None:
+                    tala_ratio_mean = float(tala_ratio.detach().float().mean().item())
+                    tala_ratio_max = float(tala_ratio.detach().float().max().item())
+                    tala_active_frac = float((tala_ratio.detach().float() > 0).float().mean().item())
+                else:
+                    tala_ratio_mean = 0.0
+                    tala_ratio_max = 0.0
+                    tala_active_frac = 0.0
                 guard_stats = {
                     "sem_tok_std": float(sem_tokens.detach().float().std().item()),
                     "sem_pre_std": float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)),
@@ -2261,6 +2316,10 @@ def main():
                     "t_min": int(t.min().item()),
                     "t_max": int(t.max().item()),
                     "t_mean": float(t.float().mean().item()),
+                    "tala_on": int(USE_TALA_TRAIN),
+                    "tala_ratio_mean": float(tala_ratio_mean),
+                    "tala_ratio_max": float(tala_ratio_max),
+                    "tala_active_frac": float(tala_active_frac),
                 }
                 assert_finite_tensor("sem_tokens", sem_tokens, guard_stats)
                 assert_finite_tensor("cond_map", cond_in["cond_map"], guard_stats)
@@ -2413,6 +2472,7 @@ def main():
                 cond_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_delta = float(cond_delta_curr)
                 text_cond_delta = float(text_cond_delta_curr)
+                tala_on = int(USE_TALA_TRAIN)
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2444,6 +2504,9 @@ def main():
                     'p_hit': f"{prompt_cache_hit_rate:.3f}",
                     'p_tok': f"{avg_prompt_token_count:.1f}",
                     'p_nonpad': f"{avg_prompt_nonpad_ratio:.3f}",
+                    'tala_on': f"{tala_on}",
+                    'tala_r': f"{tala_ratio_mean:.3f}/{tala_ratio_max:.3f}",
+                    'tala_af': f"{tala_active_frac:.3f}",
                     'sem_K': f"{16}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
                     'cond_map_std': f"{cond_map_std:.4f}",
@@ -2472,6 +2535,10 @@ def main():
                     "prompt_cache_hit_rate": float(prompt_cache_hit_rate),
                     "avg_prompt_token_count": float(avg_prompt_token_count),
                     "avg_prompt_nonpad_ratio": float(avg_prompt_nonpad_ratio),
+                    "tala_on": int(USE_TALA_TRAIN),
+                    "tala_ratio_mean": float(tala_ratio_mean),
+                    "tala_ratio_max": float(tala_ratio_max),
+                    "tala_active_frac": float(tala_active_frac),
                     "sem_K": 16,
                     "adapter_map_std": adapter_map_std,
                     "cond_map_std": cond_map_std,
