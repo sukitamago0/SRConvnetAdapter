@@ -105,6 +105,82 @@ class MultiHeadCrossAttention(nn.Module):
         return x
 
 
+def zero_module(module: nn.Module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
+
+class DecoupledImageTextCrossAttention(nn.Module):
+    def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.kv_text_linear = nn.Linear(d_model, 2 * d_model)
+        self.text_proj = nn.Linear(d_model, d_model)
+        self.k_img_linear = nn.Linear(d_model, d_model)
+        self.v_img_linear = nn.Linear(d_model, d_model)
+        self.img_out_proj = zero_module(nn.Linear(d_model, d_model))
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    @classmethod
+    def from_text_cross_attn(cls, old_attn: MultiHeadCrossAttention):
+        new = cls(old_attn.q_linear.in_features, old_attn.num_heads, attn_drop=old_attn.attn_drop.p, proj_drop=old_attn.proj_drop.p)
+        new.q_linear.load_state_dict(old_attn.q_linear.state_dict())
+        new.kv_text_linear.load_state_dict(old_attn.kv_linear.state_dict())
+        new.text_proj.load_state_dict(old_attn.proj.state_dict())
+        with torch.no_grad():
+            old_w = old_attn.kv_linear.weight.data
+            old_b = old_attn.kv_linear.bias.data if old_attn.kv_linear.bias is not None else None
+            d = old_w.shape[0] // 2
+            new.k_img_linear.weight.copy_(old_w[:d])
+            new.v_img_linear.weight.copy_(old_w[d:])
+            if old_b is not None:
+                new.k_img_linear.bias.copy_(old_b[:d])
+                new.v_img_linear.bias.copy_(old_b[d:])
+        return new
+
+    def forward(self, x, text_cond, image_cond=None, text_mask=None, image_gate=None):
+        b, n, c = x.shape
+        q_text = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)
+        kv_text = self.kv_text_linear(text_cond).view(1, -1, 2, self.num_heads, self.head_dim)
+        k_text, v_text = kv_text.unbind(2)
+        attn_bias = None
+        if text_mask is not None and XFORMERS_AVAILABLE:
+            try:
+                attn_bias = xops.fmha.BlockDiagonalMask.from_seqlens([n] * b, text_mask)
+            except Exception:
+                attn_bias = None
+        text_attn = memory_efficient_attention_fallback(q_text, k_text, v_text, p=self.attn_drop.p, attn_bias=attn_bias)
+        text_attn = text_attn.view(b, -1, c)
+        out_text = self.text_proj(text_attn)
+
+        out_img = torch.zeros_like(out_text)
+        if image_cond is not None:
+            q_img = self.q_linear(x).view(b, n, self.num_heads, self.head_dim)
+            m = image_cond.shape[1]
+            k_img = self.k_img_linear(image_cond).view(b, m, self.num_heads, self.head_dim)
+            v_img = self.v_img_linear(image_cond).view(b, m, self.num_heads, self.head_dim)
+            img_attn = memory_efficient_attention_fallback(q_img, k_img, v_img, p=self.attn_drop.p, attn_bias=None)
+            img_attn = img_attn.view(b, -1, c)
+            out_img = self.img_out_proj(img_attn)
+
+        if image_gate is not None:
+            out = out_text + image_gate * out_img
+        else:
+            out = out_text + out_img
+        out = self.proj_drop(out)
+        stats = {
+            "text_out_std": float(out_text.detach().float().std().item()),
+            "img_out_std": float(out_img.detach().float().std().item()),
+        }
+        return out, stats
+
+
 class AttentionKVCompress(Attention_):
     """Multi-head Attention block with KV token compression and qk norm."""
 
