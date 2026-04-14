@@ -105,6 +105,136 @@ class MultiHeadCrossAttention(nn.Module):
         return x
 
 
+def zero_module(module: nn.Module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
+
+class DecoupledImageTextCrossAttention(nn.Module):
+    def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.k_text_linear = nn.Linear(d_model, d_model)
+        self.v_text_linear = nn.Linear(d_model, d_model)
+        self.k_img_linear = nn.Linear(d_model, d_model)
+        self.v_img_linear = nn.Linear(d_model, d_model)
+        self.img_residual_linear = zero_module(nn.Linear(self.head_dim, self.head_dim))
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    @classmethod
+    def from_text_cross_attn(cls, old_attn: MultiHeadCrossAttention):
+        new = cls(old_attn.q_linear.in_features, old_attn.num_heads, attn_drop=old_attn.attn_drop.p, proj_drop=old_attn.proj_drop.p)
+        new.q_linear.load_state_dict(old_attn.q_linear.state_dict())
+        new.out_proj.load_state_dict(old_attn.proj.state_dict())
+        with torch.no_grad():
+            old_w = old_attn.kv_linear.weight.data
+            old_b = old_attn.kv_linear.bias.data if old_attn.kv_linear.bias is not None else None
+            d = old_w.shape[0] // 2
+            new.k_text_linear.weight.copy_(old_w[:d])
+            new.v_text_linear.weight.copy_(old_w[d:])
+            if old_b is not None:
+                new.k_text_linear.bias.copy_(old_b[:d])
+                new.v_text_linear.bias.copy_(old_b[d:])
+            new.k_img_linear.weight.copy_(new.k_text_linear.weight)
+            new.v_img_linear.weight.copy_(new.v_text_linear.weight)
+            if old_b is not None:
+                new.k_img_linear.bias.copy_(new.k_text_linear.bias)
+                new.v_img_linear.bias.copy_(new.v_text_linear.bias)
+        return new
+
+    def _packed_to_padded(self, text_cond: torch.Tensor, text_lens, batch_size: int):
+        if text_lens is None:
+            raise RuntimeError("Packed text fallback requires per-sample text lengths to avoid cross-sample leakage.")
+        if text_cond.shape[0] != 1:
+            return text_cond
+        total = text_cond.shape[1]
+        if int(sum(text_lens)) != int(total):
+            raise RuntimeError("Packed text fallback requires exact per-sample lengths to unflatten packed text.")
+        max_len = int(max(text_lens))
+        c = text_cond.shape[-1]
+        out = text_cond.new_zeros((batch_size, max_len, c))
+        cur = 0
+        for bi, l in enumerate(text_lens):
+            li = int(l)
+            out[bi, :li] = text_cond[0, cur:cur + li]
+            cur += li
+        return out
+
+    def _text_attention_fallback_per_sample(self, q_heads, k_text_heads, v_text_heads, text_lens, dropout_p=0.0):
+        b = q_heads.shape[0]
+        outs = []
+        for bi in range(b):
+            li = int(text_lens[bi])
+            qi = q_heads[bi:bi + 1]
+            ki = k_text_heads[bi:bi + 1, :, :li, :]
+            vi = v_text_heads[bi:bi + 1, :, :li, :]
+            out_i = F.scaled_dot_product_attention(
+                qi, ki, vi,
+                attn_mask=None,
+                dropout_p=dropout_p if self.training else 0.0,
+                is_causal=False
+            )
+            outs.append(out_i)
+        return torch.cat(outs, dim=0)
+
+    def forward(self, x, text_cond, image_cond=None, text_mask=None, image_gate=None):
+        b, n, c = x.shape
+        q_heads = rearrange(self.q_linear(x), "b n (h d) -> b h n d", h=self.num_heads)
+
+        text_ctx_heads = None
+        if XFORMERS_AVAILABLE and (text_mask is not None) and (text_cond.shape[0] == 1):
+            try:
+                q_pack = rearrange(q_heads, "b h n d -> 1 (b n) h d")
+                k_pack = self.k_text_linear(text_cond).view(1, -1, self.num_heads, self.head_dim)
+                v_pack = self.v_text_linear(text_cond).view(1, -1, self.num_heads, self.head_dim)
+                attn_bias = xops.fmha.BlockDiagonalMask.from_seqlens([n] * b, text_mask)
+                text_ctx_pack = memory_efficient_attention_fallback(q_pack, k_pack, v_pack, p=self.attn_drop.p, attn_bias=attn_bias)
+                text_ctx_heads = rearrange(text_ctx_pack, "1 (b n) h d -> b h n d", b=b, n=n, h=self.num_heads)
+            except Exception:
+                text_ctx_heads = None
+        if text_ctx_heads is None:
+            if text_mask is None:
+                raise RuntimeError("Packed text fallback requires per-sample text lengths to avoid cross-sample leakage.")
+            text_padded = self._packed_to_padded(text_cond, text_mask, b)
+            k_text_heads = rearrange(self.k_text_linear(text_padded), "b l (h d) -> b h l d", h=self.num_heads)
+            v_text_heads = rearrange(self.v_text_linear(text_padded), "b l (h d) -> b h l d", h=self.num_heads)
+            text_ctx_heads = self._text_attention_fallback_per_sample(q_heads, k_text_heads, v_text_heads, text_mask, dropout_p=self.attn_drop.p)
+
+        img_delta_heads = torch.zeros_like(text_ctx_heads)
+        if image_cond is not None:
+            m = image_cond.shape[1]
+            k_img = rearrange(self.k_img_linear(image_cond), "b m (h d) -> b m h d", h=self.num_heads)
+            v_img = rearrange(self.v_img_linear(image_cond), "b m (h d) -> b m h d", h=self.num_heads)
+            q_img = rearrange(q_heads, "b h n d -> b n h d")
+            img_ctx = memory_efficient_attention_fallback(q_img, k_img, v_img, p=self.attn_drop.p, attn_bias=None)
+            img_ctx_heads = rearrange(img_ctx, "b n h d -> b h n d")
+            img_delta_heads = self.img_residual_linear(img_ctx_heads)
+
+        if image_gate is not None:
+            gate = torch.as_tensor(image_gate, dtype=text_ctx_heads.dtype, device=text_ctx_heads.device)
+            while gate.dim() < text_ctx_heads.dim():
+                gate = gate.unsqueeze(-1)
+            merged_heads = text_ctx_heads + gate * img_delta_heads
+        else:
+            merged_heads = text_ctx_heads + img_delta_heads
+        merged = rearrange(merged_heads, "b h n d -> b n (h d)")
+        out = self.out_proj(merged)
+        out = self.proj_drop(out)
+        stats = {
+            "text_ctx_std": float(text_ctx_heads.detach().float().std().item()),
+            "img_delta_std": float(img_delta_heads.detach().float().std().item()),
+        }
+        return out, stats
+
+
 class AttentionKVCompress(Attention_):
     """Multi-head Attention block with KV token compression and qk norm."""
 

@@ -5,6 +5,7 @@
 
 输出内容（默认）：
 - y: [1, 1, L, C]   （与你训练脚本中的 y 形状一致）
+- mask: [1, 1, 1, L]
 - hidden: [1, L, C] （原始 T5 输出）
 - attention_mask: [1, L]
 - meta: 一些元信息（max_length / prompt / dtype / path 等）
@@ -84,10 +85,12 @@ def main():
 
     hidden = text_encoder(input_ids=input_ids, attention_mask=attention_mask)[0]  # [1, L, C]
     y = hidden.unsqueeze(1)  # [1, 1, L, C]，与你训练脚本一致
+    mask = attention_mask.unsqueeze(1).unsqueeze(1)  # [1, 1, 1, L]
 
     save_dtype = str_to_dtype(args.save_dtype)
     pack = {
         "y": y.detach().cpu().to(save_dtype),
+        "mask": mask.detach().cpu(),
         "hidden": hidden.detach().cpu().to(save_dtype),
         "attention_mask": attention_mask.detach().cpu(),
         "meta": {
@@ -98,6 +101,7 @@ def main():
             "save_dtype": args.save_dtype,
             "hidden_shape": tuple(hidden.shape),
             "y_shape": tuple(y.shape),
+            "mask_shape": tuple(mask.shape),
         },
     }
 
@@ -107,6 +111,7 @@ def main():
     print(f"  save_path: {args.save_path}")
     print(f"  hidden shape: {tuple(hidden.shape)}")
     print(f"  y shape: {tuple(y.shape)}")
+    print(f"  mask shape: {tuple(mask.shape)}")
     print(f"  attention_mask shape: {tuple(attention_mask.shape)}")
 
 
