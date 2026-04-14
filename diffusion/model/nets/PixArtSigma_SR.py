@@ -30,7 +30,7 @@ class SFTLayer(nn.Module):
         return feat * (1 + gain * scale) + gain * shift, scale, shift
 
 
-class SRTimeGate(nn.Module):
+class TASRTimeGate(nn.Module):
     def __init__(self, x_ch, cond_ch, t_embed_dim, hidden_ch=128, use_scale_shift_norm=True):
         super().__init__()
         self.use_scale_shift_norm = bool(use_scale_shift_norm)
@@ -102,7 +102,6 @@ class PixArtSigmaSR(PixArtMS):
         self.hidden_size = self.x_embedder.proj.out_channels
         self.force_null_caption = bool(force_null_caption)
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
-        self.lr_gate_prior_pow = 1.5
 
         self.sft_cond_reduce = nn.Sequential(
             nn.Conv2d(self.hidden_size, 64, 1),
@@ -123,8 +122,8 @@ class PixArtSigmaSR(PixArtMS):
             str(i): nn.Parameter(torch.tensor(float(default_alpha_init.get(int(i), 1.0))))
             for i in sorted(self.anchor_layers)
         })
-        self.lr_time_gates = nn.ModuleDict({
-            str(i): SRTimeGate(
+        self.tasr_time_gates = nn.ModuleDict({
+            str(i): TASRTimeGate(
                 x_ch=self.hidden_size,
                 cond_ch=64,
                 t_embed_dim=self.hidden_size,
@@ -182,9 +181,8 @@ class PixArtSigmaSR(PixArtMS):
             cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
 
         t_norm = timestep.float() / 999.0
-        lr_prior = t_norm.pow(float(self.lr_gate_prior_pow)).view(-1, 1, 1, 1).to(x.dtype)
         semantic_gate = (1.0 - t_norm).pow(2.0).view(-1, 1, 1).to(x.dtype)
-        lr_gate_means, lr_gate_mins, lr_gate_maxs, lr_delta_stds = [], [], [], []
+        tasr_gate_means, tasr_gate_mins, tasr_gate_maxs, sft_delta_stds = [], [], [], []
         sem_stats = []
         for i, block in enumerate(self.blocks):
             if cond_red is not None and i in self.anchor_layers:
@@ -194,15 +192,16 @@ class PixArtSigmaSR(PixArtMS):
                 x_map_pre = x.transpose(1, 2).reshape(b, c, self.h, self.w)
                 x_map_post, _, _ = self.sft_layers[i](x_map_pre, cond_red, strength=sft_strength)
                 sft_delta = x_map_post - x_map_pre
-                gate_logits = self.lr_time_gates[str(i)](x_map_pre, sft_delta, cond_red, t.to(dtype=x_map_pre.dtype))
+                # early LR structure is controlled purely by learned timestep-aware gates;
+                # no handcrafted time prior is used.
+                gate_logits = self.tasr_time_gates[str(i)](x_map_pre, sft_delta, cond_red, t.to(dtype=x_map_pre.dtype))
                 gate_spatial = torch.sigmoid(gate_logits)
-                final_gate = (lr_prior * (0.5 + gate_spatial)).clamp(0.0, 1.0)
                 alpha_i = self.sft_alpha[str(i)].to(x_map_pre.dtype).view(1, 1, 1, 1)
-                x_map = x_map_pre + alpha_i * final_gate * sft_delta
-                lr_gate_means.append(float(final_gate.detach().float().mean().item()))
-                lr_gate_mins.append(float(final_gate.detach().float().min().item()))
-                lr_gate_maxs.append(float(final_gate.detach().float().max().item()))
-                lr_delta_stds.append(float(sft_delta.detach().float().std().item()))
+                x_map = x_map_pre + alpha_i * gate_spatial * sft_delta
+                tasr_gate_means.append(float(gate_spatial.detach().float().mean().item()))
+                tasr_gate_mins.append(float(gate_spatial.detach().float().min().item()))
+                tasr_gate_maxs.append(float(gate_spatial.detach().float().max().item()))
+                sft_delta_stds.append(float(sft_delta.detach().float().std().item()))
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
 
             block_kwargs = dict(
@@ -223,17 +222,14 @@ class PixArtSigmaSR(PixArtMS):
         if len(self.anchor_layers) > 0:
             alpha_vals = [self.sft_alpha[str(i)].item() for i in self.sft_candidate_layers if str(i) in self.sft_alpha]
             self._last_sft_stats = {
-                "tau_mean": float(lr_prior.mean().item()),
-                "tau_min": float(lr_prior.min().item()),
-                "tau_max": float(lr_prior.max().item()),
                 "alpha_mean": float(sum(alpha_vals) / max(1, len(alpha_vals))),
                 "alpha_min": float(min(alpha_vals) if len(alpha_vals) > 0 else 0.0),
                 "alpha_max": float(max(alpha_vals) if len(alpha_vals) > 0 else 0.0),
                 "sft_strength": float(sft_strength),
-                "lr_gate_mean": float(sum(lr_gate_means) / max(1, len(lr_gate_means))),
-                "lr_gate_min": float(min(lr_gate_mins) if len(lr_gate_mins) > 0 else 0.0),
-                "lr_gate_max": float(max(lr_gate_maxs) if len(lr_gate_maxs) > 0 else 0.0),
-                "lr_delta_std": float(sum(lr_delta_stds) / max(1, len(lr_delta_stds))),
+                "tasr_gate_mean": float(sum(tasr_gate_means) / max(1, len(tasr_gate_means))),
+                "tasr_gate_min": float(min(tasr_gate_mins) if len(tasr_gate_mins) > 0 else 0.0),
+                "tasr_gate_max": float(max(tasr_gate_maxs) if len(tasr_gate_maxs) > 0 else 0.0),
+                "sft_delta_std": float(sum(sft_delta_stds) / max(1, len(sft_delta_stds))),
             }
         else:
             self._last_sft_stats = None

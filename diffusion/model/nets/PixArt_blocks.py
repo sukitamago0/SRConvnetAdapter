@@ -144,24 +144,6 @@ class DecoupledImageTextCrossAttention(nn.Module):
                 new.v_img_linear.bias.copy_(old_b[d:])
         return new
 
-    def _init_missing_image_branch_from_text(self):
-        with torch.no_grad():
-            w = self.kv_text_linear.weight.data
-            b = self.kv_text_linear.bias.data if self.kv_text_linear.bias is not None else None
-            d = w.shape[0] // 2
-            self.k_img_linear.weight.copy_(w[:d])
-            self.v_img_linear.weight.copy_(w[d:])
-            if b is not None:
-                self.k_img_linear.bias.copy_(b[:d])
-                self.v_img_linear.bias.copy_(b[d:])
-
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        k_img_key = prefix + "k_img_linear.weight"
-        v_img_key = prefix + "v_img_linear.weight"
-        if (k_img_key not in state_dict) or (v_img_key not in state_dict):
-            self._init_missing_image_branch_from_text()
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-
     def forward(self, x, text_cond, image_cond=None, text_mask=None, image_gate=None):
         b, n, c = x.shape
         q_text = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)

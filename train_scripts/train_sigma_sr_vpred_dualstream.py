@@ -60,7 +60,7 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "sft_cond_reduce",
     "sft_layers",
     "sft_alpha",
-    "lr_time_gates",
+    "tasr_time_gates",
     "hybrid_cross_attn",
     "semantic_alpha",
     "lora_A",
@@ -180,7 +180,9 @@ TALA_TRAIN_ACTIVE_T_MIN = 600
 TALA_TRAIN_BLEND_POW = 1.0
 TALA_TRAIN_MAX_RATIO = 0.30
 TALA_TRAIN_DETACH_LR_LATENT = True
-TALA_TRAIN_ALIGN_TO_LQ_INIT = True
+# this is a high-noise training blend regime inspired by LQ-init semantics,
+# not an exact scheduler-level mapping.
+TALA_TRAIN_HIGH_T_MODE = True
 USE_TIMESTEP_AWARE_PERCEPTUAL = True
 PERCEP_T_MAX = 350
 PERCEP_DECODE_MAX_SAMPLES = 2
@@ -610,11 +612,10 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
 def get_tala_train_interval(diffusion):
     num_train_timesteps = int(getattr(diffusion, "num_timesteps", 1000))
     t_max = max(0, num_train_timesteps - 1)
-    if TALA_TRAIN_ALIGN_TO_LQ_INIT:
-        min_t = int(round(float(LQ_INIT_STRENGTH) * float(t_max)))
-        min_t = max(min_t, int(TALA_TRAIN_ACTIVE_T_MIN))
-    else:
+    if TALA_TRAIN_HIGH_T_MODE:
         min_t = int(TALA_TRAIN_ACTIVE_T_MIN)
+    else:
+        min_t = int(round(float(LQ_INIT_STRENGTH) * float(t_max)))
     min_t = max(0, min(t_max, int(min_t)))
     return min_t, t_max
 
@@ -626,7 +627,7 @@ def build_tala_train_latent_and_target(
     noise,
     diffusion,
     lq_init_strength,
-    align_to_lq_init,
+    high_t_mode,
     active_t_min,
     blend_pow,
     max_ratio,
@@ -649,10 +650,10 @@ def build_tala_train_latent_and_target(
     zl_src = zl.detach() if detach_lr_latent else zl
     zt_lr = diffusion.q_sample(zl_src, timesteps, noise)
     t_min, t_max = get_tala_train_interval(diffusion)
-    if not align_to_lq_init:
+    if high_t_mode:
         t_min = max(0, min(t_max, int(active_t_min)))
     else:
-        t_min = max(t_min, int(active_t_min), int(round(float(lq_init_strength) * float(t_max))))
+        t_min = max(t_min, int(round(float(lq_init_strength) * float(t_max))))
     if str(TALA_TRAIN_ACTIVE_MODE).lower() != "high_t":
         raise RuntimeError(f"Unsupported TALA_TRAIN_ACTIVE_MODE={TALA_TRAIN_ACTIVE_MODE}, only 'high_t' is allowed.")
     tau = ((timesteps.float() - float(t_min)) / max(1.0, float(t_max - t_min))).clamp(0.0, 1.0)
@@ -664,7 +665,7 @@ def build_tala_train_latent_and_target(
     eps_eff = (zt_mix - alpha_t * zh) / sigma_t.clamp_min(1e-6)
     target_v = alpha_t * eps_eff - sigma_t * zh.float()
     return zt_mix, target_v, alpha_t, sigma_t, ratio, {
-        "tala_mode": "high_t_align_to_lq_init" if TALA_TRAIN_ALIGN_TO_LQ_INIT else "high_t_fixed_tmin",
+        "tala_mode": "high_t_blend_regime",
         "tala_t_min": int(t_min),
         "tala_t_max": int(t_max),
         "tala_effective_eps_std": float(eps_eff.detach().float().std().item()),
@@ -888,7 +889,7 @@ def get_config_snapshot():
         "tala_train_blend_pow": float(TALA_TRAIN_BLEND_POW),
         "tala_train_max_ratio": float(TALA_TRAIN_MAX_RATIO),
         "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
-        "tala_train_align_to_lq_init": bool(TALA_TRAIN_ALIGN_TO_LQ_INIT),
+        "tala_train_high_t_mode": bool(TALA_TRAIN_HIGH_T_MODE),
         "use_timestep_aware_perceptual": bool(USE_TIMESTEP_AWARE_PERCEPTUAL),
         "percep_t_max": int(PERCEP_T_MAX),
         "percep_decode_max_samples": int(PERCEP_DECODE_MAX_SAMPLES),
@@ -1426,7 +1427,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             p.requires_grad = True
         if any(f"sft_layers.{i}." in name for i in anchor_ids):
             p.requires_grad = True
-        if any(f"lr_time_gates.{i}." in name for i in anchor_ids):
+        if any(f"tasr_time_gates.{i}." in name for i in anchor_ids):
             p.requires_grad = True
         if ("hybrid_cross_attn" in name) or ("semantic_alpha" in name):
             p.requires_grad = True
@@ -1451,12 +1452,12 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
     trainable_sft_layer_ids = sorted(list({int(n.split("sft_layers.")[1].split(".")[0]) for n, p in pixart.named_parameters() if p.requires_grad and "sft_layers." in n}))
     trainable_sft_alpha_ids = sorted(list({int(n.split("sft_alpha.")[1].split(".")[0]) for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha." in n}))
-    trainable_lr_gate_ids = sorted(list({int(n.split("lr_time_gates.")[1].split(".")[0]) for n, p in pixart.named_parameters() if p.requires_grad and "lr_time_gates." in n}))
+    trainable_tasr_gate_ids = sorted(list({int(n.split("tasr_time_gates.")[1].split(".")[0]) for n, p in pixart.named_parameters() if p.requires_grad and "tasr_time_gates." in n}))
     outside_anchor = sorted(list(set(trainable_sft_layer_ids) - set(anchor_ids)))
     print(f"[SFT-Trainable] anchor_layers={anchor_ids}")
     print(f"[SFT-Trainable] actual_trainable_sft_ids={trainable_sft_layer_ids}")
     print(f"[SFT-Trainable] actual_trainable_sft_alpha_ids={trainable_sft_alpha_ids}")
-    print(f"[SFT-Trainable] actual_trainable_lr_gate_ids={trainable_lr_gate_ids}")
+    print(f"[SFT-Trainable] actual_trainable_tasr_gate_ids={trainable_tasr_gate_ids}")
     print(f"[SFT-Trainable] outside_anchor={outside_anchor}")
     if outside_anchor:
         raise RuntimeError(f"SFT trainable mismatch: found trainable SFT layers not in anchor_layers: {outside_anchor}")
@@ -1464,8 +1465,8 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         raise RuntimeError(f"SFT trainable mismatch: trainable_sft_ids={trainable_sft_layer_ids}, anchor_layers={anchor_ids}")
     if trainable_sft_alpha_ids != anchor_ids:
         raise RuntimeError(f"SFT alpha mismatch: trainable_sft_alpha_ids={trainable_sft_alpha_ids}, anchor_layers={anchor_ids}")
-    if trainable_lr_gate_ids != anchor_ids:
-        raise RuntimeError(f"LR gate mismatch: trainable_lr_gate_ids={trainable_lr_gate_ids}, anchor_layers={anchor_ids}")
+    if trainable_tasr_gate_ids != anchor_ids:
+        raise RuntimeError(f"TASR gate mismatch: trainable_tasr_gate_ids={trainable_tasr_gate_ids}, anchor_layers={anchor_ids}")
     print(f"✅ PixArt trainable configured(single-stage): before={total_trainable_before}, after={total_trainable_after}")
 
 
@@ -1979,7 +1980,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         cond_map_stds = []
         sem_tok_stds, sem_out_stds, sem_alphas, sem_gates = [], [], [], []
         sem_pre_stds, sem_post_stds, sem_out_scales = [], [], []
-        sft_tau_means, sft_alpha_means = [], []
+        tasr_gate_means, sft_alpha_means = [], []
         prompt_hit_rates, prompt_tok_counts, prompt_nonpad_ratios = [], [], []
         prompt_cache_mem = {}
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
@@ -2047,7 +2048,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                     sem_gates.append(float(sem_stats.get("semantic_gate_mean", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
-                    sft_tau_means.append(float(sft_stats.get("tau_mean", 0.0)))
+                    tasr_gate_means.append(float(sft_stats.get("tasr_gate_mean", 0.0)))
                     sft_alpha_means.append(float(sft_stats.get("alpha_mean", 0.0)))
 
                     if CFG_SCALE == 1.0:
@@ -2104,12 +2105,12 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         sem_out_std = float(np.mean(sem_out_stds)) if len(sem_out_stds) > 0 else 0.0
         sem_alpha = float(np.mean(sem_alphas)) if len(sem_alphas) > 0 else 0.0
         sem_gate = float(np.mean(sem_gates)) if len(sem_gates) > 0 else 0.0
-        sft_tau_mean = float(np.mean(sft_tau_means)) if len(sft_tau_means) > 0 else 0.0
+        tasr_gate_mean_val = float(np.mean(tasr_gate_means)) if len(tasr_gate_means) > 0 else 0.0
         sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         msg = (
             f"[VAL-PROXY@{steps}][{tag}] Ep{epoch+1}: proxy_psnr={res[0]:.2f} | proxy_ssim={res[1]:.4f} | proxy_lpips={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | text_cond_delta={text_cdelta:.5f} | prompt_cache_hit_rate={prompt_hit_rate:.3f} | avg_prompt_token_count={avg_prompt_token_count:.2f} | avg_prompt_nonpad_ratio={avg_prompt_nonpad_ratio:.3f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | sem_tok_std={sem_tok_std:.4f} | sem_pre_std={sem_pre_std:.4f} | sem_post_std={sem_post_std:.4f} | sem_out_scale={sem_out_scale:.4f} | sem_out_std={sem_out_std:.4f} | sem_alpha={sem_alpha:.4f} | sem_gate={sem_gate:.4f} | sem_K={16} | "
-            f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
+            f"tasr_gate_mean={tasr_gate_mean_val:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
@@ -2268,15 +2269,17 @@ def main():
         f"USE_TALA_TRAIN={bool(USE_TALA_TRAIN)} USE_LQ_INIT={bool(USE_LQ_INIT)} "
         f"LORA_RANK={int(LORA_RANK)} LORA_ALPHA={int(LORA_ALPHA)}"
     )
+    print('[GATE-MODE] gate_mode = "pure_tasr_learned" | no_handcrafted_time_prior = True')
     print(
         f"[PROMPT-STRICT] USE_ADAPTIVE_TEXT_PROMPT={bool(USE_ADAPTIVE_TEXT_PROMPT)} "
         f"STRICT_ADAPTIVE_PROMPT={bool(STRICT_ADAPTIVE_PROMPT)}"
     )
     print(
         f"[TALA-STRICT] USE_LQ_INIT={bool(USE_LQ_INIT)} LQ_INIT_STRENGTH={float(LQ_INIT_STRENGTH):.3f} "
-        f"TALA_TRAIN_ACTIVE_MODE={TALA_TRAIN_ACTIVE_MODE} TALA_TRAIN_ACTIVE_T_MIN={int(TALA_TRAIN_ACTIVE_T_MIN)} "
+        f"TALA_TRAIN_HIGH_T_MODE={bool(TALA_TRAIN_HIGH_T_MODE)} TALA_TRAIN_ACTIVE_T_MIN={int(TALA_TRAIN_ACTIVE_T_MIN)} "
         f"TALA_TRAIN_MAX_RATIO={float(TALA_TRAIN_MAX_RATIO):.3f}"
     )
+    print(f"[RUN-MODE] anchor_layers={list(ANCHOR_LAYERS)} use_tala_train={bool(USE_TALA_TRAIN)} use_hpa={bool(USE_SEMANTIC_BRANCH)} lora_rank={int(LORA_RANK)} lora_alpha={int(LORA_ALPHA)}")
     print(
         f"[PERCEP-CONFIG] USE_TIMESTEP_AWARE_PERCEPTUAL={bool(USE_TIMESTEP_AWARE_PERCEPTUAL)} "
         f"PERCEP_T_MAX={int(PERCEP_T_MAX)} PERCEP_DECODE_MAX_SAMPLES={int(PERCEP_DECODE_MAX_SAMPLES)} "
@@ -2356,7 +2359,7 @@ def main():
                     noise=noise,
                     diffusion=diffusion,
                     lq_init_strength=LQ_INIT_STRENGTH,
-                    align_to_lq_init=TALA_TRAIN_ALIGN_TO_LQ_INIT,
+                    high_t_mode=TALA_TRAIN_HIGH_T_MODE,
                     active_t_min=TALA_TRAIN_ACTIVE_T_MIN,
                     blend_pow=TALA_TRAIN_BLEND_POW,
                     max_ratio=TALA_TRAIN_MAX_RATIO,
@@ -2607,11 +2610,10 @@ def main():
 
             if i % 10 == 0:
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
-                tau_mean = float(sft_stats.get("tau_mean", 0.0))
-                lr_gate_mean = float(sft_stats.get("lr_gate_mean", 0.0))
-                lr_gate_min = float(sft_stats.get("lr_gate_min", 0.0))
-                lr_gate_max = float(sft_stats.get("lr_gate_max", 0.0))
-                lr_delta_std = float(sft_stats.get("lr_delta_std", 0.0))
+                tasr_gate_mean = float(sft_stats.get("tasr_gate_mean", 0.0))
+                tasr_gate_min = float(sft_stats.get("tasr_gate_min", 0.0))
+                tasr_gate_max = float(sft_stats.get("tasr_gate_max", 0.0))
+                sft_delta_std = float(sft_stats.get("sft_delta_std", 0.0))
                 alpha_mean_sft = float(sft_stats.get("alpha_mean", 0.0))
                 alpha_min = float(sft_stats.get("alpha_min", 0.0))
                 alpha_max = float(sft_stats.get("alpha_max", 0.0))
@@ -2652,9 +2654,8 @@ def main():
                     'late_af': f"{late_lpips_active_frac:.3f}",
                     'sft_s': f"{sft_strength_logged:.3f}",
                     'proxy_psnr': f"{last_val_psnr:.2f}",
-                    'sft_tau': f"{tau_mean:.3f}",
-                    'lr_gate': f"{lr_gate_mean:.3f}[{lr_gate_min:.3f},{lr_gate_max:.3f}]",
-                    'lr_dstd': f"{lr_delta_std:.3f}",
+                    'tasr_gate': f"{tasr_gate_mean:.3f}[{tasr_gate_min:.3f},{tasr_gate_max:.3f}]",
+                    'sft_dstd': f"{sft_delta_std:.3f}",
                     'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
                     'sem_tok_std': f"{sem_tok_std:.4f}",
                     'sem_pre_std': f"{sem_pre_std:.4f}",
@@ -2691,7 +2692,7 @@ def main():
                     "late_lpips_active_frac": float(late_lpips_active_frac),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
-                    "tau_mean": tau_mean,
+                    "tasr_gate_mean": tasr_gate_mean,
                     "alpha_mean": alpha_mean_sft,
                     "alpha_min": alpha_min,
                     "alpha_max": alpha_max,
@@ -2702,10 +2703,9 @@ def main():
                     "sem_out_std": sem_out_std,
                     "sem_alpha": sem_alpha,
                     "sem_gate": sem_gate,
-                    "lr_gate_mean": lr_gate_mean,
-                    "lr_gate_min": lr_gate_min,
-                    "lr_gate_max": lr_gate_max,
-                    "lr_delta_std": lr_delta_std,
+                    "tasr_gate_min": tasr_gate_min,
+                    "tasr_gate_max": tasr_gate_max,
+                    "sft_delta_std": sft_delta_std,
                     "hpa_text_out_std": hpa_text_out_std,
                     "hpa_img_out_std": hpa_img_out_std,
                     "cond_delta": cond_delta,
