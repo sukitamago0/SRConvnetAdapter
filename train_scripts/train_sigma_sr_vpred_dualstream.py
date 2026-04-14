@@ -50,6 +50,7 @@ from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
+from utils.prompt_key_utils import make_sample_key
 
 BASE_PIXART_SHA256 = None
 LAST_TRAIN_LOG = {}
@@ -533,11 +534,6 @@ def load_prompt_pack(path: str, pack_name: str = "prompt") -> dict:
         raise RuntimeError(f"Invalid {pack_name} prompt pack: mask must be 4D, got shape={tuple(pack['mask'].shape)}")
     pack["_legacy_converted"] = bool(legacy_converted)
     return pack
-
-
-def make_sample_key(path: str) -> str:
-    p = os.path.splitext(str(path))[0].replace("\\", "/").strip("/")
-    return p.replace("/", "__")
 
 
 def load_adaptive_prompt_batch(sample_keys, cache_root: str, cache_mem: dict):
@@ -2019,6 +2015,27 @@ def main():
         print("[VAL] mode=fallback_bicubic_from_hr (no paired VAL_LR_DIR found)")
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, drop_last=True, worker_init_fn=seed_worker, generator=dl_gen)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+    if USE_ADAPTIVE_TEXT_PROMPT:
+        if (not ADAPTIVE_PROMPT_CACHE_ROOT) or (not os.path.isdir(ADAPTIVE_PROMPT_CACHE_ROOT)):
+            raise FileNotFoundError(
+                "Adaptive prompt cache root missing. Please run tools/prepare_adaptive_text_cache.py first."
+            )
+        cache_files = sorted(glob.glob(os.path.join(ADAPTIVE_PROMPT_CACHE_ROOT, "**", "*.pth"), recursive=True))
+        if len(cache_files) == 0:
+            raise RuntimeError(
+                "Adaptive prompt cache root has no .pth files. Please run tools/prepare_adaptive_text_cache.py first."
+            )
+        if hasattr(train_ds, "pairs") and len(train_ds.pairs) > 0:
+            ex_lr = train_ds.pairs[0][0]
+            ex_key = make_sample_key(ex_lr)
+            ex_exists = os.path.exists(os.path.join(ADAPTIVE_PROMPT_CACHE_ROOT, f"{ex_key}.pth"))
+        else:
+            ex_key = "N/A"
+            ex_exists = False
+        print(f"[adaptive-prompt] root = {ADAPTIVE_PROMPT_CACHE_ROOT}")
+        print(f"[adaptive-prompt] cache files found = {len(cache_files)}")
+        print(f"[adaptive-prompt] example sample key = {ex_key}")
+        print(f"[adaptive-prompt] example cache exists = {ex_exists}")
 
     kv_cfg = {
         "sampling": None,

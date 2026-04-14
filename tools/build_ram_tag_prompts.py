@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Offline RAM tagging -> prompt text cache builder.
-
-Output format (jsonl):
-{
-  "image_key": "...",
-  "tags": ["building", "window", "tree"],
-  "prompt_text": "a realistic photo of building, window, tree"
-}
+Offline RAM tagging -> prompt text jsonl.
 """
 
 import argparse
@@ -19,88 +12,70 @@ from pathlib import Path
 
 from PIL import Image
 import torch
-import torchvision.transforms as T
+
+from utils.prompt_key_utils import make_sample_key
 
 
-def make_sample_key(path: str) -> str:
-    p = os.path.splitext(str(path))[0].replace("\\", "/").strip("/")
-    return p.replace("/", "__")
-
-
-def iter_images(inputs):
+def iter_lr_images(lr_roots):
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
-    for item in inputs:
-        if os.path.isdir(item):
-            for p in sorted(Path(item).rglob("*")):
-                if p.suffix.lower() in exts:
-                    yield str(p)
-        elif any(ch in item for ch in ["*", "?", "["]):
-            for p in sorted(glob.glob(item)):
-                if os.path.splitext(p)[1].lower() in exts:
-                    yield p
-        elif os.path.isfile(item):
-            if os.path.splitext(item)[1].lower() in exts:
-                yield item
-            else:
-                with open(item, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            yield line
-
-
-def load_ram_model(device: str):
-    try:
-        from ram.models import ram
-        from ram import inference_ram
-    except Exception as e:
-        raise RuntimeError(
-            "RAM package not found. Please install a RAM implementation that exposes "
-            "`ram.models.ram` and `ram.inference_ram`."
-        ) from e
-    model = ram(pretrained=True, image_size=384, vit="swin_l")
-    model.eval().to(device)
-    return model, inference_ram
+    for root in lr_roots:
+        if not os.path.isdir(root):
+            continue
+        for p in sorted(Path(root).rglob("*")):
+            if p.suffix.lower() not in exts:
+                continue
+            # only keep LR-like files/paths
+            s = str(p).lower()
+            if ("_lr" in s) or ("lr" in s) or ("x1" in s) or ("lq" in s):
+                yield str(p)
 
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--inputs", nargs="+", required=True, help="LR image dirs/globs/list-files")
+    ap.add_argument("--lr_roots", nargs="+", required=True, help="LR image root dirs")
     ap.add_argument("--output_jsonl", type=str, required=True)
+    ap.add_argument("--ram_pretrained", type=str, required=True)
+    ap.add_argument("--image_size", type=int, default=384)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return ap.parse_args()
+
+
+def load_ram(args):
+    try:
+        from ram.models import ram
+        from ram import inference_ram
+        from ram import get_transform
+    except Exception as e:
+        raise RuntimeError(
+            "RAM package not available. Please install the official RAM package with ram/get_transform/inference_ram."
+        ) from e
+    model = ram(pretrained=args.ram_pretrained, image_size=args.image_size, vit="swin_l")
+    model.eval().to(args.device)
+    transform = get_transform(image_size=args.image_size)
+    return model, inference_ram, transform
 
 
 @torch.no_grad()
 def main():
     args = parse_args()
-    paths = list(dict.fromkeys(iter_images(args.inputs)))
+    paths = list(dict.fromkeys(iter_lr_images(args.lr_roots)))
     if len(paths) == 0:
-        raise RuntimeError("No images found from --inputs")
+        raise RuntimeError("No LR images found under --lr_roots")
     os.makedirs(os.path.dirname(os.path.abspath(args.output_jsonl)), exist_ok=True)
-
-    model, inference_ram = load_ram_model(args.device)
-    tfm = T.Compose([
-        T.Resize((384, 384)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    model, inference_ram, transform = load_ram(args)
 
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
         for p in paths:
             img = Image.open(p).convert("RGB")
-            x = tfm(img).unsqueeze(0).to(args.device)
+            x = transform(img).unsqueeze(0).to(args.device)
             tags_str = inference_ram(x, model)[0]
             tags = [t.strip() for t in str(tags_str).split("|") if t.strip()]
             prompt_text = f"a realistic photo of {', '.join(tags)}" if len(tags) > 0 else "a realistic photo of image"
-            rec = {
-                "image_key": make_sample_key(p),
-                "tags": tags,
-                "prompt_text": prompt_text,
-            }
+            rec = {"image_key": make_sample_key(p), "tags": tags, "prompt_text": prompt_text}
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    print(f"✅ wrote {len(paths)} prompt records to: {args.output_jsonl}")
+    print(f"✅ wrote {len(paths)} records to: {args.output_jsonl}")
+    print(f"✅ first key: {make_sample_key(paths[0])}")
 
 
 if __name__ == "__main__":
