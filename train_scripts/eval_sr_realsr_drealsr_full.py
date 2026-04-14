@@ -30,6 +30,9 @@ from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
 from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 
+USE_ADAPTIVE_TEXT_PROMPT = True
+ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
+
 
 
 _SOBEL_X = torch.tensor([[1, 0, -1],
@@ -158,6 +161,37 @@ def load_prompt_pack(path: str, pack_name: str = "prompt") -> dict:
         raise RuntimeError(f"Invalid {pack_name} prompt pack: mask must be 4D, got shape={tuple(pack['mask'].shape)}")
     pack["_legacy_converted"] = bool(legacy_converted)
     return pack
+
+
+def make_sample_key(path: str) -> str:
+    p = os.path.splitext(str(path))[0].replace("\\", "/").strip("/")
+    return p.replace("/", "__")
+
+
+def load_adaptive_prompt_batch(sample_keys, cache_root: str, cache_mem: dict):
+    packs = []
+    hits = 0
+    tok_counts = []
+    nonpad_ratios = []
+    for key in sample_keys:
+        pack = cache_mem.get(key, None)
+        if pack is None:
+            pth = os.path.join(cache_root, f"{key}.pth")
+            if os.path.exists(pth):
+                pack = load_prompt_pack(pth, pack_name="adaptive")
+                cache_mem[key] = pack
+                hits += 1
+        else:
+            hits += 1
+        packs.append(pack)
+        if pack is not None:
+            mask = pack["mask"].detach().float()
+            tok_counts.append(float(mask.sum().item()))
+            nonpad_ratios.append(float(mask.mean().item()))
+    hit_rate = float(hits / max(1, len(sample_keys)))
+    avg_tok_count = float(sum(tok_counts) / max(1, len(tok_counts))) if len(tok_counts) > 0 else 0.0
+    avg_nonpad_ratio = float(sum(nonpad_ratios) / max(1, len(nonpad_ratios))) if len(nonpad_ratios) > 0 else 0.0
+    return packs, hit_rate, avg_tok_count, avg_nonpad_ratio
 
 
 def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
@@ -336,6 +370,7 @@ class RealSRValPairedDataset(Dataset):
             "hr_path": hr_path,
             "lr_path": lr_path,
             "image_name": Path(hr_path).name,
+            "sample_key": make_sample_key(hr_path),
         }
 
 
@@ -398,6 +433,7 @@ class DRealSRPairedDataset(Dataset):
             "hr_path": hr_path,
             "lr_path": lr_path,
             "image_name": Path(hr_path).name,
+            "sample_key": make_sample_key(hr_path),
         }
 
 
@@ -610,6 +646,7 @@ def build_model_and_assets(args, device, compute_dtype):
     print(f"[null-pack] y shape: {tuple(null_pack['y'].shape)}")
     print(f"[null-pack] mask shape: {tuple(null_pack['mask'].shape)}")
     print(f"[null-pack] legacy converted: {bool(null_pack.get('_legacy_converted', False))}")
+    print(f"[adaptive-prompt] enabled={USE_ADAPTIVE_TEXT_PROMPT} root={ADAPTIVE_PROMPT_CACHE_ROOT}")
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
         beta_start=0.0001,
@@ -627,7 +664,7 @@ def build_model_and_assets(args, device, compute_dtype):
 
 
 @torch.no_grad()
-def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen):
+def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem):
     hr = batch["hr"].to(device)
     lr = batch["lr"].to(device)
     lr_small = batch["lr_small"].to(device)
@@ -649,6 +686,16 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
         "img_hw": torch.tensor([[float(args.crop_size), float(args.crop_size)]], device=device),
         "aspect_ratio": torch.tensor([1.0], device=device),
     }
+    sample_keys = batch.get("sample_key", None)
+    if isinstance(sample_keys, str):
+        sample_keys = [sample_keys]
+    elif sample_keys is None:
+        fallback_path = batch["hr_path"][0] if isinstance(batch["hr_path"], list) else batch["hr_path"]
+        sample_keys = [make_sample_key(fallback_path)]
+    prompt_cache_hit_rate = 0.0
+    avg_prompt_token_count = 0.0
+    avg_prompt_nonpad_ratio = 0.0
+    text_cond_delta_vals = []
 
     for t in run_timesteps:
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
@@ -662,6 +709,13 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
             # native text path uses null prompt in this experiment
             y_cond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_cond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            if USE_ADAPTIVE_TEXT_PROMPT and ADAPTIVE_PROMPT_CACHE_ROOT:
+                prompt_packs, prompt_cache_hit_rate, avg_prompt_token_count, avg_prompt_nonpad_ratio = load_adaptive_prompt_batch(
+                    sample_keys, ADAPTIVE_PROMPT_CACHE_ROOT, prompt_cache_mem
+                )
+                if all(p is not None for p in prompt_packs):
+                    y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(device)
+                    mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(device)
             y_uncond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_uncond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
@@ -705,6 +759,19 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
                     force_drop_ids=drop_cond,
                     sft_strength=args.sft_strength,
                 )
+                out_text_null = pixart(
+                    x=latents.to(compute_dtype),
+                    timestep=t_b,
+                    y=y_uncond,
+                    aug_level=aug_level,
+                    mask=mask_uncond,
+                    data_info=data_info,
+                    adapter_cond=cond,
+                    semantic_tokens=sem_tokens,
+                    force_drop_ids=drop_cond,
+                    sft_strength=args.sft_strength,
+                )
+                text_cond_delta_vals.append(float((out_cond - out_text_null).detach().abs().mean().item()))
                 out = out_uncond + args.cfg_scale * (out_cond - out_uncond)
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
@@ -716,6 +783,10 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
         "sem_tok_std": float(sem_tokens.detach().float().std().item()),
         "sem_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
         "sem_out_scale": float(sem_adapter_stats.get("sem_out_scale", 1.0)),
+        "text_cond_delta": float(sum(text_cond_delta_vals) / max(1, len(text_cond_delta_vals))),
+        "prompt_cache_hit_rate": float(prompt_cache_hit_rate),
+        "avg_prompt_token_count": float(avg_prompt_token_count),
+        "avg_prompt_nonpad_ratio": float(avg_prompt_nonpad_ratio),
     }
     return pred, hr, lr, debug_stats
 
@@ -772,6 +843,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
 
     gen = torch.Generator(device=device)
     gen.manual_seed(int(args.seed))
+    prompt_cache_mem = {}
 
     rows = []
     pbar = tqdm(loader, desc=f"Eval[{dataset_name}]@{args.steps}")
@@ -779,7 +851,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.max_samples > 0 and idx >= args.max_samples:
             break
 
-        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen)
+        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem)
         m = metric_suite.compute(pred, hr)
         m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
         m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
@@ -830,6 +902,10 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "sem_tok_std": debug_stats["sem_tok_std"],
             "sem_out_std": debug_stats["sem_out_std"],
             "sem_out_scale": debug_stats["sem_out_scale"],
+            "text_cond_delta": debug_stats["text_cond_delta"],
+            "prompt_cache_hit_rate": debug_stats["prompt_cache_hit_rate"],
+            "avg_prompt_token_count": debug_stats["avg_prompt_token_count"],
+            "avg_prompt_nonpad_ratio": debug_stats["avg_prompt_nonpad_ratio"],
         }
         rows.append(row)
 
@@ -838,6 +914,8 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "lpips": f"{row['lpips']:.4f}",
             "c_lp": f"{row['corner_lpips']:.4f}",
             "cond": f"{row['cond_map_std']:.3f}",
+            "txtΔ": f"{row['text_cond_delta']:.4f}",
+            "hit": f"{row['prompt_cache_hit_rate']:.2f}",
         })
 
     csv_path = base_out / "per_image_metrics.csv"
@@ -849,6 +927,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         "edge_psnr", "edge_ssim", "edge_lpips",
         "corner_psnr", "corner_ssim", "corner_lpips",
         "cond_map_std", "sem_tok_std", "sem_out_std", "sem_out_scale",
+        "text_cond_delta", "prompt_cache_hit_rate", "avg_prompt_token_count", "avg_prompt_nonpad_ratio",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

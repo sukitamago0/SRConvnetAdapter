@@ -138,6 +138,8 @@ LORA_ALPHA = 32
 SEMANTIC_ENCODER_NAME_OR_PATH = os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "openai/clip-vit-large-patch14")
 ALLOW_SEM_ADAPTER_NONSTRICT_RESUME = False
 USE_FIXED_HARD_PROMPT = False
+USE_ADAPTIVE_TEXT_PROMPT = True
+ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
 INJECTION_CUTOFF_LAYER = 28
@@ -533,6 +535,37 @@ def load_prompt_pack(path: str, pack_name: str = "prompt") -> dict:
     return pack
 
 
+def make_sample_key(path: str) -> str:
+    p = os.path.splitext(str(path))[0].replace("\\", "/").strip("/")
+    return p.replace("/", "__")
+
+
+def load_adaptive_prompt_batch(sample_keys, cache_root: str, cache_mem: dict):
+    packs = []
+    hits = 0
+    tok_counts = []
+    nonpad_ratios = []
+    for key in sample_keys:
+        pack = cache_mem.get(key, None)
+        if pack is None:
+            pth = os.path.join(cache_root, f"{key}.pth")
+            if os.path.exists(pth):
+                pack = load_prompt_pack(pth, pack_name="adaptive")
+                cache_mem[key] = pack
+                hits += 1
+        else:
+            hits += 1
+        packs.append(pack)
+        if pack is not None:
+            mask = pack["mask"].detach().float()
+            tok_counts.append(float(mask.sum().item()))
+            nonpad_ratios.append(float(mask.mean().item()))
+    hit_rate = float(hits / max(1, len(sample_keys)))
+    avg_tok_count = float(np.mean(tok_counts)) if len(tok_counts) > 0 else 0.0
+    avg_nonpad_ratio = float(np.mean(nonpad_ratios)) if len(nonpad_ratios) > 0 else 0.0
+    return packs, hit_rate, avg_tok_count, avg_nonpad_ratio
+
+
 def _decode_vae_sample_checkpointed(vae: nn.Module, latents: torch.Tensor) -> torch.Tensor:
     """Decode latents with non-reentrant activation checkpoint to reduce peak memory."""
     def _decode_fn(z):
@@ -755,6 +788,8 @@ def get_config_snapshot():
         "semantic_prompt_tokens": 16,
         "use_native_text_path": True,
         "native_text_is_null": True,
+        "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
+        "adaptive_prompt_cache_root": ADAPTIVE_PROMPT_CACHE_ROOT,
         "semantic_fusion": "parallel_decoupled",
         "lr_control_role": "structure_only",
         "anchor_layers": list(ANCHOR_LAYERS),
@@ -1107,7 +1142,7 @@ class DF2K_Online_Dataset(Dataset):
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_up))
         lr_small_tensor = self.norm(self.to_tensor(lr_crop))
-        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path, "sample_key": make_sample_key(hr_path)}
 
 class DF2K_Val_Fixed_Dataset(Dataset):
     def __init__(self, hr_root, lr_root=None, crop_size=512):
@@ -1134,7 +1169,7 @@ class DF2K_Val_Fixed_Dataset(Dataset):
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_up_pil))
         lr_small_tensor = self.norm(self.to_tensor(lr_small_pil))
-        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path, "sample_key": make_sample_key(hr_path)}
 
 class DF2K_Val_Degraded_Dataset(Dataset):
     def __init__(self, hr_root, crop_size=512, seed=3407, deg_mode="highorder"):
@@ -1157,7 +1192,7 @@ class DF2K_Val_Degraded_Dataset(Dataset):
             lr_tensor, _ = self.pipeline(hr_tensor, return_meta=True, generator=gen)
             # fallback when pipeline only outputs lr_up
             lr_small_tensor = F.interpolate(lr_tensor.unsqueeze(0), size=(self.crop_size // 4, self.crop_size // 4), mode="bicubic", align_corners=False, antialias=True).squeeze(0).clamp(-1.0, 1.0)
-        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path, "sample_key": make_sample_key(hr_path)}
 
 class ValPackDataset(Dataset):
     def __init__(self, pack_dir: str, lr_dir_name: str = "lq512", crop_size: int = 512):
@@ -1176,7 +1211,7 @@ class ValPackDataset(Dataset):
             lr_crop = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         hr_tensor = self.norm(self.to_tensor(hr_crop)); lr_tensor = self.norm(self.to_tensor(lr_crop))
         lr_small_tensor = F.interpolate(lr_tensor.unsqueeze(0), size=(self.crop_size // 4, self.crop_size // 4), mode="bicubic", align_corners=False, antialias=True).squeeze(0).clamp(-1.0, 1.0)
-        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": str(hr_path)}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": str(hr_path), "sample_key": make_sample_key(str(hr_path))}
 
 class RealSR_Val_Paired_Dataset(Dataset):
     def __init__(self, roots, crop_size=512):
@@ -1220,7 +1255,7 @@ class RealSR_Val_Paired_Dataset(Dataset):
         hr_tensor = self.norm(self.to_tensor(hr_crop))
         lr_tensor = self.norm(self.to_tensor(lr_up))
         lr_small_tensor = self.norm(self.to_tensor(lr_crop))
-        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path}
+        return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path, "sample_key": make_sample_key(hr_path)}
 
 
 # ================= 7. LoRA =================
@@ -1814,13 +1849,22 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
         cond_deltas = []
+        text_cond_deltas = []
         adapter_map_stds = []
         cond_map_stds = []
         sem_tok_stds, sem_out_stds, sem_alphas, sem_gates = [], [], [], []
         sem_pre_stds, sem_post_stds, sem_out_scales = [], [], []
         sft_tau_means, sft_alpha_means = [], []
+        prompt_hit_rates, prompt_tok_counts, prompt_nonpad_ratios = [], [], []
+        prompt_cache_mem = {}
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
+            sample_keys = batch.get("sample_key", None)
+            if isinstance(sample_keys, str):
+                sample_keys = [sample_keys]
+            elif sample_keys is None:
+                fallback_path = batch["path"][0] if isinstance(batch["path"], list) else batch["path"]
+                sample_keys = [make_sample_key(fallback_path)]
             z_hr = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
             z_lr = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
             
@@ -1846,13 +1890,23 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                     sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                     y_cond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_cond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
+                    if USE_ADAPTIVE_TEXT_PROMPT and ADAPTIVE_PROMPT_CACHE_ROOT:
+                        prompt_packs, hit_rate, tok_cnt, nonpad_ratio = load_adaptive_prompt_batch(sample_keys, ADAPTIVE_PROMPT_CACHE_ROOT, prompt_cache_mem)
+                        prompt_hit_rates.append(hit_rate)
+                        prompt_tok_counts.append(tok_cnt)
+                        prompt_nonpad_ratios.append(nonpad_ratio)
+                        if all(p is not None for p in prompt_packs):
+                            y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(DEVICE)
+                            y_mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
                     y_uncond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_uncond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     out_uncond = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond_zero, semantic_tokens=None, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
                     out_cond = pixart(x=model_in, timestep=t_b, y=y_cond, aug_level=aug_level, mask=y_mask_cond, data_info=data_info, adapter_cond=cond, semantic_tokens=sem_tokens, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
+                    out_text_null = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond, semantic_tokens=sem_tokens, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
+                    text_cond_deltas.append(float((out_cond - out_text_null).detach().abs().mean().item()))
                     adapter_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
                     cond_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
                     sem_tok_stds.append(float(sem_tokens.detach().float().std().item()))
@@ -1909,6 +1963,10 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
         results[int(steps)] = res
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
+        text_cdelta = float(np.mean(text_cond_deltas)) if len(text_cond_deltas) > 0 else 0.0
+        prompt_hit_rate = float(np.mean(prompt_hit_rates)) if len(prompt_hit_rates) > 0 else 0.0
+        avg_prompt_token_count = float(np.mean(prompt_tok_counts)) if len(prompt_tok_counts) > 0 else 0.0
+        avg_prompt_nonpad_ratio = float(np.mean(prompt_nonpad_ratios)) if len(prompt_nonpad_ratios) > 0 else 0.0
         adapter_map_std = float(np.mean(adapter_map_stds)) if len(adapter_map_stds) > 0 else 0.0
         cond_map_std = float(np.mean(cond_map_stds)) if len(cond_map_stds) > 0 else 0.0
         sem_tok_std = float(np.mean(sem_tok_stds)) if len(sem_tok_stds) > 0 else 0.0
@@ -1922,7 +1980,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         msg = (
             f"[VAL@{steps}][{tag}] Ep{epoch+1}: PSNR={res[0]:.2f} | SSIM={res[1]:.4f} | LPIPS={res[2]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | sem_tok_std={sem_tok_std:.4f} | sem_pre_std={sem_pre_std:.4f} | sem_post_std={sem_post_std:.4f} | sem_out_scale={sem_out_scale:.4f} | sem_out_std={sem_out_std:.4f} | sem_alpha={sem_alpha:.4f} | sem_gate={sem_gate:.4f} | sem_K={16} | "
+            f"CONDΔ={cdelta:.5f} | text_cond_delta={text_cdelta:.5f} | prompt_cache_hit_rate={prompt_hit_rate:.3f} | avg_prompt_token_count={avg_prompt_token_count:.2f} | avg_prompt_nonpad_ratio={avg_prompt_nonpad_ratio:.3f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | sem_tok_std={sem_tok_std:.4f} | sem_pre_std={sem_pre_std:.4f} | sem_post_std={sem_post_std:.4f} | sem_out_scale={sem_out_scale:.4f} | sem_out_std={sem_out_std:.4f} | sem_alpha={sem_alpha:.4f} | sem_gate={sem_gate:.4f} | sem_K={16} | "
             f"sft_tau_mean={sft_tau_mean:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
@@ -2031,6 +2089,11 @@ def main():
     print(f"[null-pack] y shape: {tuple(y_null.shape)}")
     print(f"[null-pack] mask shape: {tuple(mask_null.shape)}")
     print(f"[null-pack] legacy converted: {bool(null_pack.get('_legacy_converted', False))}")
+    if USE_ADAPTIVE_TEXT_PROMPT:
+        print(f"[adaptive-prompt] enabled root={ADAPTIVE_PROMPT_CACHE_ROOT}")
+    else:
+        print("[adaptive-prompt] disabled")
+    prompt_cache_mem = {}
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
     # Single-stage optimizer is built once.
@@ -2096,6 +2159,12 @@ def main():
                 break
 
             hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE); lr_small_b = batch['lr_small']
+            sample_keys = batch.get("sample_key", None)
+            if isinstance(sample_keys, str):
+                sample_keys = [sample_keys]
+            elif sample_keys is None:
+                fallback_path = batch["path"][0] if isinstance(batch["path"], list) else batch["path"]
+                sample_keys = [make_sample_key(fallback_path)]
             with torch.no_grad():
                 zh = vae.encode(hr).latent_dist.mean * vae.config.scaling_factor
                 zl = vae.encode(lr).latent_dist.mean * vae.config.scaling_factor
@@ -2127,6 +2196,16 @@ def main():
                 # native text path uses null prompt in this experiment
                 y_cond = y_null.repeat(zt.shape[0], 1, 1, 1)
                 y_mask = mask_null.repeat(zt.shape[0], 1, 1, 1)
+                prompt_cache_hit_rate = 0.0
+                avg_prompt_token_count = 0.0
+                avg_prompt_nonpad_ratio = 0.0
+                if USE_ADAPTIVE_TEXT_PROMPT and ADAPTIVE_PROMPT_CACHE_ROOT:
+                    prompt_packs, prompt_cache_hit_rate, avg_prompt_token_count, avg_prompt_nonpad_ratio = load_adaptive_prompt_batch(
+                        sample_keys, ADAPTIVE_PROMPT_CACHE_ROOT, prompt_cache_mem
+                    )
+                    if all(p is not None for p in prompt_packs):
+                        y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(DEVICE)
+                        y_mask = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
                 drop_cond = torch.zeros(zt.shape[0], device=DEVICE, dtype=torch.long)
                 sft_strength = get_sft_strength(epoch + 1)
                 kwargs = dict(
@@ -2186,8 +2265,21 @@ def main():
                         force_drop_ids=drop_uncond_guard,
                         sft_strength=sft_strength,
                     ).float()
+                    out_text_null_guard = pixart(
+                        x=zt.detach(),
+                        timestep=t,
+                        y=y_uncond_guard,
+                        aug_level=aug_level_emb,
+                        mask=y_mask_uncond_guard,
+                        data_info=d_info,
+                        adapter_cond=cond_in,
+                        semantic_tokens=sem_tokens.detach(),
+                        force_drop_ids=drop_cond,
+                        sft_strength=sft_strength,
+                    ).float()
                 assert_finite_tensor("out_uncond", out_uncond_guard, guard_stats)
                 cond_delta_curr = float((model_pred.detach() - out_uncond_guard).abs().mean().item())
+                text_cond_delta_curr = float((model_pred.detach() - out_text_null_guard).abs().mean().item())
 
                 # [V8 Logic] Calculate V-Target
                 # v = alpha * epsilon - sigma * x0
@@ -2303,6 +2395,7 @@ def main():
                 adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_delta = float(cond_delta_curr)
+                text_cond_delta = float(text_cond_delta_curr)
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2330,6 +2423,10 @@ def main():
                     'sem_alpha': f"{sem_alpha:.4f}",
                     'sem_gate': f"{sem_gate:.4f}",
                     'cond_delta': f"{cond_delta:.5f}",
+                    'text_cond_delta': f"{text_cond_delta:.5f}",
+                    'p_hit': f"{prompt_cache_hit_rate:.3f}",
+                    'p_tok': f"{avg_prompt_token_count:.1f}",
+                    'p_nonpad': f"{avg_prompt_nonpad_ratio:.3f}",
                     'sem_K': f"{16}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
                     'cond_map_std': f"{cond_map_std:.4f}",
@@ -2354,6 +2451,10 @@ def main():
                     "sem_alpha": sem_alpha,
                     "sem_gate": sem_gate,
                     "cond_delta": cond_delta,
+                    "text_cond_delta": text_cond_delta,
+                    "prompt_cache_hit_rate": float(prompt_cache_hit_rate),
+                    "avg_prompt_token_count": float(avg_prompt_token_count),
+                    "avg_prompt_nonpad_ratio": float(avg_prompt_nonpad_ratio),
                     "sem_K": 16,
                     "adapter_map_std": adapter_map_std,
                     "cond_map_std": cond_map_std,
