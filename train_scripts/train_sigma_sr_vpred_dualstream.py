@@ -135,8 +135,10 @@ MAX_TRAIN_STEPS = int(os.getenv("MAX_TRAIN_STEPS", "0"))
 BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16 
 NUM_WORKERS = 4
+VAL_NUM_WORKERS = 0
 TRAIN_PROMPT_CACHE_MAX_ITEMS = 0
 VAL_PROMPT_CACHE_MAX_ITEMS = 128
+GUARD_FORWARD_EVERY = 50
 
 LR_BASE = 1e-5 
 LORA_RANK = 16
@@ -2336,9 +2338,9 @@ def main():
         val_ds,
         batch_size=1,
         shuffle=False,
-        num_workers=NUM_WORKERS,
+        num_workers=VAL_NUM_WORKERS,
         persistent_workers=False,
-        prefetch_factor=1 if NUM_WORKERS > 0 else None,
+        prefetch_factor=1 if VAL_NUM_WORKERS > 0 else None,
     )
     if USE_ADAPTIVE_TEXT_PROMPT:
         if (not ADAPTIVE_PROMPT_CACHE_ROOT) or (not os.path.isdir(ADAPTIVE_PROMPT_CACHE_ROOT)):
@@ -2493,6 +2495,8 @@ def main():
     print("📏 Raw validation frequency: every validation trigger")
     print("[VAL-SCHEDULE] epochs 1-14: every 5 | epochs 15-24: every 2 | epochs 25+: every epoch")
     print(f"[PROMPT-CACHE] train_max_items={TRAIN_PROMPT_CACHE_MAX_ITEMS} val_max_items={VAL_PROMPT_CACHE_MAX_ITEMS}")
+    print(f"[DATALOADER] train_num_workers={NUM_WORKERS} val_num_workers={VAL_NUM_WORKERS}")
+    print(f"[GUARD-FWD] extra_guard_forward_every={GUARD_FORWARD_EVERY}")
 
     if START_FROM_BASE_ONLY:
         print("✅ START_FROM_BASE_ONLY=True: skip bootstrap/resume checkpoints; train from PixArt base.")
@@ -2530,6 +2534,8 @@ def main():
         train_ds.set_epoch(epoch)
         pbar = tqdm(train_loader, dynamic_ncols=True, desc=f"Ep{epoch+1}")
         accum_micro_steps = 0
+        last_cond_delta_curr = float("nan")
+        last_text_cond_delta_curr = float("nan")
         reached_max_steps = False
         for i, batch in enumerate(pbar):
             if max_steps is not None and step >= max_steps:
@@ -2671,38 +2677,45 @@ def main():
                 assert_finite_tensor("sem_tokens", sem_tokens, guard_stats)
                 assert_finite_tensor("cond_map", cond_in["cond_map"], guard_stats)
                 assert_finite_tensor("model_pred", model_pred, guard_stats)
-                drop_uncond_guard = torch.ones(zt_in.shape[0], device=DEVICE, dtype=torch.long)
-                cond_zero_guard = mask_adapter_cond(cond_in, torch.zeros((zt_in.shape[0],), device=DEVICE))
-                y_uncond_guard = null_pack["y"].to(DEVICE).repeat(zt_in.shape[0], 1, 1, 1)
-                y_mask_uncond_guard = null_pack["mask"].to(DEVICE).repeat(zt_in.shape[0], 1, 1, 1)
-                with torch.no_grad():
-                    out_uncond_guard = pixart(
-                        x=zt_in.detach(),
-                        timestep=t,
-                        y=y_uncond_guard,
-                        aug_level=aug_level_emb,
-                        mask=y_mask_uncond_guard,
-                        data_info=d_info,
-                        adapter_cond=cond_zero_guard,
-                        semantic_tokens=None,
-                        force_drop_ids=drop_uncond_guard,
-                        sft_strength=sft_strength,
-                    ).float()
-                    out_text_null_guard = pixart(
-                        x=zt_in.detach(),
-                        timestep=t,
-                        y=y_uncond_guard,
-                        aug_level=aug_level_emb,
-                        mask=y_mask_uncond_guard,
-                        data_info=d_info,
-                        adapter_cond=cond_in,
-                        semantic_tokens=sem_tokens.detach(),
-                        force_drop_ids=drop_cond,
-                        sft_strength=sft_strength,
-                    ).float()
-                assert_finite_tensor("out_uncond", out_uncond_guard, guard_stats)
-                cond_delta_curr = float((model_pred.detach() - out_uncond_guard).abs().mean().item())
-                text_cond_delta_curr = float((model_pred.detach() - out_text_null_guard).abs().mean().item())
+                run_guard_forward = ((i % GUARD_FORWARD_EVERY) == 0) or ((step % GUARD_FORWARD_EVERY) == 0)
+                if run_guard_forward:
+                    drop_uncond_guard = torch.ones(zt_in.shape[0], device=DEVICE, dtype=torch.long)
+                    cond_zero_guard = mask_adapter_cond(cond_in, torch.zeros((zt_in.shape[0],), device=DEVICE))
+                    y_uncond_guard = null_pack["y"].to(DEVICE).repeat(zt_in.shape[0], 1, 1, 1)
+                    y_mask_uncond_guard = null_pack["mask"].to(DEVICE).repeat(zt_in.shape[0], 1, 1, 1)
+                    with torch.no_grad():
+                        out_uncond_guard = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_uncond_guard,
+                            aug_level=aug_level_emb,
+                            mask=y_mask_uncond_guard,
+                            data_info=d_info,
+                            adapter_cond=cond_zero_guard,
+                            semantic_tokens=None,
+                            force_drop_ids=drop_uncond_guard,
+                            sft_strength=sft_strength,
+                        ).float()
+                        out_text_null_guard = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_uncond_guard,
+                            aug_level=aug_level_emb,
+                            mask=y_mask_uncond_guard,
+                            data_info=d_info,
+                            adapter_cond=cond_in,
+                            semantic_tokens=sem_tokens.detach(),
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                    assert_finite_tensor("out_uncond", out_uncond_guard, guard_stats)
+                    cond_delta_curr = float((model_pred.detach() - out_uncond_guard).abs().mean().item())
+                    text_cond_delta_curr = float((model_pred.detach() - out_text_null_guard).abs().mean().item())
+                    last_cond_delta_curr = cond_delta_curr
+                    last_text_cond_delta_curr = text_cond_delta_curr
+                else:
+                    cond_delta_curr = float(last_cond_delta_curr)
+                    text_cond_delta_curr = float(last_text_cond_delta_curr)
 
                 # [V8 Logic] Min-SNR-Gamma Weighting (per-sample, shape [B])
                 alpha_s = alpha_t[:, 0, 0, 0]
@@ -2871,6 +2884,7 @@ def main():
                     'hpa_idelta': f"{hpa_img_delta_std:.4f}",
                     'cond_delta': f"{cond_delta:.5f}",
                     'text_cond_delta': f"{text_cond_delta:.5f}",
+                    'guard_fwd': f"{int(run_guard_forward)}",
                     'a_hit': f"{prompt_cache_hit_rate:.3f}",
                     'p_miss': f"{int(num_missing_prompt_packs)}",
                     'p_tok': f"{avg_prompt_token_count:.1f}",
@@ -2915,6 +2929,7 @@ def main():
                     "hpa_img_delta_std": hpa_img_delta_std,
                     "cond_delta": cond_delta,
                     "text_cond_delta": text_cond_delta,
+                    "run_guard_forward": int(run_guard_forward),
                     "adaptive_prompt_hit_rate": float(prompt_cache_hit_rate),
                     "num_missing_prompt_packs": int(num_missing_prompt_packs),
                     "avg_prompt_token_count": float(avg_prompt_token_count),
