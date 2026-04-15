@@ -2693,7 +2693,7 @@ def main():
                 need_patch_loss = (
                     (w.get('lr_cons', 0.0) > 0)
                     or (w.get('gw', 0.0) > 0)
-                    or (w.get('lpips', 0.0) > 0)
+                    or (USE_LEGACY_PATCH_LPIPS and (w.get('lpips', 0.0) > 0))
                 )
 
                 patch_t_mask = (t >= int(PIXEL_LOSS_T_MIN))
