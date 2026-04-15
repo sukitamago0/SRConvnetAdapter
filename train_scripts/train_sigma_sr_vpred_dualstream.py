@@ -24,6 +24,7 @@ import glob
 import random
 import math
 import re
+import resource
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,6 +32,7 @@ import torch.nn.functional as F
 import io
 import hashlib
 import shutil
+from collections import OrderedDict
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.transforms import functional as TF
@@ -132,7 +134,9 @@ MAX_TRAIN_STEPS = int(os.getenv("MAX_TRAIN_STEPS", "0"))
 
 BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16 
-NUM_WORKERS = 8
+NUM_WORKERS = 4
+TRAIN_PROMPT_CACHE_MAX_ITEMS = 0
+VAL_PROMPT_CACHE_MAX_ITEMS = 128
 
 LR_BASE = 1e-5 
 LORA_RANK = 16
@@ -555,22 +559,28 @@ def load_prompt_pack(path: str, pack_name: str = "prompt") -> dict:
     return pack
 
 
-def load_adaptive_prompt_batch(sample_keys, cache_root: str, cache_mem: dict):
+def load_adaptive_prompt_batch(sample_keys, cache_root: str, cache_mem, max_cache_items: int = 0):
     packs = []
     hits = 0
     num_missing = 0
     tok_counts = []
     nonpad_ratios = []
+    use_cache = (cache_mem is not None) and (max_cache_items > 0)
     for key in sample_keys:
-        pack = cache_mem.get(key, None)
-        if pack is None:
+        pack = None
+        if use_cache and key in cache_mem:
+            pack = cache_mem[key]
+            cache_mem.move_to_end(key)
+            hits += 1
+        else:
             pth = os.path.join(cache_root, f"{key}.pth")
             if os.path.exists(pth):
                 pack = load_prompt_pack(pth, pack_name="adaptive")
-                cache_mem[key] = pack
-                hits += 1
-        else:
-            hits += 1
+                if use_cache:
+                    cache_mem[key] = pack
+                    cache_mem.move_to_end(key)
+                    while len(cache_mem) > max_cache_items:
+                        cache_mem.popitem(last=False)
         packs.append(pack)
         if pack is None:
             num_missing += 1
@@ -578,7 +588,7 @@ def load_adaptive_prompt_batch(sample_keys, cache_root: str, cache_mem: dict):
             mask = pack["mask"].detach().float()
             tok_counts.append(float(mask.sum().item()))
             nonpad_ratios.append(float(mask.mean().item()))
-    hit_rate = float(hits / max(1, len(sample_keys)))
+    hit_rate = float(hits / max(1, len(sample_keys))) if use_cache else 0.0
     avg_tok_count = float(np.mean(tok_counts)) if len(tok_counts) > 0 else 0.0
     avg_nonpad_ratio = float(np.mean(nonpad_ratios)) if len(nonpad_ratios) > 0 else 0.0
     return packs, hit_rate, avg_tok_count, avg_nonpad_ratio, int(num_missing)
@@ -594,6 +604,11 @@ def _decode_vae_sample_checkpointed(vae: nn.Module, latents: torch.Tensor) -> to
 def _maybe_empty_cuda_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def get_rss_gb():
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return float(rss_kb) / 1024.0 / 1024.0
 
 def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
     strength = float(max(0.0, min(1.0, strength)))
@@ -2139,7 +2154,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         sem_pre_stds, sem_post_stds, sem_out_scales = [], [], []
         tasr_gate_means, sft_alpha_means = [], []
         prompt_hit_rates, prompt_tok_counts, prompt_nonpad_ratios = [], [], []
-        prompt_cache_mem = {}
+        prompt_cache_mem = OrderedDict()
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
             sample_keys = batch.get("sample_key", None)
@@ -2174,7 +2189,12 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                     y_cond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_cond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     if USE_ADAPTIVE_TEXT_PROMPT and ADAPTIVE_PROMPT_CACHE_ROOT:
-                        prompt_packs, hit_rate, tok_cnt, nonpad_ratio, _num_missing_prompt_packs = load_adaptive_prompt_batch(sample_keys, ADAPTIVE_PROMPT_CACHE_ROOT, prompt_cache_mem)
+                        prompt_packs, hit_rate, tok_cnt, nonpad_ratio, _num_missing_prompt_packs = load_adaptive_prompt_batch(
+                            sample_keys,
+                            ADAPTIVE_PROMPT_CACHE_ROOT,
+                            prompt_cache_mem,
+                            max_cache_items=VAL_PROMPT_CACHE_MAX_ITEMS,
+                        )
                         prompt_hit_rates.append(hit_rate)
                         prompt_tok_counts.append(tok_cnt)
                         prompt_nonpad_ratios.append(nonpad_ratio)
@@ -2301,8 +2321,25 @@ def main():
     else:
         val_ds = DF2K_Val_Fixed_Dataset(VAL_HR_DIR, lr_root=None, crop_size=512)
         print("[VAL] mode=fallback_bicubic_from_hr (no paired VAL_LR_DIR found)")
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, drop_last=True, worker_init_fn=seed_worker, generator=dl_gen)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=dl_gen,
+        persistent_workers=False,
+        prefetch_factor=1 if NUM_WORKERS > 0 else None,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        persistent_workers=False,
+        prefetch_factor=1 if NUM_WORKERS > 0 else None,
+    )
     if USE_ADAPTIVE_TEXT_PROMPT:
         if (not ADAPTIVE_PROMPT_CACHE_ROOT) or (not os.path.isdir(ADAPTIVE_PROMPT_CACHE_ROOT)):
             raise FileNotFoundError(
@@ -2398,7 +2435,7 @@ def main():
         print(f"[adaptive-prompt] enabled root={ADAPTIVE_PROMPT_CACHE_ROOT}")
     else:
         print("[adaptive-prompt] disabled")
-    prompt_cache_mem = {}
+    prompt_cache_mem = None
     d_info = {"img_hw": torch.tensor([[512.,512.]]).to(DEVICE), "aspect_ratio": torch.tensor([1.]).to(DEVICE)}
 
     # Single-stage optimizer is built once.
@@ -2455,6 +2492,7 @@ def main():
     print(f"📏 EMA validation frequency: every {EMA_VALIDATE_EVERY} validations")
     print("📏 Raw validation frequency: every validation trigger")
     print("[VAL-SCHEDULE] epochs 1-14: every 5 | epochs 15-24: every 2 | epochs 25+: every epoch")
+    print(f"[PROMPT-CACHE] train_max_items={TRAIN_PROMPT_CACHE_MAX_ITEMS} val_max_items={VAL_PROMPT_CACHE_MAX_ITEMS}")
 
     if START_FROM_BASE_ONLY:
         print("✅ START_FROM_BASE_ONLY=True: skip bootstrap/resume checkpoints; train from PixArt base.")
@@ -2568,7 +2606,10 @@ def main():
                 avg_prompt_nonpad_ratio = 0.0
                 if USE_ADAPTIVE_TEXT_PROMPT and ADAPTIVE_PROMPT_CACHE_ROOT:
                     prompt_packs, prompt_cache_hit_rate, avg_prompt_token_count, avg_prompt_nonpad_ratio, num_missing_prompt_packs = load_adaptive_prompt_batch(
-                        sample_keys, ADAPTIVE_PROMPT_CACHE_ROOT, prompt_cache_mem
+                        sample_keys,
+                        ADAPTIVE_PROMPT_CACHE_ROOT,
+                        prompt_cache_mem,
+                        max_cache_items=TRAIN_PROMPT_CACHE_MAX_ITEMS,
                     )
                     if not all(p is not None for p in prompt_packs):
                         if STRICT_ADAPTIVE_PROMPT:
@@ -2793,6 +2834,9 @@ def main():
                 cond_delta = float(cond_delta_curr)
                 text_cond_delta = float(text_cond_delta_curr)
                 tala_on = int(USE_TALA_TRAIN)
+                cpu_rss_gb = float(get_rss_gb()) if (step % 100 == 0) else float("nan")
+                if step % 100 == 0:
+                    print(f"[MEM] step={step} cpu_rss_gb={cpu_rss_gb:.3f}")
                 log_dict = {
                     'v_loss': f"{loss_v:.3f}",
                     'lat_l1': f"{loss_latent_l1:.3f}",
@@ -2839,6 +2883,7 @@ def main():
                     'sem_K': f"{16}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
                     'cond_map_std': f"{cond_map_std:.4f}",
+                    'cpu_rss_gb': f"{cpu_rss_gb:.3f}" if math.isfinite(cpu_rss_gb) else "nan",
                 }
                 log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
                 pbar.set_postfix(log_dict)
@@ -2884,6 +2929,9 @@ def main():
                     "sem_K": 16,
                     "adapter_map_std": adapter_map_std,
                     "cond_map_std": cond_map_std,
+                    "cpu_rss_gb": (float(cpu_rss_gb) if math.isfinite(cpu_rss_gb) else float("nan")),
+                    "train_prompt_cache_max_items": int(TRAIN_PROMPT_CACHE_MAX_ITEMS),
+                    "val_prompt_cache_max_items": int(VAL_PROMPT_CACHE_MAX_ITEMS),
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
