@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint
 from diffusion.model.nets.PixArtMS import PixArtMS
 from diffusion.model.nets.PixArt_blocks import TimestepEmbedder, T2IFinalLayer
 from diffusion.model.nets.PixArt import get_2d_sincos_pos_embed
+
 
 def zero_module(module: nn.Module):
     for p in module.parameters():
@@ -28,52 +30,6 @@ class SFTLayer(nn.Module):
         shift = self.shift_conv1(self.act(self.shift_conv0(cond)))
         gain = self.w * float(strength)
         return feat * (1 + gain * scale) + gain * shift, scale, shift
-
-
-class TASRTimeGate(nn.Module):
-    def __init__(self, x_ch, cond_ch, t_embed_dim, hidden_ch=128, use_scale_shift_norm=True):
-        super().__init__()
-        self.use_scale_shift_norm = bool(use_scale_shift_norm)
-        half = hidden_ch // 2
-        self.x_proj = nn.Conv2d(x_ch, half, 1)
-        self.delta_proj = nn.Conv2d(x_ch, half, 1)
-        self.cond_proj = nn.Conv2d(cond_ch, half, 1)
-        c_init = hidden_ch + half
-        mid_ch = max(64, c_init // 2)
-        self.in_layers = nn.Sequential(
-            nn.GroupNorm(16, c_init),
-            nn.SiLU(),
-            nn.Conv2d(c_init, mid_ch, 3, 1, 1),
-        )
-        self.emb_layers = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(t_embed_dim, 2 * mid_ch if self.use_scale_shift_norm else mid_ch),
-        )
-        self.out_norm = nn.GroupNorm(16, mid_ch)
-        self.out_rest = nn.Sequential(
-            nn.SiLU(),
-            nn.Conv2d(mid_ch, max(32, mid_ch // 2), 3, 1, 1),
-            nn.SiLU(),
-            zero_module(nn.Conv2d(max(32, mid_ch // 2), 1, 3, 1, 1)),
-        )
-
-    def forward(self, x_map, delta_map, cond_map, t_emb):
-        x_in = self.x_proj(x_map)
-        d_in = self.delta_proj(delta_map)
-        c_in = self.cond_proj(cond_map)
-        h = torch.cat([x_in, d_in, c_in], dim=1)
-        h = self.in_layers(h)
-        emb = self.emb_layers(t_emb).type_as(h)
-        while emb.dim() < h.dim():
-            emb = emb[..., None]
-        if self.use_scale_shift_norm:
-            scale, shift = torch.chunk(emb, 2, dim=1)
-            h = self.out_norm(h) * (1 + scale) + shift
-            h = self.out_rest(h)
-        else:
-            h = h + emb
-            h = self.out_rest(self.out_norm(h))
-        return h
 
 
 @MODELS.register_module()
@@ -103,39 +59,29 @@ class PixArtSigmaSR(PixArtMS):
         self.force_null_caption = bool(force_null_caption)
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
+        self.lr_token_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+        self.lr_token_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.lr_token_dropout = nn.Dropout(0.0)
+        nn.init.normal_(self.lr_token_proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.lr_token_proj.bias)
+
+        self.local_entry_proj = nn.Conv2d(self.hidden_size, self.hidden_size, 1, 1, 0, bias=True)
+        self.local_entry_gate = nn.Parameter(torch.tensor(-4.0))
+        nn.init.zeros_(self.local_entry_proj.weight)
+        nn.init.zeros_(self.local_entry_proj.bias)
+
         self.sft_cond_reduce = nn.Sequential(
             nn.Conv2d(self.hidden_size, 64, 1),
             nn.LeakyReLU(0.1, inplace=True),
         )
         self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
-        # anchor_layers = early structure-only band.
-        self.sft_candidate_layers = list(anchor_layers) if anchor_layers is not None else list(range(0, 8))
-        self.anchor_layers = set(self.sft_candidate_layers)
-        # semantic_layers = late semantic-only band.
-        self.semantic_layers = list(semantic_layers) if semantic_layers is not None else list(range(24, 28))
-        for i in self.semantic_layers:
-            if 0 <= i < self.depth:
-                self.blocks[i].enable_semantic_adapter()
-
-        default_alpha_init = {i: 1.0 for i in self.sft_candidate_layers}
-        self.sft_alpha = nn.ParameterDict({
-            str(i): nn.Parameter(torch.tensor(float(default_alpha_init.get(int(i), 1.0))))
-            for i in sorted(self.anchor_layers)
-        })
-        self.tasr_time_gates = nn.ModuleDict({
-            str(i): TASRTimeGate(
-                x_ch=self.hidden_size,
-                cond_ch=64,
-                t_embed_dim=self.hidden_size,
-                hidden_ch=128,
-            )
-            for i in sorted(self.anchor_layers)
-        })
+        self.local_sft_start_layer = 16
+        self.local_sft_end_layer = self.depth
 
         self._last_sft_stats = None
-        self._last_semantic_stats = None
+        self._last_image_cond_stats = None
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, semantic_tokens=None, **kwargs):
+    def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
         sft_strength = float(kwargs.pop("sft_strength", 1.0))
         bs = x.shape[0]
@@ -149,8 +95,7 @@ class PixArtSigmaSR(PixArtMS):
         ).unsqueeze(0).to(x.device).to(self.dtype)
 
         x = self.x_embedder(x) + pos_embed
-        t_time_only = self.t_embedder(timestep)
-        t = t_time_only
+        t = self.t_embedder(timestep)
         if aug_level is not None:
             t = t + self.aug_embedder(aug_level.to(self.dtype))
 
@@ -159,8 +104,27 @@ class PixArtSigmaSR(PixArtMS):
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
 
         cond_map = None
+        cond_tokens = None
         if adapter_cond is not None:
             cond_map = adapter_cond.get("cond_map", None)
+            cond_tokens = adapter_cond.get("cond_tokens", None)
+
+        lr_cond_tokens = None
+        if cond_tokens is not None:
+            lr_cond_tokens = self.lr_token_proj(self.lr_token_norm(cond_tokens.to(dtype=x.dtype)))
+            lr_cond_tokens = self.lr_token_dropout(lr_cond_tokens)
+
+        entry_local_tokens = None
+        cond_red = None
+        if cond_map is not None:
+            cond_map_x = cond_map.to(dtype=x.dtype)
+            if cond_map_x.shape[-2:] != (self.h, self.w):
+                cond_map_x = F.interpolate(cond_map_x, size=(self.h, self.w), mode="bilinear", align_corners=False)
+            entry_local_tokens = self.local_entry_proj(cond_map_x).flatten(2).transpose(1, 2).contiguous()
+            cond_red = self.sft_cond_reduce(cond_map_x)
+
+        if entry_local_tokens is not None:
+            x = x + torch.sigmoid(self.local_entry_gate).to(x.dtype).view(1, 1, 1) * entry_local_tokens
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -177,83 +141,48 @@ class PixArtSigmaSR(PixArtMS):
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
-        cond_red = None
-        if cond_map is not None:
-            cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
-
-        semantic_gate = None
-        tasr_gate_means, tasr_gate_mins, tasr_gate_maxs, sft_delta_stds = [], [], [], []
-        sem_stats = []
+        sft_delta_stds = []
+        image_stats = []
         for i, block in enumerate(self.blocks):
-            if cond_red is not None and i in self.anchor_layers:
+            if cond_red is not None and (self.local_sft_start_layer <= i < self.local_sft_end_layer):
                 b, n, c = x.shape
                 if n != self.h * self.w:
-                    raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w} from input/patch rule")
-                x_map_pre = x.transpose(1, 2).reshape(b, c, self.h, self.w)
-                x_map_post, _, _ = self.sft_layers[i](x_map_pre, cond_red, strength=sft_strength)
-                sft_delta = x_map_post - x_map_pre
-                # backbone uses augmented t; TASR gate uses pure timestep embedding only.
-                gate_logits = self.tasr_time_gates[str(i)](x_map_pre, sft_delta, cond_red, t_time_only.to(dtype=x_map_pre.dtype))
-                gate_spatial = torch.sigmoid(gate_logits)
-                alpha_i = self.sft_alpha[str(i)].to(x_map_pre.dtype).view(1, 1, 1, 1)
-                x_map = x_map_pre + alpha_i * gate_spatial * sft_delta
-                tasr_gate_means.append(float(gate_spatial.detach().float().mean().item()))
-                tasr_gate_mins.append(float(gate_spatial.detach().float().min().item()))
-                tasr_gate_maxs.append(float(gate_spatial.detach().float().max().item()))
-                sft_delta_stds.append(float(sft_delta.detach().float().std().item()))
+                    raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w}")
+                x_map = x.transpose(1, 2).reshape(b, c, self.h, self.w)
+                x_map_pre = x_map
+                x_map, _, _ = self.sft_layers[i](x_map, cond_red, strength=sft_strength)
+                sft_delta_stds.append(float((x_map - x_map_pre).detach().float().std().item()))
                 x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
 
             block_kwargs = dict(
                 HW=(self.h, self.w),
                 base_size=self.base_size,
                 pe_interpolation=self.pe_interpolation,
+                image_cond=lr_cond_tokens,
+                image_gate=None,
                 **kwargs,
             )
-            if (i in self.semantic_layers) and (semantic_tokens is not None):
-                block_kwargs["semantic_tokens"] = semantic_tokens
-                block_kwargs["semantic_block_id"] = i
             x = auto_grad_checkpoint(block, x, y, t0, y_lens, **block_kwargs)
-            blk_stats = getattr(block, "_last_semantic_stats", None)
+            blk_stats = getattr(block, "_last_image_stats", None)
             if blk_stats is not None:
-                sem_stats.append(blk_stats)
+                image_stats.append(blk_stats)
 
-        if len(self.anchor_layers) > 0:
-            alpha_vals = [self.sft_alpha[str(i)].item() for i in self.sft_candidate_layers if str(i) in self.sft_alpha]
-            self._last_sft_stats = {
-                "alpha_mean": float(sum(alpha_vals) / max(1, len(alpha_vals))),
-                "alpha_min": float(min(alpha_vals) if len(alpha_vals) > 0 else 0.0),
-                "alpha_max": float(max(alpha_vals) if len(alpha_vals) > 0 else 0.0),
-                "sft_strength": float(sft_strength),
-                "tasr_gate_mean": float(sum(tasr_gate_means) / max(1, len(tasr_gate_means))),
-                "tasr_gate_min": float(min(tasr_gate_mins) if len(tasr_gate_mins) > 0 else 0.0),
-                "tasr_gate_max": float(max(tasr_gate_maxs) if len(tasr_gate_maxs) > 0 else 0.0),
-                "sft_delta_std": float(sum(sft_delta_stds) / max(1, len(sft_delta_stds))),
+        self._last_sft_stats = {
+            "sft_strength": float(sft_strength),
+            "sft_delta_std": float(sum(sft_delta_stds) / max(1, len(sft_delta_stds))),
+            "late_sft_active_start": int(self.local_sft_start_layer),
+            "local_entry_gate": float(torch.sigmoid(self.local_entry_gate.detach()).item()),
+        }
+
+        if len(image_stats) > 0:
+            self._last_image_cond_stats = {
+                "avg_image_alpha": float(sum(float(s.get("image_alpha_value", 0.0)) for s in image_stats) / len(image_stats)),
+                "lr_cross_text_ctx_std": float(sum(float(s.get("text_ctx_std", 0.0)) for s in image_stats) / len(image_stats)),
+                "lr_cross_img_delta_std": float(sum(float(s.get("img_delta_std", 0.0)) for s in image_stats) / len(image_stats)),
+                "cross_out_std": float(sum(float(s.get("cross_out_std", 0.0)) for s in image_stats) / len(image_stats)),
             }
         else:
-            self._last_sft_stats = None
-
-        if len(sem_stats) > 0:
-            active_ids = [int(s.get("semantic_block_id", -1)) for s in sem_stats if int(s.get("semantic_block_id", -1)) >= 0]
-            nonfinite_ids = [int(s.get("semantic_block_id", -1)) for s in sem_stats if bool(s.get("semantic_nonfinite", False)) and int(s.get("semantic_block_id", -1)) >= 0]
-            self._last_semantic_stats = {
-                "semantic_out_std": float(sum(s["semantic_out_std"] for s in sem_stats) / len(sem_stats)),
-                "semantic_alpha_value": float(sum(s["semantic_alpha_value"] for s in sem_stats) / len(sem_stats)),
-                "hpa_text_ctx_std": float(sum(float(s.get("hpa_text_ctx_std", 0.0)) for s in sem_stats) / len(sem_stats)),
-                "hpa_img_delta_std": float(sum(float(s.get("hpa_img_delta_std", 0.0)) for s in sem_stats) / len(sem_stats)),
-                "semantic_block_ids_active": sorted(list(set(active_ids))),
-                "semantic_block_ids_nonfinite": sorted(list(set(nonfinite_ids))),
-            }
-            if len(nonfinite_ids) > 0:
-                sem_tok_std = float(semantic_tokens.detach().float().std().item()) if semantic_tokens is not None else 0.0
-                print(
-                    f"[Semantic-NonFinite] timestep_min={float(timestep.float().min().item()):.1f} "
-                    f"timestep_max={float(timestep.float().max().item()):.1f} sem_tok_std={sem_tok_std:.5f} "
-                    f"sem_out_std={self._last_semantic_stats['semantic_out_std']:.5f} "
-                    f"semantic_alpha_value={self._last_semantic_stats['semantic_alpha_value']:.5f} "
-                    f"nonfinite_blocks={self._last_semantic_stats['semantic_block_ids_nonfinite']}"
-                )
-        else:
-            self._last_semantic_stats = None
+            self._last_image_cond_stats = None
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)

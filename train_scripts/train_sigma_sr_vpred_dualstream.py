@@ -1440,15 +1440,15 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             or "lora_A" in name
             or "lora_B" in name
             or "sft_cond_reduce" in name
+            or "local_entry_proj" in name
+            or "local_entry_gate" in name
+            or "lr_token_norm" in name
+            or "lr_token_proj" in name
         ):
             p.requires_grad = True
-        if any(f"sft_alpha.{i}" in name for i in anchor_ids):
+        if "sft_layers." in name:
             p.requires_grad = True
-        if any(f"sft_layers.{i}." in name for i in anchor_ids):
-            p.requires_grad = True
-        if any(f"tasr_time_gates.{i}." in name for i in anchor_ids):
-            p.requires_grad = True
-        if ("hybrid_cross_attn" in name) or ("semantic_alpha" in name):
+        if ("cross_attn" in name) or ("image_alpha" in name):
             p.requires_grad = True
 
     if not train_x_embedder:
@@ -1470,22 +1470,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
     trainable_sft_layer_ids = sorted(list({int(n.split("sft_layers.")[1].split(".")[0]) for n, p in pixart.named_parameters() if p.requires_grad and "sft_layers." in n}))
-    trainable_sft_alpha_ids = sorted(list({int(n.split("sft_alpha.")[1].split(".")[0]) for n, p in pixart.named_parameters() if p.requires_grad and "sft_alpha." in n}))
-    trainable_tasr_gate_ids = sorted(list({int(n.split("tasr_time_gates.")[1].split(".")[0]) for n, p in pixart.named_parameters() if p.requires_grad and "tasr_time_gates." in n}))
-    outside_anchor = sorted(list(set(trainable_sft_layer_ids) - set(anchor_ids)))
-    print(f"[SFT-Trainable] anchor_layers={anchor_ids}")
-    print(f"[SFT-Trainable] actual_trainable_sft_ids={trainable_sft_layer_ids}")
-    print(f"[SFT-Trainable] actual_trainable_sft_alpha_ids={trainable_sft_alpha_ids}")
-    print(f"[SFT-Trainable] actual_trainable_tasr_gate_ids={trainable_tasr_gate_ids}")
-    print(f"[SFT-Trainable] outside_anchor={outside_anchor}")
-    if outside_anchor:
-        raise RuntimeError(f"SFT trainable mismatch: found trainable SFT layers not in anchor_layers: {outside_anchor}")
-    if trainable_sft_layer_ids != anchor_ids:
-        raise RuntimeError(f"SFT trainable mismatch: trainable_sft_ids={trainable_sft_layer_ids}, anchor_layers={anchor_ids}")
-    if trainable_sft_alpha_ids != anchor_ids:
-        raise RuntimeError(f"SFT alpha mismatch: trainable_sft_alpha_ids={trainable_sft_alpha_ids}, anchor_layers={anchor_ids}")
-    if trainable_tasr_gate_ids != anchor_ids:
-        raise RuntimeError(f"TASR gate mismatch: trainable_tasr_gate_ids={trainable_tasr_gate_ids}, anchor_layers={anchor_ids}")
+    print(f"[SFT-Trainable] configured_sft_layers={trainable_sft_layer_ids}")
     print(f"✅ PixArt trainable configured(single-stage): before={total_trainable_before}, after={total_trainable_after}")
 
 
@@ -2185,9 +2170,6 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                     drop_cond = torch.zeros(latents.shape[0], device=DEVICE, dtype=torch.long)
                     model_in = latents.to(COMPUTE_DTYPE)
                     cond_zero = mask_adapter_cond(cond, torch.zeros((latents.shape[0],), device=DEVICE))
-                    lr_01_for_semantics = ((batch["lr"].to(DEVICE, dtype=COMPUTE_DTYPE)) + 1.0) * 0.5
-                    sem_tokens = sem_adapter(lr_01_for_semantics)
-                    sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                     y_cond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_cond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     if USE_ADAPTIVE_TEXT_PROMPT and ADAPTIVE_PROMPT_CACHE_ROOT:
@@ -2208,22 +2190,22 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                         y_mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
                     y_uncond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_uncond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
-                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond_zero, semantic_tokens=None, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
-                    out_cond = pixart(x=model_in, timestep=t_b, y=y_cond, aug_level=aug_level, mask=y_mask_cond, data_info=data_info, adapter_cond=cond, semantic_tokens=sem_tokens, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
-                    out_text_null = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond, semantic_tokens=sem_tokens, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
+                    out_uncond = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
+                    out_cond = pixart(x=model_in, timestep=t_b, y=y_cond, aug_level=aug_level, mask=y_mask_cond, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
+                    out_text_null = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond, force_drop_ids=drop_cond, sft_strength=get_sft_strength(epoch + 1))
                     if out_uncond.shape[1] != 4 or out_cond.shape[1] != 4:
                         raise RuntimeError(f"Expected 4-channel CFG outputs, got uncond={out_uncond.shape[1]}, cond={out_cond.shape[1]}")
                     cond_deltas.append(float((out_cond - out_uncond).detach().abs().mean().item()))
                     text_cond_deltas.append(float((out_cond - out_text_null).detach().abs().mean().item()))
                     adapter_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
                     cond_map_stds.append(float(cond["cond_map"].detach().float().std().item()))
-                    sem_tok_stds.append(float(sem_tokens.detach().float().std().item()))
-                    sem_pre_stds.append(float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)))
-                    sem_post_stds.append(float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0)))
-                    sem_out_scales.append(float(sem_adapter_stats.get("sem_out_scale", 1.0)))
-                    sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
-                    sem_out_stds.append(float(sem_stats.get("semantic_out_std", 0.0)))
-                    sem_alphas.append(float(sem_stats.get("semantic_alpha_value", 0.0)))
+                    sem_tok_stds.append(float(cond["cond_tokens"].detach().float().std().item()))
+                    sem_pre_stds.append(0.0)
+                    sem_post_stds.append(0.0)
+                    sem_out_scales.append(0.0)
+                    sem_stats = getattr(pixart, "_last_image_cond_stats", {}) or {}
+                    sem_out_stds.append(float(sem_stats.get("lr_cross_img_delta_std", 0.0)))
+                    sem_alphas.append(float(sem_stats.get("avg_image_alpha", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                     tasr_gate_means.append(float(sft_stats.get("tasr_gate_mean", 0.0)))
@@ -2592,6 +2574,15 @@ def main():
                 t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
+            if "cond_map" not in cond:
+                raise KeyError("adapter output missing key 'cond_map'")
+            if "cond_tokens" not in cond:
+                raise KeyError("adapter output missing key 'cond_tokens'")
+            expected_tokens = (zt_in.shape[-2] // pixart.patch_size) * (zt_in.shape[-1] // pixart.patch_size)
+            if cond["cond_tokens"].shape[1] != expected_tokens:
+                raise RuntimeError(
+                    f"Adapter cond_tokens length mismatch: got {cond['cond_tokens'].shape[1]}, expected {expected_tokens}"
+                )
             cond_in = cond
             cond_drop_prob = float(COND_DROP_PROB)
             if USE_ADAPTER_CFDROPOUT and cond_drop_prob > 0:
@@ -2599,10 +2590,6 @@ def main():
                 cond_in = mask_adapter_cond(cond, keep)
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                # semantic adapter is the only late semantic/detail guidance
-                lr_01_for_semantics = (lr.to(COMPUTE_DTYPE) + 1.0) * 0.5
-                sem_tokens = sem_adapter(lr_01_for_semantics)
-                sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                 # conditional prompt source = adaptive cache (if enabled); unconditional prompt source = null prompt.
                 y_cond = y_null.repeat(zt_in.shape[0], 1, 1, 1)
                 y_mask = mask_null.repeat(zt_in.shape[0], 1, 1, 1)
@@ -2634,7 +2621,6 @@ def main():
                     mask=y_mask,
                     data_info=d_info,
                     adapter_cond=cond_in,
-                    semantic_tokens=sem_tokens,
                     sft_strength=sft_strength,
                 )
                 kwargs["force_drop_ids"] = drop_cond
@@ -2643,20 +2629,17 @@ def main():
                 if out.shape[1] != 4:
                     raise RuntimeError(f"Expected 4-channel model output, got {out.shape[1]} channels")
                 model_pred = out.float()
-                sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
+                image_cond_stats = getattr(pixart, "_last_image_cond_stats", {}) or {}
                 tala_ratio_mean = float(tala_ratio.detach().float().mean().item())
                 tala_ratio_max = float(tala_ratio.detach().float().max().item())
                 tala_active_frac = float((tala_ratio.detach().float() > 0).float().mean().item())
                 guard_stats = {
-                    "sem_tok_std": float(sem_tokens.detach().float().std().item()),
-                    "sem_pre_std": float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0)),
-                    "sem_post_std": float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0)),
-                    "sem_out_scale": float(sem_adapter_stats.get("sem_out_scale", 1.0)),
-                    "semantic_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
-                    "semantic_alpha_value": float(sem_stats.get("semantic_alpha_value", 0.0)),
-                    "hpa_text_ctx_std": float(sem_stats.get("hpa_text_ctx_std", 0.0)),
-                    "hpa_img_delta_std": float(sem_stats.get("hpa_img_delta_std", 0.0)),
-                    "semantic_block_ids_active": str(list(sem_stats.get("semantic_block_ids_active", []))),
+                    "lr_cond_token_std": float(cond_in["cond_tokens"].detach().float().std().item()),
+                    "lr_cross_text_ctx_std": float(image_cond_stats.get("lr_cross_text_ctx_std", 0.0)),
+                    "lr_cross_img_delta_std": float(image_cond_stats.get("lr_cross_img_delta_std", 0.0)),
+                    "local_entry_gate": float((getattr(pixart, "_last_sft_stats", {}) or {}).get("local_entry_gate", 0.0)),
+                    "avg_image_alpha": float(image_cond_stats.get("avg_image_alpha", 0.0)),
+                    "late_sft_active_start": int((getattr(pixart, "_last_sft_stats", {}) or {}).get("late_sft_active_start", -1)),
                     "ad_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "cond_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "sft_strength": float(sft_strength),
@@ -2674,7 +2657,7 @@ def main():
                     "tala_t_max": int(tala_stats.get("tala_t_max", 0)),
                     "tala_effective_eps_std": float(tala_stats.get("tala_effective_eps_std", 0.0)),
                 }
-                assert_finite_tensor("sem_tokens", sem_tokens, guard_stats)
+                assert_finite_tensor("cond_tokens", cond_in["cond_tokens"], guard_stats)
                 assert_finite_tensor("cond_map", cond_in["cond_map"], guard_stats)
                 assert_finite_tensor("model_pred", model_pred, guard_stats)
                 run_guard_forward = ((i % GUARD_FORWARD_EVERY) == 0) or ((step % GUARD_FORWARD_EVERY) == 0)
@@ -2692,7 +2675,6 @@ def main():
                             mask=y_mask_uncond_guard,
                             data_info=d_info,
                             adapter_cond=cond_zero_guard,
-                            semantic_tokens=None,
                             force_drop_ids=drop_uncond_guard,
                             sft_strength=sft_strength,
                         ).float()
@@ -2704,7 +2686,6 @@ def main():
                             mask=y_mask_uncond_guard,
                             data_info=d_info,
                             adapter_cond=cond_in,
-                            semantic_tokens=sem_tokens.detach(),
                             force_drop_ids=drop_cond,
                             sft_strength=sft_strength,
                         ).float()
@@ -2824,24 +2805,15 @@ def main():
 
             if i % 10 == 0:
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
-                tasr_gate_mean = float(sft_stats.get("tasr_gate_mean", 0.0))
-                tasr_gate_min = float(sft_stats.get("tasr_gate_min", 0.0))
-                tasr_gate_max = float(sft_stats.get("tasr_gate_max", 0.0))
                 sft_delta_std = float(sft_stats.get("sft_delta_std", 0.0))
-                alpha_mean_sft = float(sft_stats.get("alpha_mean", 0.0))
-                alpha_min = float(sft_stats.get("alpha_min", 0.0))
-                alpha_max = float(sft_stats.get("alpha_max", 0.0))
                 sft_strength_logged = float(sft_stats.get("sft_strength", sft_strength))
-                sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
-                sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
-                sem_tok_std = float(sem_tokens.detach().float().std().item())
-                sem_pre_std = float(sem_adapter_stats.get("sem_tokens_preproj_std", 0.0))
-                sem_post_std = float(sem_adapter_stats.get("sem_tokens_postproj_std", 0.0))
-                sem_out_scale = float(sem_adapter_stats.get("sem_out_scale", 1.0))
-                sem_out_std = float(sem_stats.get("semantic_out_std", 0.0))
-                sem_alpha = float(sem_stats.get("semantic_alpha_value", 0.0))
-                hpa_text_ctx_std = float(sem_stats.get("hpa_text_ctx_std", 0.0))
-                hpa_img_delta_std = float(sem_stats.get("hpa_img_delta_std", 0.0))
+                image_stats = getattr(pixart, "_last_image_cond_stats", {}) or {}
+                lr_cond_token_std = float(cond_in["cond_tokens"].detach().float().std().item())
+                lr_cross_text_ctx_std = float(image_stats.get("lr_cross_text_ctx_std", 0.0))
+                lr_cross_img_delta_std = float(image_stats.get("lr_cross_img_delta_std", 0.0))
+                avg_image_alpha = float(image_stats.get("avg_image_alpha", 0.0))
+                local_entry_gate = float(sft_stats.get("local_entry_gate", 0.0))
+                late_sft_active_start = int(sft_stats.get("late_sft_active_start", -1))
                 adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_delta = float(cond_delta_curr)
@@ -2871,17 +2843,13 @@ def main():
                     'late_af': f"{late_lpips_active_frac:.3f}",
                     'sft_s': f"{sft_strength_logged:.3f}",
                     'proxy_psnr': f"{last_val_psnr:.2f}",
-                    'tasr_gate': f"{tasr_gate_mean:.3f}[{tasr_gate_min:.3f},{tasr_gate_max:.3f}]",
                     'sft_dstd': f"{sft_delta_std:.3f}",
-                    'sft_a': f"{alpha_mean_sft:.3f}[{alpha_min:.3f},{alpha_max:.3f}]",
-                    'sem_tok_std': f"{sem_tok_std:.4f}",
-                    'sem_pre_std': f"{sem_pre_std:.4f}",
-                    'sem_post_std': f"{sem_post_std:.4f}",
-                    'sem_out_scale': f"{sem_out_scale:.4f}",
-                    'sem_out_std': f"{sem_out_std:.4f}",
-                    'sem_alpha': f"{sem_alpha:.4f}",
-                    'hpa_tctx': f"{hpa_text_ctx_std:.4f}",
-                    'hpa_idelta': f"{hpa_img_delta_std:.4f}",
+                    'lr_tok_std': f"{lr_cond_token_std:.4f}",
+                    'lr_tctx': f"{lr_cross_text_ctx_std:.4f}",
+                    'lr_idelta': f"{lr_cross_img_delta_std:.4f}",
+                    'img_alpha': f"{avg_image_alpha:.4f}",
+                    'entry_gate': f"{local_entry_gate:.4f}",
+                    'late_sft': f"{late_sft_active_start}",
                     'cond_delta': f"{cond_delta:.5f}",
                     'text_cond_delta': f"{text_cond_delta:.5f}",
                     'guard_fwd': f"{int(run_guard_forward)}",
@@ -2911,22 +2879,13 @@ def main():
                     "late_lpips_active_frac": float(late_lpips_active_frac),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
                     "inject_reg_weight": float(inject_reg_w),
-                    "tasr_gate_mean": tasr_gate_mean,
-                    "alpha_mean": alpha_mean_sft,
-                    "alpha_min": alpha_min,
-                    "alpha_max": alpha_max,
-                    "sem_tok_std": sem_tok_std,
-                    "sem_pre_std": sem_pre_std,
-                    "sem_post_std": sem_post_std,
-                    "sem_out_scale": sem_out_scale,
-                    "sem_out_std": sem_out_std,
-                    "sem_alpha": sem_alpha,
-                    "semantic_alpha_value": sem_alpha,
-                    "tasr_gate_min": tasr_gate_min,
-                    "tasr_gate_max": tasr_gate_max,
+                    "lr_cond_token_std": lr_cond_token_std,
+                    "lr_cross_text_ctx_std": lr_cross_text_ctx_std,
+                    "lr_cross_img_delta_std": lr_cross_img_delta_std,
+                    "local_entry_gate": local_entry_gate,
+                    "avg_image_alpha": avg_image_alpha,
+                    "late_sft_active_start": late_sft_active_start,
                     "sft_delta_std": sft_delta_std,
-                    "hpa_text_ctx_std": hpa_text_ctx_std,
-                    "hpa_img_delta_std": hpa_img_delta_std,
                     "cond_delta": cond_delta,
                     "text_cond_delta": text_cond_delta,
                     "run_guard_forward": int(run_guard_forward),

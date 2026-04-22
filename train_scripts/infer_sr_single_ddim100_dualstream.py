@@ -254,14 +254,12 @@ def run(args):
         run_timesteps = scheduler.timesteps
 
     adapter_in = build_adapter_struct_input(lr_small).to(device=device, dtype=torch.float32)
-    lr_01_for_sem = (lr.to(compute_dtype) + 1.0) * 0.5
     aug_level = torch.zeros((latents.shape[0],), device=device, dtype=compute_dtype)
 
     for t in run_timesteps:
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         cond = adapter(adapter_in, t_embed=t_embed.float())
-        sem_tokens = sem_adapter(lr_01_for_sem)
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
             drop_uncond = torch.ones(latents.shape[0], device=device, dtype=torch.long)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
@@ -279,7 +277,6 @@ def run(args):
                     mask=mask_cond,
                     data_info=data_info,
                     adapter_cond=cond,
-                    semantic_tokens=sem_tokens,
                     force_drop_ids=drop_cond,
                     sft_strength=args.sft_strength,
                 )
@@ -293,7 +290,6 @@ def run(args):
                     mask=mask_uncond,
                     data_info=data_info,
                     adapter_cond=cond_zero,
-                    semantic_tokens=None,
                     force_drop_ids=drop_uncond,
                     sft_strength=args.sft_strength,
                 )
@@ -305,7 +301,6 @@ def run(args):
                     mask=mask_cond,
                     data_info=data_info,
                     adapter_cond=cond,
-                    semantic_tokens=sem_tokens,
                     force_drop_ids=drop_cond,
                     sft_strength=args.sft_strength,
                 )

@@ -715,10 +715,6 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
-            # LR is early structural condition only.
-            # semantic/text are late-detail semantic conditions.
-            # no late LR detail control.
-            sem_tokens = sem_adapter((lr.to(compute_dtype) + 1.0) * 0.5)
             # conditional prompt source = adaptive cache (if enabled); unconditional prompt source = null prompt.
             y_cond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_cond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
@@ -744,7 +740,6 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
                     mask=mask_cond,
                     data_info=data_info,
                     adapter_cond=cond,
-                    semantic_tokens=sem_tokens,
                     force_drop_ids=drop_cond,
                     sft_strength=args.sft_strength,
                 )
@@ -758,7 +753,6 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
                     mask=mask_uncond,
                     data_info=data_info,
                     adapter_cond=cond_zero,
-                    semantic_tokens=None,
                     force_drop_ids=drop_uncond,
                     sft_strength=args.sft_strength,
                 )
@@ -770,7 +764,6 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
                     mask=mask_cond,
                     data_info=data_info,
                     adapter_cond=cond,
-                    semantic_tokens=sem_tokens,
                     force_drop_ids=drop_cond,
                     sft_strength=args.sft_strength,
                 )
@@ -782,7 +775,6 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
                     mask=mask_uncond,
                     data_info=data_info,
                     adapter_cond=cond,
-                    semantic_tokens=sem_tokens,
                     force_drop_ids=drop_cond,
                     sft_strength=args.sft_strength,
                 )
@@ -791,13 +783,15 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
         latents = scheduler.step(out.float(), t, latents.float()).prev_sample
 
     pred = vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1)
-    sem_stats = getattr(pixart, "_last_semantic_stats", {}) or {}
-    sem_adapter_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
+    image_stats = getattr(pixart, "_last_image_cond_stats", {}) or {}
+    sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
     debug_stats = {
         "cond_map_std": float(cond["cond_map"].detach().float().std().item()),
-        "sem_tok_std": float(sem_tokens.detach().float().std().item()),
-        "sem_out_std": float(sem_stats.get("semantic_out_std", 0.0)),
-        "sem_out_scale": float(sem_adapter_stats.get("sem_out_scale", 1.0)),
+        "lr_cond_token_std": float(cond["cond_tokens"].detach().float().std().item()),
+        "lr_cross_text_ctx_std": float(image_stats.get("lr_cross_text_ctx_std", 0.0)),
+        "lr_cross_img_delta_std": float(image_stats.get("lr_cross_img_delta_std", 0.0)),
+        "avg_image_alpha": float(image_stats.get("avg_image_alpha", 0.0)),
+        "local_entry_gate": float(sft_stats.get("local_entry_gate", 0.0)),
         "text_cond_delta": float(sum(text_cond_delta_vals) / max(1, len(text_cond_delta_vals))),
         "prompt_cache_hit_rate": float(prompt_cache_hit_rate),
         "avg_prompt_token_count": float(avg_prompt_token_count),
