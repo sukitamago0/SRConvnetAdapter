@@ -331,6 +331,8 @@ def evaluate(args):
             t_b = torch.tensor([t], device=device).expand(latents.shape[0])
             with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
                 drop_cond = torch.ones(latents.shape[0], device=device)
+                if "cond_map" not in cond or "cond_tokens" not in cond:
+                    raise KeyError("adapter output must contain both 'cond_map' and 'cond_tokens'")
                 model_in = torch.cat([latents.to(compute_dtype), z_lr.to(compute_dtype)], dim=1)
                 out = pixart(
                     x=model_in,

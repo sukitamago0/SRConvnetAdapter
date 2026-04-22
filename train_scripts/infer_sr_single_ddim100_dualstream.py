@@ -17,7 +17,6 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
-from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 
 
 def randn_like_with_generator(tensor, generator):
@@ -178,11 +177,6 @@ def run(args):
         in_channels=3,
         hidden_size=1152,
     ).to(device).float()
-    sem_adapter = CLIPSemanticAdapter(
-        encoder_name_or_path=args.semantic_encoder_name_or_path,
-        hidden_size=1152,
-        num_prompt_tokens=16,
-    ).to(device).eval()
 
     saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
 
@@ -200,9 +194,6 @@ def run(args):
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
-    sem_adapter_sd = ckpt.get("sem_adapter", ckpt.get("sem_prompt", None))
-    if isinstance(sem_adapter_sd, dict):
-        sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -216,7 +207,6 @@ def run(args):
 
     pixart.eval()
     adapter.eval()
-    sem_adapter.eval()
 
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
@@ -260,6 +250,8 @@ def run(args):
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         cond = adapter(adapter_in, t_embed=t_embed.float())
+        if "cond_map" not in cond or "cond_tokens" not in cond:
+            raise KeyError("adapter output must contain both 'cond_map' and 'cond_tokens'")
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
             drop_uncond = torch.ones(latents.shape[0], device=device, dtype=torch.long)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)

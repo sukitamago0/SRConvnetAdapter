@@ -28,7 +28,6 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
-from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 
 USE_ADAPTIVE_TEXT_PROMPT = True
 ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
@@ -247,21 +246,6 @@ def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context
     if len(skipped) > 0:
         print(f"[{context}] skipped examples: {skipped[:5]}")
     return missing, unexpected, skipped
-
-
-def is_allowed_sem_adapter_missing(missing, unexpected):
-    missing = set(missing)
-    unexpected = set(unexpected)
-    if len(unexpected) > 0:
-        return False
-    allowed = {"out_scale"}
-    for k in list(missing):
-        if k in allowed:
-            continue
-        if k.startswith("image_encoder."):
-            continue
-        return False
-    return True
 
 
 def infer_lora_rank_from_state_dict(state_dict: dict):
@@ -636,20 +620,7 @@ def build_model_and_assets(args, device, compute_dtype):
         hidden_size=1152,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
-    sem_adapter = CLIPSemanticAdapter(
-        encoder_name_or_path=args.semantic_encoder_name_or_path,
-        hidden_size=1152,
-        num_prompt_tokens=16,
-    ).to(device).eval()
-    sem_adapter_sd = ckpt.get("sem_adapter", ckpt.get("sem_prompt", None))
-    if isinstance(sem_adapter_sd, dict):
-        missing, unexpected = sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
-        if not is_allowed_sem_adapter_missing(missing, unexpected):
-            raise RuntimeError(f"Strict sem_adapter eval load failed: missing={len(missing)} unexpected={len(unexpected)}")
-        if len(missing) > 0:
-            print("ℹ️ sem_adapter trainable-only checkpoint accepted (missing frozen image_encoder and/or out_scale).")
-    else:
-        raise RuntimeError("Checkpoint missing sem_adapter state for strict eval.")
+    sem_adapter = None
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -672,7 +643,6 @@ def build_model_and_assets(args, device, compute_dtype):
 
     pixart.eval()
     adapter.eval()
-    sem_adapter.eval()
     return pixart, adapter, sem_adapter, vae, null_pack, scheduler
 
 
@@ -715,6 +685,8 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
+            if "cond_map" not in cond or "cond_tokens" not in cond:
+                raise KeyError("adapter output must contain both 'cond_map' and 'cond_tokens'")
             # conditional prompt source = adaptive cache (if enabled); unconditional prompt source = null prompt.
             y_cond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_cond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
