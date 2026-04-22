@@ -67,21 +67,72 @@ class PixArtMSBlock(nn.Module):
         self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
+        self.semantic_norm = None
+        self.semantic_cross_attn = None
+        self.semantic_out_proj = None
+        self.semantic_alpha = None
+        self.has_semantic_adapter = False
+        self._last_semantic_stats = None
 
-    def forward(self, x, y, t, mask=None, HW=None, **kwargs):
+    def enable_semantic_adapter(self):
+        self.has_semantic_adapter = True
+        self.semantic_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+        self.semantic_cross_attn = MultiHeadCrossAttention(self.hidden_size, self.attn.num_heads)
+        self.semantic_out_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        nn.init.zeros_(self.semantic_out_proj.weight)
+        nn.init.zeros_(self.semantic_out_proj.bias)
+        self.semantic_alpha = nn.Parameter(torch.tensor(1.0))
+
+    def forward(
+        self,
+        x,
+        y,
+        t,
+        mask=None,
+        HW=None,
+        semantic_tokens=None,
+        semantic_gate=None,
+        **kwargs,
+    ):
         B, N, C = x.shape
         adaln_shift = kwargs.get("adaln_shift", None)
         adaln_scale = kwargs.get("adaln_scale", None)
         adaln_alpha = kwargs.get("adaln_alpha", None)
+        semantic_block_id = kwargs.get("semantic_block_id", None)
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
         h = self.norm1(x)
         if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
             h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
-        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
-        x = x + self.cross_attn(x, y, mask)
-        x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
+        x_ca = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
+        text_out = self.cross_attn(x_ca, y, mask)
 
+        if self.has_semantic_adapter and semantic_tokens is not None:
+            sem = semantic_tokens.to(dtype=x.dtype)
+            gate = 1.0 if semantic_gate is None else semantic_gate
+            sem_in = self.semantic_norm(x_ca)
+            sem_attn_out = self.semantic_cross_attn(sem_in, sem, None)
+            sem_out = self.semantic_out_proj(sem_attn_out)
+            nonfinite_now = (
+                (not torch.isfinite(sem_in).all())
+                or (not torch.isfinite(sem_attn_out).all())
+                or (not torch.isfinite(sem_out).all())
+            )
+            x = x_ca + text_out + self.drop_path((self.semantic_alpha.to(x.dtype) * gate) * sem_out)
+            self._last_semantic_stats = {
+                "semantic_out_std": float(sem_out.detach().float().std().item()),
+                "semantic_alpha": float(self.semantic_alpha.detach().float().item()),
+                "semantic_gate_mean": float(torch.as_tensor(gate, dtype=x.dtype, device=x.device).mean().item()),
+                "semantic_q_std": float(sem_in.detach().float().std().item()),
+                "semantic_attn_out_std": float(sem_attn_out.detach().float().std().item()),
+                "semantic_proj_out_std": float(sem_out.detach().float().std().item()),
+                "semantic_block_id": int(semantic_block_id) if semantic_block_id is not None else -1,
+                "semantic_nonfinite": bool(nonfinite_now),
+            }
+        else:
+            x = x_ca + text_out
+            self._last_semantic_stats = None
+        x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
         return x
 
 
