@@ -15,7 +15,7 @@ from timm.models.vision_transformer import Mlp
 
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint, to_2tuple
-from diffusion.model.nets.PixArt_blocks import t2i_modulate, CaptionEmbedder, AttentionKVCompress, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, SizeEmbedder
+from diffusion.model.nets.PixArt_blocks import t2i_modulate, CaptionEmbedder, AttentionKVCompress, DecoupledImageTextCrossAttention, T2IFinalLayer, TimestepEmbedder, SizeEmbedder
 from diffusion.model.nets.PixArt import PixArt, get_2d_sincos_pos_embed
 
 
@@ -60,28 +60,57 @@ class PixArtMSBlock(nn.Module):
             hidden_size, num_heads=num_heads, qkv_bias=True, sampling=sampling, sr_ratio=sr_ratio,
             qk_norm=qk_norm, **block_kwargs
         )
-        self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.cross_attn = DecoupledImageTextCrossAttention(hidden_size, num_heads, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # to be compatible with lower version pytorch
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
+        self.image_alpha = nn.Parameter(torch.tensor(-4.0))
+        self._last_image_stats = None
 
-    def forward(self, x, y, t, mask=None, HW=None, **kwargs):
+    def forward(
+        self,
+        x,
+        y,
+        t,
+        mask=None,
+        HW=None,
+        image_cond=None,
+        image_gate=None,
+        **kwargs,
+    ):
         B, N, C = x.shape
         adaln_shift = kwargs.get("adaln_shift", None)
         adaln_scale = kwargs.get("adaln_scale", None)
         adaln_alpha = kwargs.get("adaln_alpha", None)
-
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
         h = self.norm1(x)
         if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
             h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
-        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
-        x = x + self.cross_attn(x, y, mask)
+        x_ca = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
+        img_gate = None
+        if image_cond is not None:
+            if image_gate is None:
+                img_gate = torch.sigmoid(self.image_alpha).to(x_ca.dtype)
+            else:
+                img_gate = image_gate.to(x_ca.dtype)
+        cross_out, cross_stats = self.cross_attn(
+            x_ca,
+            text_cond=y,
+            image_cond=image_cond,
+            text_mask=mask,
+            image_gate=img_gate,
+        )
+        x = x_ca + self.drop_path(cross_out)
+        self._last_image_stats = {
+            "image_alpha_value": float(torch.sigmoid(self.image_alpha.detach()).item()),
+            "cross_out_std": float(cross_out.detach().float().std().item()),
+            "text_ctx_std": float(cross_stats.get("text_ctx_std", 0.0)),
+            "img_delta_std": float(cross_stats.get("img_delta_std", 0.0)),
+        }
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
-
         return x
 
 
