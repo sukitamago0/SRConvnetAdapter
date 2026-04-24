@@ -70,7 +70,6 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
 )
 FP32_SAVE_KEY_FRAGMENTS = ACTIVE_PIXART_KEY_FRAGMENTS
 FINAL_LAYER_KEYWORD = "final_layer"
-TRAIN_ADAPTER_IN_STAGE_A = True
 
 def get_required_active_key_fragments_for_model(model: nn.Module):
     trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
@@ -252,7 +251,6 @@ RESIZE_INTERP_MODES = [transforms.InterpolationMode.NEAREST, transforms.Interpol
 # VNext training controls (script-versioned, no ENV override)
 USE_EMA = False
 EMA_DECAY = 0.999
-EMA_TRACK_SET = "small"  # small | all
 EMA_VALIDATE = False  # S2D main experiment: disable EMA/EMA-validate for clean comparison
 EMA_VALIDATE_EVERY = 5  # run EMA validation every N validation triggers
 
@@ -838,30 +836,17 @@ class ParamEMA:
         self.backup = {}
 
 
-def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, mode: str = "small"):
-    names = (
-        "final_layer",
-        "sft_cond_reduce",
-        "sft_layers",
-        "gcsa2",
-        "gcsa3",
-        "gcsa4",
-        "lora_A",
-        "lora_B",
-        "x_embedder",
-        "aug_embedder",
-    )
+def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module):
     out = []
     for n, p in adapter.named_parameters():
         if p.requires_grad:
             out.append((f"adapter.{n}", p))
     for n, p in pixart.named_parameters():
-        if not p.requires_grad:
-            continue
-        if mode == "all":
+        if p.requires_grad:
             out.append((f"pixart.{n}", p))
-        elif any(k in n for k in names):
-            out.append((f"pixart.{n}", p))
+    for n, p in sem_adapter.named_parameters():
+        if p.requires_grad:
+            out.append((f"sem_adapter.{n}", p))
     return out
 
 
@@ -1502,10 +1487,7 @@ def is_allowed_sem_adapter_missing(missing, unexpected):
     unexpected = set(unexpected)
     if len(unexpected) > 0:
         return False
-    allowed = {"out_scale"}
     for k in list(missing):
-        if k in allowed:
-            continue
         if k.startswith("image_encoder."):
             continue
         return False
@@ -1534,7 +1516,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
             continue
         structure_params.append(p)
 
-    sem_adapter_params = [p for n, p in sem_adapter.named_parameters() if p.requires_grad and (("resampler" in n) or ("proj_norm" in n) or ("proj." in n) or ("out_scale" in n))]
+    sem_adapter_params = [p for _, p in sem_adapter.named_parameters() if p.requires_grad]
 
     optim_groups = []
     if len(adapter_params) + len(structure_params) > 0:
@@ -1545,17 +1527,21 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
 
     if len(optim_groups) == 0:
-        raise RuntimeError("No optimizer groups built; check stage trainable settings.")
+        raise RuntimeError("No optimizer groups built; check trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
     params_to_clip = adapter_params + structure_params + semantic_hpa_params + sem_adapter_params + lora_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped = structure_params + lora_params + semantic_hpa_params
-    if len({id(p) for p in grouped}) != len(grouped):
+    grouped_pixart = structure_params + lora_params + semantic_hpa_params
+    if len({id(p) for p in grouped_pixart}) != len(grouped_pixart):
         raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
-    if {id(p) for p in grouped} != {id(p) for p in pixart_trainable}:
+    if {id(p) for p in grouped_pixart} != {id(p) for p in pixart_trainable}:
         raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
+
+    sem_trainable = [p for p in sem_adapter.parameters() if p.requires_grad]
+    if {id(p) for p in sem_adapter_params} != {id(p) for p in sem_trainable}:
+        raise RuntimeError("Optimizer grouping does not exactly cover sem_adapter trainable params.")
 
     group_counts = {
         "structure_group_pixart": len(structure_params),
@@ -2011,7 +1997,9 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
         return False
     print(f"📦 Bootstrapping model weights from {ckpt_path} (weights-only, no optimizer)")
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    saved_trainable = ckpt.get("pixart_trainable", ckpt.get("pixart_keep", {}))
+    saved_trainable = ckpt.get("pixart_trainable", None)
+    if not isinstance(saved_trainable, dict) or len(saved_trainable) == 0:
+        raise RuntimeError("Bootstrap checkpoint missing required key: pixart_trainable")
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="init")
     adapter_sd = ckpt.get("adapter", None)
     if isinstance(adapter_sd, dict):
@@ -2034,7 +2022,9 @@ def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_
             f"Checkpoint role '{ckpt_role}' is not resume-capable. "
             "Use last.pth or best.pth for resume."
         )
-    saved_trainable = ckpt.get("pixart_trainable", ckpt.get("pixart_keep", {}))
+    saved_trainable = ckpt.get("pixart_trainable", None)
+    if not isinstance(saved_trainable, dict) or len(saved_trainable) == 0:
+        raise RuntimeError("Checkpoint missing required key: pixart_trainable")
     required_frags = get_required_active_key_fragments_for_model(pixart)
     missing_required = [frag for frag in required_frags if not any(frag in k for k in saved_trainable.keys())]
     if missing_required:
@@ -2045,7 +2035,7 @@ def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_
         adapter.load_state_dict(adapter_sd, strict=True)
     except RuntimeError as e:
         raise RuntimeError(f"Adapter strict load failed during resume: {e}") from e
-    sem_adapter_sd = ckpt.get("sem_adapter", ckpt.get("sem_prompt", None))
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
     if isinstance(sem_adapter_sd, dict):
         missing, unexpected = sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
         if len(missing) > 0 or len(unexpected) > 0:
@@ -2434,9 +2424,9 @@ def main():
     ema_named_params = []
     if USE_EMA:
         ema = ParamEMA(decay=EMA_DECAY)
-        ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
+        ema_named_params = collect_ema_named_params(pixart, adapter, sem_adapter)
         ema.register(ema_named_params)
-        print(f"✅ EMA tracking enabled: decay={EMA_DECAY}, track_set={EMA_TRACK_SET}, tensors={len(ema_named_params)}")
+        print(f"✅ EMA tracking enabled: decay={EMA_DECAY}, tensors={len(ema_named_params)}")
 
     print(f"📏 Validation steps: {VAL_STEPS_LIST}")
     print(
@@ -2489,7 +2479,7 @@ def main():
     for p in adapter.parameters():
         p.requires_grad_(True)
     for n, p in sem_adapter.named_parameters():
-        if ("resampler" in n) or ("proj_norm" in n) or ("proj." in n):
+        if ("resampler" in n) or ("proj_norm" in n) or ("proj." in n) or (n == "out_scale"):
             p.requires_grad_(True)
         else:
             p.requires_grad_(False)
@@ -2506,7 +2496,7 @@ def main():
             pixart, adapter, sem_adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params
         )
     if ema is not None:
-        ema_named_params = collect_ema_named_params(pixart, adapter, mode=EMA_TRACK_SET)
+        ema_named_params = collect_ema_named_params(pixart, adapter, sem_adapter)
         ema.register(ema_named_params)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")

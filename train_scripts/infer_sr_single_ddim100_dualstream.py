@@ -178,7 +178,7 @@ def run(args):
         hidden_size=1152,
     ).to(device).float()
 
-    saved_trainable = ckpt.get("pixart_keep", ckpt.get("pixart_trainable", {}))
+    saved_trainable = ckpt.get("pixart_trainable", {})
 
     has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
     if "lora_rank" in ckpt:

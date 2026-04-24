@@ -538,9 +538,9 @@ def build_model_and_assets(args, device, compute_dtype):
     if "adapter" not in ckpt:
         raise KeyError("Checkpoint must contain key: adapter")
 
-    pixart_state = ckpt.get("pixart_trainable", ckpt.get("pixart_keep", None))
+    pixart_state = ckpt.get("pixart_trainable", None)
     if pixart_state is None:
-        raise KeyError("Checkpoint must contain pixart_keep or pixart_trainable")
+        raise KeyError("Checkpoint must contain pixart_trainable")
 
     layer_cfg = ckpt.get("layer_config", {}) if isinstance(ckpt, dict) else {}
     if not isinstance(layer_cfg, dict):
