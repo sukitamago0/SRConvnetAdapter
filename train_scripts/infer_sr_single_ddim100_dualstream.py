@@ -151,19 +151,16 @@ def run(args):
     compute_dtype = torch.bfloat16 if (device == "cuda") else torch.float32
 
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
-    inj_cfg = ckpt.get("injection_config", {}) if isinstance(ckpt, dict) else {}
-    hard_layers = list(inj_cfg.get("hard_layers", [2, 4, 6, 8, 10, 12]))
-    detail_layers = list(inj_cfg.get("detail_layers", [14, 16, 18, 20, 22, 24]))
-    injection_layer_to_level = dict(inj_cfg.get("injection_layer_to_level", {}))
-    ref_token_hw = int(inj_cfg.get("ref_token_hw", 32))
+    layer_cfg = ckpt.get("layer_config", {}) if isinstance(ckpt, dict) else {}
+    anchor_layers = list(layer_cfg.get("anchor_layers", [2, 4, 6, 8]))
+    semantic_layers = list(layer_cfg.get("semantic_layers", [18, 22, 24, 26]))
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
-        hard_injection_layers=hard_layers,
-        detail_injection_layers=detail_layers,
-        injection_layer_to_level=injection_layer_to_level,
+        anchor_layers=anchor_layers,
+        semantic_layers=semantic_layers,
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -202,7 +199,7 @@ def run(args):
     vae.enable_slicing()
 
     null_pack = torch.load(args.null_t5_embed_path, map_location="cpu")
-    y = null_pack["y"].to(device)
+    hard_prompt_pack = torch.load(args.hard_prompt_embed_path, map_location="cpu")
     data_info = {
         "img_hw": torch.tensor([[512.0, 512.0]], device=device),
         "aspect_ratio": torch.tensor([1.0], device=device),
@@ -253,17 +250,25 @@ def run(args):
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         cond = adapter(adapter_in, t_embed=t_embed.float())
+        if "ip_tokens" not in cond and "cond_tokens" not in cond:
+            raise KeyError("adapter output missing ip_tokens/cond_tokens")
+        if "local_entry_tokens" not in cond and "cond_map" not in cond:
+            raise KeyError("adapter output missing local_entry_tokens/cond_map")
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
-            drop_uncond = torch.ones(latents.shape[0], device=device)
-            drop_cond = torch.ones(latents.shape[0], device=device)
+            drop_uncond = torch.ones(latents.shape[0], device=device, dtype=torch.long)
+            drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
             model_in = latents.to(compute_dtype)
+            y_cond = hard_prompt_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            mask_cond = hard_prompt_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            y_uncond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
+            mask_uncond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             if args.cfg_scale == 1.0:
                 out = pixart(
                     x=model_in,
                     timestep=t_b,
-                    y=y,
+                    y=y_cond,
                     aug_level=aug_level,
-                    mask=None,
+                    mask=mask_cond,
                     data_info=data_info,
                     adapter_cond=cond,
                     force_drop_ids=drop_cond,
@@ -274,9 +279,9 @@ def run(args):
                 out_uncond = pixart(
                     x=model_in,
                     timestep=t_b,
-                    y=y,
+                    y=y_uncond,
                     aug_level=aug_level,
-                    mask=None,
+                    mask=mask_uncond,
                     data_info=data_info,
                     adapter_cond=cond_zero,
                     force_drop_ids=drop_uncond,
@@ -285,9 +290,9 @@ def run(args):
                 out_cond = pixart(
                     x=model_in,
                     timestep=t_b,
-                    y=y,
+                    y=y_cond,
                     aug_level=aug_level,
-                    mask=None,
+                    mask=mask_cond,
                     data_info=data_info,
                     adapter_cond=cond,
                     force_drop_ids=drop_cond,
@@ -317,6 +322,8 @@ def parse_args():
     parser.add_argument("--pixart-path", type=str, required=True)
     parser.add_argument("--vae-path", type=str, required=True)
     parser.add_argument("--null-t5-embed-path", type=str, required=True)
+    parser.add_argument("--hard-prompt-embed-path", type=str, required=True)
+    parser.add_argument("--semantic-encoder-name-or-path", type=str, default="openai/clip-vit-large-patch14")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--crop-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=3407)

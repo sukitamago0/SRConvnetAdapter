@@ -61,27 +61,53 @@ class PixArtMSBlock(nn.Module):
             qk_norm=qk_norm, **block_kwargs
         )
         self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.lr_ip_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.lr_ip_gate = nn.Parameter(torch.full((1,), -6.0))
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # to be compatible with lower version pytorch
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
+        nn.init.constant_(self.lr_ip_attn.proj.weight, 0)
+        nn.init.constant_(self.lr_ip_attn.proj.bias, 0)
+        self._last_image_stats = None
 
-    def forward(self, x, y, t, mask=None, HW=None, **kwargs):
+    def forward(
+        self,
+        x,
+        y,
+        t,
+        mask=None,
+        HW=None,
+        lr_ip_tokens=None,
+        lr_ip_scale=None,
+        **kwargs,
+    ):
         B, N, C = x.shape
         adaln_shift = kwargs.get("adaln_shift", None)
         adaln_scale = kwargs.get("adaln_scale", None)
         adaln_alpha = kwargs.get("adaln_alpha", None)
-
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
         h = self.norm1(x)
         if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
             h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
-        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
-        x = x + self.cross_attn(x, y, mask)
-        x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
+        x_ca = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
+        x = x_ca + self.drop_path(self.cross_attn(x_ca, y, mask))
 
+        lr_delta = torch.zeros_like(x)
+        gate_val = torch.sigmoid(self.lr_ip_gate).to(dtype=x.dtype)
+        if lr_ip_tokens is not None:
+            if lr_ip_scale is not None:
+                gate_val = gate_val * lr_ip_scale.to(dtype=x.dtype)
+            lr_delta = gate_val.view(1, 1, 1) * self.lr_ip_attn(x, lr_ip_tokens, None)
+            x = x + self.drop_path(lr_delta)
+        self._last_image_stats = {
+            "image_alpha_value": float(gate_val.detach().float().item()),
+            "text_ctx_std": 0.0,
+            "img_delta_std": float(lr_delta.detach().float().std().item()),
+        }
+        x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
         return x
 
 

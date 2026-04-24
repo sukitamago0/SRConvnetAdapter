@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusion.model.nets.srconvnet_blocks import SRConvNetBlock
-from diffusion.model.nets.smfanet_blocks import FMB
+from diffusion.model.nets.smfanet_blocks_official import FMB
 
 try:
     from mmcv.ops import CARAFEPack
@@ -12,6 +12,8 @@ except Exception:
 
 
 class SRConvNetLSAAdapter(nn.Module):
+    # Legacy adapter kept for backward compatibility.
+    # NOTE: build_adapter_v12() is the active mainline entry in current training/eval scripts.
     def __init__(self, hidden_size: int = 1152):
         super().__init__()
         self.hidden_size = int(hidden_size)
@@ -62,11 +64,12 @@ class SRConvNetLSAAdapter(nn.Module):
         c3 = self.proj3(f3)
         c4 = self.proj4(f4)
         cond_map = self.out_proj(torch.cat([c2, c3, c4], dim=1))
-        cond_tokens = cond_map.flatten(2).transpose(1, 2)
+        cond_tokens = cond_map.flatten(2).transpose(1, 2).contiguous()
 
         return {
             "cond_map": cond_map,
             "cond_tokens": cond_tokens,
+            "cond_tokens_hw": (cond_map.shape[-2], cond_map.shape[-1]),
         }
 
 
@@ -90,45 +93,53 @@ class SimpleGate(nn.Module):
         return x1 * x2
 
 
-class NAFBlock(nn.Module):
-    def __init__(self, channels: int, dw_expand: int = 2, ffn_expand: int = 2):
+class NAFChannelAttention(nn.Module):
+    def __init__(self, c: int):
         super().__init__()
-        dw_channel = channels * dw_expand
-        ffn_channel = channels * ffn_expand
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv2d(c, c, 1, 1, 0)
 
-        self.norm1 = LayerNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, dw_channel, kernel_size=1, stride=1, padding=0)
-        self.conv2 = nn.Conv2d(dw_channel, dw_channel, kernel_size=3, stride=1, padding=1, groups=dw_channel)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(self.pool(x))
+
+
+class NAFBlock(nn.Module):
+    def __init__(self, c, DW_Expand=2, FFN_Expand=2):
+        super().__init__()
+        self.norm1 = LayerNorm2d(c)
+        self.conv1 = nn.Conv2d(c, c * DW_Expand, 1, 1, 0)
+        self.dwconv = nn.Conv2d(c * DW_Expand, c * DW_Expand, 3, 1, 1, groups=c * DW_Expand)
         self.sg = SimpleGate()
-        self.sca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dw_channel // 2, dw_channel // 2, kernel_size=1, stride=1, padding=0),
-        )
-        self.conv3 = nn.Conv2d(dw_channel // 2, channels, kernel_size=1, stride=1, padding=0)
-        self.beta = nn.Parameter(torch.zeros((1, channels, 1, 1)))
+        self.sca = NAFChannelAttention(c * DW_Expand // 2)
+        self.conv2 = nn.Conv2d(c * DW_Expand // 2, c, 1, 1, 0)
 
-        self.norm2 = LayerNorm2d(channels)
-        self.conv4 = nn.Conv2d(channels, ffn_channel, kernel_size=1, stride=1, padding=0)
-        self.conv5 = nn.Conv2d(ffn_channel // 2, channels, kernel_size=1, stride=1, padding=0)
-        self.gamma = nn.Parameter(torch.zeros((1, channels, 1, 1)))
+        self.norm2 = LayerNorm2d(c)
+        self.conv3 = nn.Conv2d(c, c * FFN_Expand, 1, 1, 0)
+        self.sg2 = SimpleGate()
+        self.conv4 = nn.Conv2d(c * FFN_Expand // 2, c, 1, 1, 0)
+
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)))
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)))
 
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
         x = self.norm1(inp)
         x = self.conv1(x)
-        x = self.conv2(x)
+        x = self.dwconv(x)
         x = self.sg(x)
         x = x * self.sca(x)
-        x = self.conv3(x)
+        x = self.conv2(x)
         y = inp + x * self.beta
 
         x = self.norm2(y)
+        x = self.conv3(x)
+        x = self.sg2(x)
         x = self.conv4(x)
-        x = self.sg(x)
-        x = self.conv5(x)
         return y + x * self.gamma
 
 
 class SRConvNetLSAAdapterV8(nn.Module):
+    # Legacy adapter kept for backward compatibility experiments.
+    # NOTE: build_adapter_v12() is the active mainline entry in current training/eval scripts.
     def __init__(self, in_channels: int = 3, hidden_size: int = 1152, ref_token_hw: int = 32, structure_only: bool = True):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -310,7 +321,13 @@ class SRConvNetLSAAdapterV12(nn.Module):
             nn.GELU(),
             nn.Conv2d(512, 288, 3, 1, 1),
         )
-        self.to32 = nn.Sequential(
+        self.ip_token_head = nn.Sequential(
+            nn.PixelUnshuffle(2),
+            nn.Conv2d(1152, self.hidden_size, 1),
+            nn.GELU(),
+            nn.Conv2d(self.hidden_size, self.hidden_size, 1),
+        )
+        self.local_entry_head = nn.Sequential(
             nn.PixelUnshuffle(2),
             nn.Conv2d(1152, self.hidden_size, 1),
         )
@@ -321,10 +338,15 @@ class SRConvNetLSAAdapterV12(nn.Module):
             self.proj4_hi,
             self.fuse64[0],
             self.fuse64[2],
-            self.to32[1],
         ]:
             nn.init.normal_(m.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(m.bias)
+        nn.init.normal_(self.ip_token_head[1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.ip_token_head[1].bias)
+        nn.init.normal_(self.ip_token_head[3].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.ip_token_head[3].bias)
+        nn.init.normal_(self.local_entry_head[1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.local_entry_head[1].bias)
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -354,14 +376,82 @@ class SRConvNetLSAAdapterV12(nn.Module):
 
         fused_64 = torch.cat([c2_64, c3_64, c4_64], dim=1)
         fused_64 = self.fuse64(fused_64)
-        cond_map = self.to32(fused_64)
-        cond_tokens = cond_map.flatten(2).transpose(1, 2).contiguous()
+        ip_map = self.ip_token_head(fused_64)
+        local_map = self.local_entry_head(fused_64)
+
+        ip_tokens = ip_map.flatten(2).transpose(1, 2).contiguous()
+        local_tokens = local_map.flatten(2).transpose(1, 2).contiguous()
 
         return {
-            "cond_map": cond_map,
-            "cond_tokens": cond_tokens,
+            "ip_tokens": ip_tokens,
+            "local_entry_tokens": local_tokens,
+            "ip_tokens_hw": (ip_map.shape[-2], ip_map.shape[-1]),
+            "cond_tokens": ip_tokens,
+            "cond_map": local_map,
         }
 
 
 def build_adapter_v12(in_channels=3, hidden_size=1152):
     return SRConvNetLSAAdapterV12(in_channels=in_channels, hidden_size=hidden_size)
+
+
+class LRConditionAdapterV3(nn.Module):
+    def __init__(self, in_channels=3, hidden_size=1152):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.hidden_size = int(hidden_size)
+
+        self.stem = nn.Conv2d(in_channels, 64, 3, 1, 1)
+        self.enc1 = nn.Sequential(NAFBlock(64), NAFBlock(64))
+        self.down1 = nn.Conv2d(64, 128, 3, 2, 1)
+        self.enc2 = nn.Sequential(NAFBlock(128), NAFBlock(128))
+        self.down2 = nn.Conv2d(128, 256, 3, 2, 1)
+        self.enc3 = nn.Sequential(NAFBlock(256), NAFBlock(256), NAFBlock(256), NAFBlock(256))
+
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 512),
+        )
+
+        self.fpn1 = nn.Conv2d(64, 128, 1, 1, 0)
+        self.fpn2 = nn.Conv2d(128, 128, 1, 1, 0)
+        self.fpn3 = nn.Conv2d(256, 128, 1, 1, 0)
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(128 * 3, 256, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(256, 256, 3, 1, 1),
+        )
+
+        self.map_head = nn.Conv2d(256, hidden_size, 3, 1, 1)
+        self.token_head = nn.Conv2d(256, hidden_size, 1, 1, 0)
+
+        nn.init.zeros_(self.map_head.weight)
+        nn.init.zeros_(self.map_head.bias)
+        nn.init.zeros_(self.token_head.weight)
+        nn.init.zeros_(self.token_head.bias)
+
+    def forward(self, lr_small: torch.Tensor, t_embed: torch.Tensor = None):
+        f1 = self.enc1(self.stem(lr_small))
+        f2 = self.enc2(self.down1(f1))
+        f3 = self.enc3(self.down2(f2))
+
+        if t_embed is not None:
+            tb = self.time_mlp(t_embed)
+            gamma, beta = tb.chunk(2, dim=-1)
+            f3 = (1.0 + gamma[:, :, None, None]) * f3 + beta[:, :, None, None]
+
+        f1_32 = F.interpolate(self.fpn1(f1), size=(32, 32), mode="bilinear", align_corners=False)
+        f2_32 = F.interpolate(self.fpn2(f2), size=(32, 32), mode="bilinear", align_corners=False)
+        f3_32 = self.fpn3(f3)
+
+        fused_32 = self.fuse(torch.cat([f1_32, f2_32, f3_32], dim=1))
+
+        cond_map = self.map_head(fused_32)
+        cond_tokens = self.token_head(fused_32).flatten(2).transpose(1, 2).contiguous()
+
+        return {
+            "cond_map": cond_map,
+            "cond_tokens": cond_tokens,
+            "cond_tokens_hw": (32, 32),
+        }
