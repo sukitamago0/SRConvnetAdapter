@@ -620,7 +620,6 @@ def build_model_and_assets(args, device, compute_dtype):
         hidden_size=1152,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
-    sem_adapter = None
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -643,11 +642,11 @@ def build_model_and_assets(args, device, compute_dtype):
 
     pixart.eval()
     adapter.eval()
-    return pixart, adapter, sem_adapter, vae, null_pack, scheduler
+    return pixart, adapter, vae, null_pack, scheduler
 
 
 @torch.no_grad()
-def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem):
+def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem):
     hr = batch["hr"].to(device)
     lr = batch["lr"].to(device)
     lr_small = batch["lr_small"].to(device)
@@ -813,7 +812,7 @@ def nanmean(xs):
     return float(sum(vals) / len(vals))
 
 
-def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype):
+def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype):
     base_out = Path(args.output_dir) / dataset_name
     preds_dir = base_out / "preds"
     trip_dir = base_out / "triptychs"
@@ -834,7 +833,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.max_samples > 0 and idx >= args.max_samples:
             break
 
-        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem)
+        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem)
         m = metric_suite.compute(pred, hr)
         m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
         m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
@@ -882,9 +881,6 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
             "corner_ssim": m_corner_c["ssim"],
             "corner_lpips": m_corner_c["lpips"],
             "cond_map_std": debug_stats["cond_map_std"],
-            "sem_tok_std": debug_stats["sem_tok_std"],
-            "sem_out_std": debug_stats["sem_out_std"],
-            "sem_out_scale": debug_stats["sem_out_scale"],
             "text_cond_delta": debug_stats["text_cond_delta"],
             "prompt_cache_hit_rate": debug_stats["prompt_cache_hit_rate"],
             "avg_prompt_token_count": debug_stats["avg_prompt_token_count"],
@@ -909,7 +905,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         "flat_psnr", "flat_ssim", "flat_lpips",
         "edge_psnr", "edge_ssim", "edge_lpips",
         "corner_psnr", "corner_ssim", "corner_lpips",
-        "cond_map_std", "sem_tok_std", "sem_out_std", "sem_out_scale",
+        "cond_map_std",
         "text_cond_delta", "prompt_cache_hit_rate", "avg_prompt_token_count", "avg_prompt_nonpad_ratio",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -1032,7 +1028,6 @@ def parse_args():
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--vae_path", type=str, default="/home/hello/HJT/PixArt-sigma/output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers/vae")
     parser.add_argument("--null_t5_embed_path", type=str, default="/home/hello/HJT/PixArt-sigma/output/pretrained_models/null_t5_embed_sigma_300.pth")
-    parser.add_argument("--semantic_encoder_name_or_path", type=str, default="openai/clip-vit-large-patch14")
 
     parser.add_argument("--realsr_roots", type=str, nargs="*", default=["/data/RealSR/Nikon/Test/4", "/data/RealSR/Canon/Test/4"])
     parser.add_argument("--drealsr_hr_dir", type=str, default="/data/DRealSR/HR")
@@ -1078,19 +1073,19 @@ def main():
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    pixart, adapter, sem_adapter, vae, null_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
+    pixart, adapter, vae, null_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
     metric_suite = MetricSuite()
 
     paper_rows = []
     if args.dataset in ("realsr", "both"):
         realsr_ds = RealSRValPairedDataset(roots=args.realsr_roots, crop_size=args.crop_size)
         realsr_loader = DataLoader(realsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype))
+        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype))
 
     if args.dataset in ("drealsr", "both"):
         drealsr_ds = DRealSRPairedDataset(args.drealsr_hr_dir, args.drealsr_lr_dir, crop_size=args.crop_size)
         drealsr_loader = DataLoader(drealsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype))
+        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype))
 
     if args.dataset == "both" and len(paper_rows) > 0:
         ckpt_name = Path(args.ckpt_path).stem

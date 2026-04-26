@@ -153,14 +153,13 @@ def run(args):
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
     layer_cfg = ckpt.get("layer_config", {}) if isinstance(ckpt, dict) else {}
     anchor_layers = list(layer_cfg.get("anchor_layers", [2, 4, 6, 8]))
-    semantic_layers = list(layer_cfg.get("semantic_layers", [18, 22, 24, 26]))
 
     pixart = PixArtSigmaSR_XL_2(
         input_size=64,
         in_channels=4,
         out_channels=4,
         anchor_layers=anchor_layers,
-        semantic_layers=semantic_layers,
+        semantic_layers=[24, 25, 26, 27],
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
