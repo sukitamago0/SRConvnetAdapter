@@ -16,6 +16,7 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
 from diffusion.model.nets.adapter_cond import mask_adapter_cond
 
@@ -89,11 +90,22 @@ def run(args):
         pixart.load_pretrained_weights_with_zero_init(base)
     else:
         pixart.load_state_dict(base, strict=False)
+    pixart.enable_sr_conditioning_layers(
+        pixel_layers=list(layer_cfg.get("pixel_layers", anchor_layers)),
+        lr_conv_layers=list(layer_cfg.get("lr_conv_layers", anchor_layers)),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
+        init_gate=-4.0,
+    )
 
     adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
     ).to(device).float()
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=args.semantic_encoder_name_or_path,
+        hidden_size=1152,
+        num_prompt_tokens=16,
+    ).to(device).eval()
 
     saved_trainable = ckpt.get("pixart_trainable", {})
 
@@ -110,10 +122,13 @@ def run(args):
             pixel_alpha=float(layer_cfg.get("pixel_lora_alpha", args.lora_alpha)),
             semantic_alpha=float(layer_cfg.get("semantic_lora_alpha", args.lora_alpha)),
         )
-        set_dual_lora_scales(pixart, lambda_pix=1.0, lambda_sem=1.0)
+        set_dual_lora_scales(pixart, lambda_pix=float(args.lambda_pix), lambda_sem=float(args.lambda_sem))
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
+    if (not bool(args.disable_semantic_branch)) and isinstance(sem_adapter_sd, dict):
+        sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -127,6 +142,7 @@ def run(args):
 
     pixart.eval()
     adapter.eval()
+    sem_adapter.eval()
 
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
@@ -170,6 +186,8 @@ def run(args):
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         cond = adapter(adapter_in, t_embed=t_embed.float())
+        if not bool(args.disable_semantic_branch):
+            cond["sem_tokens"] = sem_adapter(((adapter_in.clamp(-1, 1) + 1.0) * 0.5).float())
         if "ip_tokens" not in cond and "cond_tokens" not in cond:
             raise KeyError("adapter output missing ip_tokens/cond_tokens")
         if "local_entry_tokens" not in cond and "cond_map" not in cond:
@@ -255,6 +273,9 @@ def parse_args():
     parser.add_argument("--sft_strength", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=int, default=4)
+    parser.add_argument("--lambda-pix", type=float, default=1.0)
+    parser.add_argument("--lambda-sem", type=float, default=1.0)
+    parser.add_argument("--disable-semantic-branch", action="store_true")
     parser.add_argument("--input_is_lr_small", type=lambda x: str(x).lower() in ("1","true","yes","y"), default=True)
     return parser.parse_args()
 

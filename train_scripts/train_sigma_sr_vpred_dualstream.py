@@ -48,6 +48,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
 from diffusion.model.nets.adapter_cond import mask_adapter_cond
 from diffusion.model.utils import set_grad_checkpoint
@@ -148,8 +149,8 @@ SEMANTIC_ENCODER_NAME_OR_PATH = os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "open
 USE_SEMANTIC_BRANCH = True
 ALLOW_SEM_ADAPTER_NONSTRICT_RESUME = False
 USE_FIXED_HARD_PROMPT = False
-USE_ADAPTIVE_TEXT_PROMPT = True
-STRICT_ADAPTIVE_PROMPT = True
+USE_ADAPTIVE_TEXT_PROMPT = False
+STRICT_ADAPTIVE_PROMPT = False
 ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
@@ -161,6 +162,8 @@ INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
 # anchor_layers = early structure-only band
 ANCHOR_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7]
+PIXEL_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7]
+LR_CONV_LAYERS = [2, 3, 4, 5, 6, 7]
 # semantic_layers = late semantic-only band
 SEMANTIC_LAYERS = [24, 25, 26, 27]
 
@@ -216,20 +219,20 @@ LATENT_L1_T_MIN = 200
 
 # LPIPS perceptual curriculum (single-script, no separate stage script)
 USE_LPIPS_PERCEP = True
-LPIPS_START_EPOCH = 8
-LPIPS_RAMP_END_EPOCH = 25
+LPIPS_START_EPOCH = 3
+LPIPS_RAMP_END_EPOCH = 10
 LPIPS_WEIGHT_MAX = 0.25
 LPIPS_T_MAX = 800
 
 # As LPIPS ramps in, old structure losses ramp down
 LATENT_L1_WEIGHT_START = 0.08
-LATENT_L1_WEIGHT_END = 0.0
+LATENT_L1_WEIGHT_END = 0.02
 
 LR_CONS_WEIGHT_START = 0.0
-LR_CONS_WEIGHT_END = 0.0
+LR_CONS_WEIGHT_END = 0.01
 
 GW_WEIGHT_START = 0.0
-GW_WEIGHT_END = 0.0
+GW_WEIGHT_END = 0.01
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
 CKPT_SELECT_MODE = "psnr_gate_then_lpips"
@@ -256,7 +259,10 @@ EMA_DECAY = 0.999
 EMA_VALIDATE = False  # S2D main experiment: disable EMA/EMA-validate for clean comparison
 EMA_VALIDATE_EVERY = 5  # run EMA validation every N validation triggers
 
-T_SAMPLE_MODE = "power"   # uniform | power | two_stage
+T_SAMPLE_MODE = "mixture"   # uniform | power | two_stage | mixture
+T_MIX_HIGH_PROB = 0.65
+T_MIX_HIGH_MIN = 700
+T_MIX_LOW_POWER = 2.0
 T_SAMPLE_POWER = 2.5
 T_SAMPLE_MIN = 0
 T_SAMPLE_MAX = 999
@@ -388,6 +394,14 @@ def sample_t(batch: int, device: str, step: int) -> torch.Tensor:
             t = torch.floor((u ** float(T_SAMPLE_POWER)) * span + tmin)
             return t.clamp(tmin, tmax).long()
         return torch.randint(tmin, tmax + 1, (batch,), device=device).long()
+    if mode == "mixture":
+        u = torch.rand((batch,), device=device)
+        high = u < float(T_MIX_HIGH_PROB)
+        hi_min = int(max(tmin, min(tmax, int(T_MIX_HIGH_MIN))))
+        t_hi = torch.randint(hi_min, tmax + 1, (batch,), device=device)
+        p = torch.rand((batch,), device=device).pow(float(T_MIX_LOW_POWER))
+        t_lo = torch.floor(p * float(max(1, hi_min - tmin)) + tmin).long().clamp(tmin, tmax)
+        return torch.where(high, t_hi, t_lo).long()
     raise ValueError(f"Unknown T_SAMPLE_MODE: {T_SAMPLE_MODE}")
 
 def rgb01_to_y01(rgb01):
@@ -789,7 +803,7 @@ class ParamEMA:
         self.backup = {}
 
 
-def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module):
+def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module):
     out = []
     for n, p in adapter.named_parameters():
         if p.requires_grad:
@@ -797,6 +811,9 @@ def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module):
     for n, p in pixart.named_parameters():
         if p.requires_grad:
             out.append((f"pixart.{n}", p))
+    for n, p in sem_adapter.named_parameters():
+        if p.requires_grad:
+            out.append((f"sem_adapter.{n}", p))
     return out
 
 
@@ -822,13 +839,13 @@ def get_config_snapshot():
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV12",
-        "control_type": "structure_early_band + adaptive_text + image_semantic + tala_train_consistency",
+        "control_type": "dualcondsr_pixel+semantic+tala",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
         "adapter_token_head": "structure-only cond_map head",
         "internal_control_type": "disabled",
         "internal_control_layers": [],
-        "semantic_prompt_branch": "enabled",
-        "semantic_prompt_source": "CLIP + IP-Adapter Resampler + decoupled cross-attn",
+        "semantic_prompt_branch": ("enabled" if USE_SEMANTIC_BRANCH else "disabled"),
+        "semantic_prompt_source": ("CLIPSemanticAdapter + decoupled cross-attn" if USE_SEMANTIC_BRANCH else "disabled"),
         "semantic_prompt_tokens": 16,
         "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
         "use_native_text_path": True,
@@ -848,7 +865,7 @@ def get_config_snapshot():
         "percep_decode_max_samples": int(PERCEP_DECODE_MAX_SAMPLES),
         "lpips_late_weight": float(LPIPS_LATE_WEIGHT),
         "use_legacy_patch_lpips": bool(USE_LEGACY_PATCH_LPIPS),
-        "semantic_fusion": "parallel_decoupled",
+        "semantic_fusion": ("parallel_decoupled" if USE_SEMANTIC_BRANCH else "disabled"),
         "lr_control_role": "structure_only",
         "anchor_layers": list(ANCHOR_LAYERS),
         "tala_lite": False,
@@ -965,14 +982,26 @@ class DegradationPipeline:
             "jpeg_quality": jpeg_quality,
         }
 
-    def __call__(self, hr_tensor, return_meta: bool = False, meta=None, generator=None):
+    def __call__(self, hr_tensor, mode: str = "realesrgan", return_meta: bool = False, meta=None, generator=None, return_small: bool = False):
         img = (hr_tensor + 1.0) * 0.5
+        mode = str(mode).lower()
         if meta is None:
-            use_two_stage = bool(self._sample_uniform(0.0, 1.0, generator) < P_TWO_STAGE)
-            ops_stage1 = self._shuffle_ops(generator)
-            ops_stage2 = self._shuffle_ops(generator) if use_two_stage else []
+            if mode == "bsrgan":
+                use_two_stage = bool(self._sample_uniform(0.0, 1.0, generator) < 0.85)
+                ops_stage1 = self._shuffle_ops(generator)
+                ops_stage2 = self._shuffle_ops(generator) if use_two_stage else []
+            else:
+                use_two_stage = bool(self._sample_uniform(0.0, 1.0, generator) < P_TWO_STAGE)
+                ops_stage1 = ["blur", "resize", "noise", "jpeg"]
+                ops_stage2 = ["blur", "resize", "noise", "jpeg"] if use_two_stage else []
             stage1 = self._sample_stage_params(generator)
             stage2 = self._sample_stage_params(generator) if use_two_stage else None
+            if mode == "bsrgan":
+                stage1["jpeg_quality"] = int(max(25, min(95, stage1["jpeg_quality"] - 8)))
+                stage1["noise_std"] = float(stage1["noise_std"] * 1.2)
+                if stage2 is not None:
+                    stage2["jpeg_quality"] = int(max(20, min(90, stage2["jpeg_quality"] - 10)))
+                    stage2["noise_std"] = float(stage2["noise_std"] * 1.2)
         else:
             use_two_stage = bool(int(meta.get("use_two_stage", torch.tensor(0)).item()))
             ops_stage1 = [op for op in str(meta.get("ops_stage1", ",".join(DEG_OPS))).split(",") if op]
@@ -1044,7 +1073,8 @@ class DegradationPipeline:
         down_w = int(self.crop_size * self.downscale_factor)
         lr_small = TF.resize(lr_small, [down_h, down_w], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         lr_out = TF.resize(lr_small, [self.crop_size, self.crop_size], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-        lr_out = (lr_out * 2.0 - 1.0).clamp(-1.0, 1.0)
+        lr_small_m11 = (lr_small * 2.0 - 1.0).clamp(-1.0, 1.0)
+        lr_out_m11 = (lr_out * 2.0 - 1.0).clamp(-1.0, 1.0)
 
         # FIXED: Strictly return 2 values
         if return_meta:
@@ -1077,8 +1107,12 @@ class DegradationPipeline:
                 "down_h": torch.tensor(int(down_h), dtype=torch.int64),
                 "down_w": torch.tensor(int(down_w), dtype=torch.int64),
             }
-            return lr_out, meta_out
-        return lr_out
+            if return_small:
+                return lr_out_m11, lr_small_m11, meta_out
+            return lr_out_m11, meta_out
+        if return_small:
+            return lr_out_m11, lr_small_m11
+        return lr_out_m11
 
 # ================= 6. Datasets (Correctly Placed BEFORE Main) =================
 def _scan_images(root):
@@ -1140,6 +1174,74 @@ def center_crop_aligned_pair(lr_pil: Image.Image, hr_pil: Image.Image, scale: in
     hr_aligned = TF.crop(hr_pil, hr_top, hr_left, h2, w2)
     lr_aligned = TF.crop(lr_pil, lr_top, lr_left, lr_h2, lr_w2)
     return lr_aligned, hr_aligned
+
+
+def random_crop_pil(img: Image.Image, crop_h: int, crop_w: int):
+    w, h = img.size
+    if h < crop_h or w < crop_w:
+        scale = max(crop_h / max(1, h), crop_w / max(1, w))
+        new_w = int(math.ceil(w * scale))
+        new_h = int(math.ceil(h * scale))
+        img = img.resize((new_w, new_h), Image.BICUBIC)
+        w, h = img.size
+    top = random.randint(0, h - crop_h)
+    left = random.randint(0, w - crop_w)
+    return TF.crop(img, top, left, crop_h, crop_w)
+
+
+class MixedRealISRDataset(Dataset):
+    def __init__(self, crop_size=512, scale=4):
+        self.crop_size = int(crop_size)
+        self.scale = int(scale)
+        self.df2k = DF2K_Online_Dataset(crop_size=crop_size, is_train=True, scale=scale)
+        self.pipeline = DegradationPipeline(crop_size)
+        self.norm = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
+        self.to_tensor = transforms.ToTensor()
+        self.epoch = 0
+        self.sources = ["paired_df2k", "paired_realsr", "syn_realesrgan", "syn_bsrgan"]
+
+    def __len__(self):
+        return len(self.df2k)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+        if hasattr(self.df2k, "set_epoch"):
+            self.df2k.set_epoch(epoch)
+
+    def _sample_syn(self, mode: str, hr_path: str):
+        hr_pil = Image.open(hr_path).convert("RGB")
+        hr_crop = random_crop_pil(hr_pil, self.crop_size, self.crop_size)
+        hr = self.norm(self.to_tensor(hr_crop))
+        lr, lr_small, _meta = self.pipeline(hr, mode=mode, return_meta=True, return_small=True)
+        return {"hr": hr, "lr": lr, "lr_small": lr_small, "path": hr_path, "sample_key": make_sample_key(hr_path), "source_type": f"syn_{mode}", "pixel_loss_weight": 0.8}
+
+    def __getitem__(self, idx):
+        base = self.df2k[idx % len(self.df2k)]
+        src = self.sources[(idx + self.epoch) % len(self.sources)]
+        if src == "paired_df2k":
+            base["source_type"] = src
+            base["pixel_loss_weight"] = 1.0
+            return base
+        if src == "paired_realsr":
+            hr_path = base["path"]
+            lr_path = hr_path.replace("_HR", "_LR4")
+            if os.path.exists(lr_path) and os.path.exists(hr_path):
+                hr_pil = Image.open(hr_path).convert("RGB")
+                lr_pil = Image.open(lr_path).convert("RGB")
+                lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=self.scale)
+                lr_crop = TF.center_crop(lr_aligned, (self.crop_size // self.scale, self.crop_size // self.scale))
+                hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
+                lr_up = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+                return {
+                    "hr": self.norm(self.to_tensor(hr_crop)),
+                    "lr": self.norm(self.to_tensor(lr_up)),
+                    "lr_small": self.norm(self.to_tensor(lr_crop)),
+                    "path": hr_path,
+                    "sample_key": make_sample_key(lr_path),
+                    "source_type": src,
+                    "pixel_loss_weight": 0.5,
+                }
+        return self._sample_syn("realesrgan" if src == "syn_realesrgan" else "bsrgan", base["path"])
 
 class DF2K_Online_Dataset(Dataset):
     def __init__(self, crop_size=512, is_train=True, scale=4):
@@ -1246,9 +1348,7 @@ class DF2K_Val_Degraded_Dataset(Dataset):
             lr_small_tensor = (lr_small01 * 2.0 - 1.0).clamp(-1.0, 1.0)
         else:
             gen = torch.Generator(); gen.manual_seed(self.seed + idx)
-            lr_tensor, _ = self.pipeline(hr_tensor, return_meta=True, generator=gen)
-            # fallback when pipeline only outputs lr_up
-            lr_small_tensor = F.interpolate(lr_tensor.unsqueeze(0), size=(self.crop_size // 4, self.crop_size // 4), mode="bicubic", align_corners=False, antialias=True).squeeze(0).clamp(-1.0, 1.0)
+            lr_tensor, lr_small_tensor, _ = self.pipeline(hr_tensor, mode="realesrgan", return_meta=True, return_small=True, generator=gen)
         return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path, "sample_key": make_sample_key(hr_path)}
 
 class ValPackDataset(Dataset):
@@ -1316,6 +1416,11 @@ class RealSR_Val_Paired_Dataset(Dataset):
 
 
 # ================= 7. LoRA =================
+def _block_id_from_name(name: str):
+    m = re.search(r"blocks\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
+
+
 def apply_lora(model):
     cnt = apply_dual_lora(
         model,
@@ -1352,18 +1457,44 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             if "x_embedder" in n and p.requires_grad:
                 p.requires_grad_(False)
 
+    pixel_layer_ids = {int(i) for i in PIXEL_LAYERS}
+    semantic_layer_ids = {int(i) for i in SEMANTIC_LAYERS}
+    lr_conv_layer_ids = {int(i) for i in LR_CONV_LAYERS}
+
     if ENABLE_LORA:
         for n, p in pixart.named_parameters():
             if ".base.weight" in n or ".base.bias" in n:
                 p.requires_grad_(False)
                 continue
-            if ("pixel_lora_" in n) or ("semantic_lora_" in n):
-                p.requires_grad_(True)
+            bid = _block_id_from_name(n)
+            if ("pixel_lora_" in n):
+                p.requires_grad_(bid in pixel_layer_ids)
+            if ("semantic_lora_" in n):
+                p.requires_grad_(bid in semantic_layer_ids)
+
+    for n, p in pixart.named_parameters():
+        bid = _block_id_from_name(n)
+        if bid is None:
+            continue
+        if ("lr_ip_attn" in n) or ("lr_stream_attn" in n):
+            p.requires_grad_(bid in pixel_layer_ids)
+        if ("lr_cross_conv" in n):
+            p.requires_grad_(bid in lr_conv_layer_ids)
+        if ("cross_attn.k_img_linear" in n) or ("cross_attn.v_img_linear" in n) or ("cross_attn.img_residual_linear" in n) or ("semantic_gate" in n):
+            p.requires_grad_(bid in semantic_layer_ids)
+        if ("cross_attn.k_text_linear" in n) or ("cross_attn.v_text_linear" in n) or ("cross_attn.q_linear" in n) or ("cross_attn.out_proj" in n):
+            p.requires_grad_(False)
 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
     print(f"✅ PixArt trainable configured(IP-control): before={total_trainable_before}, after={total_trainable_after}")
+    trainable_names = [n for n, p in pixart.named_parameters() if p.requires_grad]
+    must_have = ["lr_stream_attn", "lr_cross_conv", "sem_ip_proj", "cross_attn.k_img_linear", "cross_attn.img_residual_linear", "pixel_lora", "semantic_lora"]
+    missing = [m for m in must_have if not any(m in n for n in trainable_names)]
+    if missing:
+        raise RuntimeError(f"Trainable paths missing required fragments: {missing}")
+    print("[Trainable-Check] includes:", ", ".join(must_have))
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
@@ -1383,8 +1514,9 @@ def should_run_proxy_validation(epoch_1based: int) -> bool:
     return True
 
 
-def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module):
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
+    sem_adapter_params = [p for p in sem_adapter.parameters() if p.requires_grad]
     lora_params = []
     ip_control_params = []
 
@@ -1397,15 +1529,15 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
             ip_control_params.append(p)
 
     optim_groups = []
-    if adapter_params or ip_control_params:
-        optim_groups.append({"params": adapter_params + ip_control_params, "lr": 3e-4, "weight_decay": 0.01})
+    if adapter_params or ip_control_params or sem_adapter_params:
+        optim_groups.append({"params": adapter_params + sem_adapter_params + ip_control_params, "lr": 3e-4, "weight_decay": 0.01})
     if lora_params:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + ip_control_params + lora_params
+    params_to_clip = adapter_params + sem_adapter_params + ip_control_params + lora_params
 
     pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
     grouped_pixart = ip_control_params + lora_params
@@ -1416,6 +1548,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
 
     group_counts = {
         "adapter": len(adapter_params),
+        "sem_adapter": len(sem_adapter_params),
         "ip_control_pixart": len(ip_control_params),
         "lora": len(lora_params),
     }
@@ -1500,6 +1633,7 @@ def save_smart(
     global_step,
     pixart,
     adapter,
+    sem_adapter,
     optimizer,
     best_records,
     metrics,
@@ -1593,14 +1727,18 @@ def save_smart(
         adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
         adapter_token_head_counts = {
             "adapter.to32": int(sum(1 for k in adapter_sd.keys() if k.startswith("to32."))),
+            "adapter.cond_proj": int(sum(1 for k in adapter_sd.keys() if "cond" in k)),
+            "adapter.local_entry": int(sum(1 for k in adapter_sd.keys() if "local" in k)),
         }
         print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
+        sem_adapter_sd = {k: v.detach().float().cpu() for k, v in sem_adapter.state_dict().items()}
         state = {
             "epoch": epoch,
             "step": global_step,
             "lora_rank": int(LORA_RANK),
             "lora_alpha": float(LORA_ALPHA),
             "adapter": adapter_sd,
+            "sem_adapter": sem_adapter_sd,
             "adapter_token_head_counts": adapter_token_head_counts,
             "optimizer": optimizer.state_dict(),
             "rng_state": {
@@ -1625,6 +1763,10 @@ def save_smart(
             "train_runtime_log": dict(LAST_TRAIN_LOG),
             "layer_config": {
                 "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
+                "pixel_layers": list(PIXEL_LAYERS),
+                "lr_conv_layers": list(LR_CONV_LAYERS),
+                "semantic_layers": list(SEMANTIC_LAYERS),
+                "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
                 "use_tala_train": bool(USE_TALA_TRAIN),
                 "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
                 "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -1663,14 +1805,18 @@ def save_smart(
         adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
         adapter_token_head_counts = {
             "adapter.to32": int(sum(1 for k in adapter_sd.keys() if k.startswith("to32."))),
+            "adapter.cond_proj": int(sum(1 for k in adapter_sd.keys() if "cond" in k)),
+            "adapter.local_entry": int(sum(1 for k in adapter_sd.keys() if "local" in k)),
         }
         print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
+        sem_adapter_sd = {k: v.detach().float().cpu() for k, v in sem_adapter.state_dict().items()}
         state = {
             "epoch": epoch,
             "step": global_step,
             "lora_rank": int(LORA_RANK),
             "lora_alpha": float(LORA_ALPHA),
             "adapter": adapter_sd,
+            "sem_adapter": sem_adapter_sd,
             "adapter_token_head_counts": adapter_token_head_counts,
             "pixart_trainable": pixart_sd,
             "best_records": None,
@@ -1686,6 +1832,10 @@ def save_smart(
             "train_runtime_log": dict(LAST_TRAIN_LOG),
             "layer_config": {
                 "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
+                "pixel_layers": list(PIXEL_LAYERS),
+                "lr_conv_layers": list(LR_CONV_LAYERS),
+                "semantic_layers": list(SEMANTIC_LAYERS),
+                "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
                 "use_tala_train": bool(USE_TALA_TRAIN),
                 "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
                 "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -1769,6 +1919,7 @@ def save_last_resume_only(
     global_step,
     pixart,
     adapter,
+    sem_adapter,
     optimizer,
     best_records,
     dl_gen,
@@ -1777,6 +1928,7 @@ def save_last_resume_only(
     last_val_psnr: float = -1.0,
 ):
     adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
+    sem_adapter_sd = {k: v.detach().float().cpu() for k, v in sem_adapter.state_dict().items()}
     pixart_sd = collect_trainable_state_dict(pixart)
     state_last = {
         "epoch": epoch,
@@ -1784,8 +1936,11 @@ def save_last_resume_only(
         "lora_rank": int(LORA_RANK),
         "lora_alpha": float(LORA_ALPHA),
         "adapter": adapter_sd,
+        "sem_adapter": sem_adapter_sd,
         "adapter_token_head_counts": {
             "adapter.to32": int(sum(1 for k in adapter_sd.keys() if k.startswith("to32."))),
+            "adapter.cond_proj": int(sum(1 for k in adapter_sd.keys() if "cond" in k)),
+            "adapter.local_entry": int(sum(1 for k in adapter_sd.keys() if "local" in k)),
         },
         "optimizer": optimizer.state_dict(),
         "rng_state": {
@@ -1810,6 +1965,10 @@ def save_last_resume_only(
         "train_runtime_log": dict(LAST_TRAIN_LOG),
         "layer_config": {
             "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
+            "pixel_layers": list(PIXEL_LAYERS),
+            "lr_conv_layers": list(LR_CONV_LAYERS),
+            "semantic_layers": list(SEMANTIC_LAYERS),
+            "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
             "use_tala_train": bool(USE_TALA_TRAIN),
             "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
             "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -1877,7 +2036,7 @@ def _build_limited_val_loader(val_loader, num_samples: int):
     return DataLoader(subset, batch_size=1, shuffle=False)
 
 
-def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
+def init_from_ckpt_weights_only(pixart, adapter, sem_adapter, ckpt_path: str):
     if not ckpt_path:
         return False
     if not os.path.exists(ckpt_path):
@@ -1896,10 +2055,16 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
             print("✅ Adapter bootstrap load succeeded.")
         except Exception as e:
             print(f"⚠️ Adapter bootstrap load skipped due to mismatch: {e}")
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
+    if isinstance(sem_adapter_sd, dict):
+        missing, unexpected, skipped = load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="init-sem-adapter")
+        print(f"✅ sem_adapter bootstrap load: missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
+    elif USE_SEMANTIC_BRANCH:
+        raise RuntimeError("Bootstrap checkpoint missing sem_adapter while USE_SEMANTIC_BRANCH=True")
     return True
 
 
-def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
+def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH):
         return 0, 0, [], None, -1.0
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
@@ -1923,6 +2088,12 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
         adapter.load_state_dict(adapter_sd, strict=True)
     except RuntimeError as e:
         raise RuntimeError(f"Adapter strict load failed during resume: {e}") from e
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
+    if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
+        missing, unexpected, skipped = load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="resume-sem-adapter")
+        print(f"✅ sem_adapter resume load: missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
+    elif USE_SEMANTIC_BRANCH:
+        raise RuntimeError("Checkpoint missing sem_adapter while USE_SEMANTIC_BRANCH=True")
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="resume")
     try:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -1960,7 +2131,7 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
 
 # ================= 9. Validation =================
 @torch.no_grad()
-def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
+def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
     tag = str(val_tag).lower()
     print(f"🔎 Validating Epoch {epoch+1} [{tag}]...")
     print(
@@ -1971,7 +2142,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
         f"tala_train_blend_pow={float(TALA_TRAIN_BLEND_POW):.3f} "
         f"tala_train_detach_lr_latent={bool(TALA_TRAIN_DETACH_LR_LATENT)}"
     )
-    pixart.eval(); adapter.eval()
+    pixart.eval(); adapter.eval(); sem_adapter.eval()
     results = {}
     val_gen = torch.Generator(device=DEVICE); val_gen.manual_seed(SEED)
     
@@ -2028,6 +2199,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
                     t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     cond = adapter(lr_small, t_embed=t_embed)
+                sem_tokens = sem_adapter(((lr_small.clamp(-1, 1) + 1.0) * 0.5).float())
+                cond["sem_tokens"] = sem_tokens.to(dtype=cond["cond_tokens"].dtype if "cond_tokens" in cond else sem_tokens.dtype)
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     drop_uncond = torch.ones(latents.shape[0], device=DEVICE, dtype=torch.long)
                     drop_cond = torch.zeros(latents.shape[0], device=DEVICE, dtype=torch.long)
@@ -2137,7 +2310,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
         print(msg)
-    pixart.train(); adapter.train()
+    pixart.train(); adapter.train(); sem_adapter.train()
     return results
 
 # ================= 10. Main =================
@@ -2152,7 +2325,7 @@ def main():
         if not os.path.exists(pth):
             raise FileNotFoundError(f"Required pretrained path missing: {pth}")
 
-    train_ds = DF2K_Online_Dataset(crop_size=512, is_train=True, scale=4)
+    train_ds = MixedRealISRDataset(crop_size=512, scale=4)
     if VAL_MODE == "realsr":
         val_ds = RealSR_Val_Paired_Dataset(REALSR_VAL_ROOTS, crop_size=512)
         print(f"[VAL] mode=realsr roots={REALSR_VAL_ROOTS} pairs={len(val_ds)}")
@@ -2219,6 +2392,8 @@ def main():
         input_size=64, in_channels=4, out_channels=4,
         force_null_caption=False,
         anchor_layers=list(ANCHOR_LAYERS),
+        pixel_layers=list(ANCHOR_LAYERS),
+        lr_conv_layers=list(ANCHOR_LAYERS),
         semantic_layers=list(SEMANTIC_LAYERS),
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
@@ -2235,6 +2410,12 @@ def main():
     else:
         missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
+    pixart.enable_sr_conditioning_layers(
+        pixel_layers=list(ANCHOR_LAYERS),
+        lr_conv_layers=list(ANCHOR_LAYERS),
+        semantic_layers=list(SEMANTIC_LAYERS),
+        init_gate=-4.0,
+    )
     if ENABLE_LORA:
         apply_lora(pixart)
         set_dual_lora_scales(pixart, lambda_pix=1.0, lambda_sem=1.0)
@@ -2245,6 +2426,11 @@ def main():
     adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
+    ).to(DEVICE).train()
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "/workspace/models/openai/clip-vit-large-patch14"),
+        hidden_size=1152,
+        num_prompt_tokens=16,
     ).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
@@ -2289,7 +2475,7 @@ def main():
     ema_named_params = []
     if USE_EMA:
         ema = ParamEMA(decay=EMA_DECAY)
-        ema_named_params = collect_ema_named_params(pixart, adapter)
+        ema_named_params = collect_ema_named_params(pixart, adapter, sem_adapter)
         ema.register(ema_named_params)
         print(f"✅ EMA tracking enabled: decay={EMA_DECAY}, tensors={len(ema_named_params)}")
 
@@ -2300,10 +2486,7 @@ def main():
         f"USE_TALA_TRAIN={bool(USE_TALA_TRAIN)} USE_LQ_INIT={bool(USE_LQ_INIT)} "
         f"LORA_RANK={int(LORA_RANK)} LORA_ALPHA={int(LORA_ALPHA)}"
     )
-    print('[GATE-MODE] gate_mode = "pure_tasr_learned" | no_handcrafted_time_prior = True')
-    print('[GATE-SOURCE] gate_time_source = "pure_timestep_only"')
-    print('[SEMANTIC-SCHEDULE] semantic_time_schedule = "disabled"')
-    print('[HPA-MODE] hpa_mode = "head_space_residual_injection"')
+    print('[GATE-MODE] gate_mode = "dualcondsr_dynamic"')
     print('[PACKED-FALLBACK] packed_text_fallback = "per_sample_safe"')
     print(f"[LPIPS-PATH] use_legacy_patch_lpips = {bool(USE_LEGACY_PATCH_LPIPS)}")
     print(
@@ -2315,7 +2498,7 @@ def main():
         f"TALA_TRAIN_HIGH_T_MODE={bool(TALA_TRAIN_HIGH_T_MODE)} TALA_TRAIN_ACTIVE_T_MIN={int(TALA_TRAIN_ACTIVE_T_MIN)} "
         f"TALA_TRAIN_MAX_RATIO={float(TALA_TRAIN_MAX_RATIO):.3f}"
     )
-    print(f"[RUN-MODE] anchor_layers={list(ANCHOR_LAYERS)} use_tala_train={bool(USE_TALA_TRAIN)} use_hpa={bool(USE_SEMANTIC_BRANCH)} lora_rank={int(LORA_RANK)} lora_alpha={int(LORA_ALPHA)}")
+    print(f"[RUN-MODE] anchor_layers={list(ANCHOR_LAYERS)} use_tala_train={bool(USE_TALA_TRAIN)} use_semantic_branch={bool(USE_SEMANTIC_BRANCH)} lora_rank={int(LORA_RANK)} lora_alpha={int(LORA_ALPHA)}")
     print(
         f"[PERCEP-CONFIG] USE_TIMESTEP_AWARE_PERCEPTUAL={bool(USE_TIMESTEP_AWARE_PERCEPTUAL)} "
         f"PERCEP_T_MAX={int(PERCEP_T_MAX)} PERCEP_DECODE_MAX_SAMPLES={int(PERCEP_DECODE_MAX_SAMPLES)} "
@@ -2338,14 +2521,14 @@ def main():
     if START_FROM_BASE_ONLY:
         print("✅ START_FROM_BASE_ONLY=True: skip bootstrap/resume checkpoints; train from PixArt base.")
     elif not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
-        init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
+        init_from_ckpt_weights_only(pixart, adapter, sem_adapter, INIT_CKPT_PATH)
 
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     for p in adapter.parameters():
         p.requires_grad_(True)
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
-    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
+    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter, sem_adapter)
     print(f"✅ Optim groups(single-stage): {group_counts}")
     _maybe_empty_cuda_cache()
 
@@ -2353,10 +2536,10 @@ def main():
         ep_start, step, best, last_val_psnr = 0, 0, [], -1.0
     else:
         ep_start, step, best, _, last_val_psnr = resume(
-            pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params
+            pixart, adapter, sem_adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params
         )
     if ema is not None:
-        ema_named_params = collect_ema_named_params(pixart, adapter)
+        ema_named_params = collect_ema_named_params(pixart, adapter, sem_adapter)
         ema.register(ema_named_params)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
@@ -2424,6 +2607,9 @@ def main():
                 t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
+            lr_small_01 = ((adapter_in.clamp(-1, 1) + 1.0) * 0.5).float()
+            sem_tokens = sem_adapter(lr_small_01)
+            cond["sem_tokens"] = sem_tokens.to(dtype=cond["cond_tokens"].dtype if "cond_tokens" in cond else sem_tokens.dtype)
             if "ip_tokens" not in cond and "cond_tokens" not in cond:
                 raise KeyError("adapter output missing ip_tokens/cond_tokens")
             if "local_entry_tokens" not in cond and "cond_map" not in cond:
@@ -2669,7 +2855,7 @@ def main():
             accum_micro_steps += 1
 
             if accum_micro_steps == GRAD_ACCUM_STEPS:
-                log_critical_path_gradients(step + 1, pixart, adapter, None)
+                log_critical_path_gradients(step + 1, pixart, adapter, sem_adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -2740,6 +2926,8 @@ def main():
                     'ip_K': f"{16}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
                     'cond_map_std': f"{cond_map_std:.4f}",
+                    'sem_tok_std': f"{float((getattr(sem_adapter, '_last_sem_adapter_stats', {}) or {}).get('sem_tokens_postproj_std', 0.0)):.4f}",
+                    'sem_scale': f"{float((getattr(sem_adapter, '_last_sem_adapter_stats', {}) or {}).get('sem_out_scale', 0.0)):.3f}",
                     'cpu_rss_gb': f"{cpu_rss_gb:.3f}" if math.isfinite(cpu_rss_gb) else "nan",
                 }
                 log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
@@ -2778,13 +2966,15 @@ def main():
                     "ip_K": 16,
                     "adapter_map_std": adapter_map_std,
                     "cond_map_std": cond_map_std,
+                    "sem_tokens_std": float((getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}).get("sem_tokens_postproj_std", 0.0)),
+                    "sem_out_scale": float((getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}).get("sem_out_scale", 0.0)),
                     "cpu_rss_gb": (float(cpu_rss_gb) if math.isfinite(cpu_rss_gb) else float("nan")),
                     "train_prompt_cache_max_items": int(TRAIN_PROMPT_CACHE_MAX_ITEMS),
                     "val_prompt_cache_max_items": int(VAL_PROMPT_CACHE_MAX_ITEMS),
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
-            log_critical_path_gradients(step + 1, pixart, adapter, None)
+            log_critical_path_gradients(step + 1, pixart, adapter, sem_adapter)
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
             optimizer.zero_grad()
@@ -2801,7 +2991,7 @@ def main():
         if run_proxy_val:
             validation_count += 1
             print(f"🔎 [VAL] Raw weights (validation #{validation_count})")
-            val_raw = validate(epoch, pixart, adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="raw")
+            val_raw = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="raw")
 
             run_ema_val = (
                 (ema is not None)
@@ -2813,7 +3003,7 @@ def main():
             if run_ema_val:
                 print(f"🔎 [VAL] EMA weights (validation #{validation_count})")
                 ema.apply(ema_named_params)
-                val_ema = validate(epoch, pixart, adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="ema")
+                val_ema = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="ema")
                 ema.restore(ema_named_params)
 
             raw_metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
@@ -2845,6 +3035,7 @@ def main():
                 step,
                 pixart,
                 adapter,
+                sem_adapter,
                 optimizer,
                 best,
                 best_eval_metrics_this_round,
@@ -2865,6 +3056,7 @@ def main():
                 global_step=step,
                 pixart=pixart,
                 adapter=adapter,
+                sem_adapter=sem_adapter,
                 optimizer=optimizer,
                 best_records=best,
                 dl_gen=dl_gen,

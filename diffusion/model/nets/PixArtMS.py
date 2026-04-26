@@ -15,7 +15,7 @@ from timm.models.vision_transformer import Mlp
 
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint, to_2tuple
-from diffusion.model.nets.PixArt_blocks import t2i_modulate, CaptionEmbedder, AttentionKVCompress, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, SizeEmbedder
+from diffusion.model.nets.PixArt_blocks import t2i_modulate, CaptionEmbedder, AttentionKVCompress, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, SizeEmbedder, TokenCrossStreamConv, DecoupledImageTextCrossAttention
 from diffusion.model.nets.PixArt import PixArt, get_2d_sincos_pos_embed
 
 
@@ -52,8 +52,12 @@ class PixArtMSBlock(nn.Module):
     """
 
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0., input_size=None,
-                 sampling=None, sr_ratio=1, qk_norm=False, **block_kwargs):
+                 sampling=None, sr_ratio=1, qk_norm=False, block_id: int = -1, **block_kwargs):
         super().__init__()
+        self.block_id = int(block_id)
+        self.is_pixel_layer = False
+        self.is_lr_conv_layer = False
+        self.is_semantic_layer = False
         self.hidden_size = hidden_size
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = AttentionKVCompress(
@@ -62,7 +66,12 @@ class PixArtMSBlock(nn.Module):
         )
         self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
         self.lr_ip_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
-        self.lr_ip_gate = nn.Parameter(torch.full((1,), -6.0))
+        self.lr_stream_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.lr_cross_conv = TokenCrossStreamConv(hidden_size)
+        self.lr_ip_gate = nn.Parameter(torch.full((1,), -4.0))
+        self.lr_stream_gate = nn.Parameter(torch.full((1,), -4.0))
+        self.lr_cross_conv_gate = nn.Parameter(torch.full((1,), -4.0))
+        self.semantic_gate = nn.Parameter(torch.full((1,), -4.0))
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # to be compatible with lower version pytorch
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -71,6 +80,8 @@ class PixArtMSBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
         nn.init.constant_(self.lr_ip_attn.proj.weight, 0)
         nn.init.constant_(self.lr_ip_attn.proj.bias, 0)
+        nn.init.constant_(self.lr_stream_attn.proj.weight, 0)
+        nn.init.constant_(self.lr_stream_attn.proj.bias, 0)
         self._last_image_stats = None
 
     def forward(
@@ -81,7 +92,11 @@ class PixArtMSBlock(nn.Module):
         mask=None,
         HW=None,
         lr_ip_tokens=None,
+        lr_stream_tokens=None,
+        sem_tokens=None,
+        sem_scale=None,
         lr_ip_scale=None,
+        return_lr_stream=False,
         **kwargs,
     ):
         B, N, C = x.shape
@@ -93,21 +108,50 @@ class PixArtMSBlock(nn.Module):
         if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
             h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
         x_ca = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
-        x = x_ca + self.drop_path(self.cross_attn(x_ca, y, mask))
+        text_ctx_std = 0.0
+        sem_img_delta_std = 0.0
+        if isinstance(self.cross_attn, DecoupledImageTextCrossAttention):
+            img_gate = torch.sigmoid(self.semantic_gate).to(dtype=x.dtype)
+            if sem_scale is not None:
+                img_gate = img_gate * sem_scale.to(dtype=x.dtype)
+            x_attn, dec_stats = self.cross_attn(x_ca, y, image_cond=sem_tokens if self.is_semantic_layer else None, text_mask=mask, image_gate=img_gate)
+            x = x_ca + self.drop_path(x_attn)
+            text_ctx_std = float(dec_stats.get("text_ctx_std", 0.0))
+            sem_img_delta_std = float(dec_stats.get("img_delta_std", 0.0))
+        else:
+            x = x_ca + self.drop_path(self.cross_attn(x_ca, y, mask))
 
         lr_delta = torch.zeros_like(x)
         gate_val = torch.sigmoid(self.lr_ip_gate).to(dtype=x.dtype)
-        if lr_ip_tokens is not None:
+        stream_delta = torch.zeros_like(x)
+        conv_delta = torch.zeros_like(x)
+        if self.is_pixel_layer and (lr_stream_tokens is not None):
+            g_stream = torch.sigmoid(self.lr_stream_gate).to(dtype=x.dtype).view(1, 1, 1)
+            stream_delta = g_stream * self.lr_stream_attn(lr_stream_tokens, x, None)
+            lr_stream_tokens = lr_stream_tokens + self.drop_path(stream_delta)
+        if lr_ip_tokens is not None and (lr_stream_tokens is None):
+            lr_stream_tokens = lr_ip_tokens
+        if self.is_pixel_layer and (lr_stream_tokens is not None):
             if lr_ip_scale is not None:
                 gate_val = gate_val * lr_ip_scale.to(dtype=x.dtype)
-            lr_delta = gate_val.view(1, 1, 1) * self.lr_ip_attn(x, lr_ip_tokens, None)
+            lr_delta = gate_val.view(1, 1, 1) * self.lr_ip_attn(x, lr_stream_tokens, None)
             x = x + self.drop_path(lr_delta)
+        if self.is_lr_conv_layer and (lr_stream_tokens is not None):
+            g_conv = torch.sigmoid(self.lr_cross_conv_gate).to(dtype=x.dtype).view(1, 1, 1)
+            conv_delta = g_conv * self.lr_cross_conv(x, lr_stream_tokens, HW)
+            x = x + self.drop_path(conv_delta)
         self._last_image_stats = {
             "image_alpha_value": float(gate_val.detach().float().item()),
-            "text_ctx_std": 0.0,
+            "text_ctx_std": float(text_ctx_std),
             "img_delta_std": float(lr_delta.detach().float().std().item()),
+            "lr_stream_delta_std": float(stream_delta.detach().float().std().item()),
+            "lr_conv_delta_std": float(conv_delta.detach().float().std().item()),
+            "semantic_img_delta_std": float(sem_img_delta_std),
+            "semantic_gate": float(torch.sigmoid(self.semantic_gate.detach()).item()),
         }
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
+        if return_lr_stream:
+            return x, lr_stream_tokens
         return x
 
 
@@ -187,6 +231,7 @@ class PixArtMS(PixArt):
                 sampling=kv_compress_config['sampling'],
                 sr_ratio=int(kv_compress_config['scale_factor']) if i in kv_compress_config['kv_compress_layer'] else 1,
                 qk_norm=qk_norm,
+                block_id=i,
             )
             for i in range(depth)
         ])
@@ -314,6 +359,13 @@ class PixArtMS(PixArt):
             if hasattr(block, "lr_ip_attn"):
                 nn.init.constant_(block.lr_ip_attn.proj.weight, 0)
                 nn.init.constant_(block.lr_ip_attn.proj.bias, 0)
+            if hasattr(block, "lr_stream_attn"):
+                nn.init.constant_(block.lr_stream_attn.proj.weight, 0)
+                nn.init.constant_(block.lr_stream_attn.proj.bias, 0)
+            if hasattr(block, "lr_cross_conv"):
+                nn.init.constant_(block.lr_cross_conv.dw.weight, 0)
+                if block.lr_cross_conv.dw.bias is not None:
+                    nn.init.constant_(block.lr_cross_conv.dw.bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.linear.weight, 0)

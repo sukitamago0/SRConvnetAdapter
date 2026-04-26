@@ -112,6 +112,26 @@ def zero_module(module: nn.Module):
     return module
 
 
+class TokenCrossStreamConv(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.dw = zero_module(nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1, groups=hidden_size, bias=True))
+        self.pw = nn.Conv2d(hidden_size, hidden_size, kernel_size=1, padding=0, bias=True)
+
+    def forward(self, x: torch.Tensor, lr_tokens: torch.Tensor, HW):
+        b, n, c = x.shape
+        h, w = int(HW[0]), int(HW[1])
+        if n != h * w:
+            raise RuntimeError(f"TokenCrossStreamConv got N={n}, but H*W={h*w}")
+        base = self.norm(x)
+        lr = self.norm(lr_tokens)
+        delta = (lr - base).transpose(1, 2).reshape(b, c, h, w)
+        delta = self.dw(delta)
+        delta = self.pw(delta)
+        return delta.flatten(2).transpose(1, 2).contiguous()
+
+
 class DecoupledImageTextCrossAttention(nn.Module):
     def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0.):
         super().__init__()

@@ -28,6 +28,7 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
 from diffusion.model.nets.adapter_cond import mask_adapter_cond
 
@@ -497,6 +498,12 @@ def build_model_and_assets(args, device, compute_dtype):
         pixart.load_pretrained_weights_with_zero_init(base)
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+    pixart.enable_sr_conditioning_layers(
+        pixel_layers=list(layer_cfg.get("pixel_layers", layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7]))),
+        lr_conv_layers=list(layer_cfg.get("lr_conv_layers", layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7]))),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
+        init_gate=-4.0,
+    )
 
     has_dual_lora = any(
         ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
@@ -515,7 +522,7 @@ def build_model_and_assets(args, device, compute_dtype):
             pixel_alpha=float(layer_cfg.get("pixel_lora_alpha", lora_alpha)),
             semantic_alpha=float(layer_cfg.get("semantic_lora_alpha", lora_alpha)),
         )
-        set_dual_lora_scales(pixart, lambda_pix=1.0, lambda_sem=1.0)
+        set_dual_lora_scales(pixart, lambda_pix=float(args.lambda_pix), lambda_sem=float(args.lambda_sem))
 
     load_state_dict_shape_compatible(pixart, pixart_state, context="eval")
 
@@ -547,6 +554,14 @@ def build_model_and_assets(args, device, compute_dtype):
         hidden_size=1152,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=args.semantic_encoder_name_or_path,
+        hidden_size=1152,
+        num_prompt_tokens=16,
+    ).to(device).eval()
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
+    if (not bool(args.disable_semantic_branch)) and isinstance(sem_adapter_sd, dict):
+        load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="eval-sem-adapter")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -569,11 +584,12 @@ def build_model_and_assets(args, device, compute_dtype):
 
     pixart.eval()
     adapter.eval()
-    return pixart, adapter, vae, null_pack, scheduler
+    sem_adapter.eval()
+    return pixart, adapter, sem_adapter, vae, null_pack, scheduler
 
 
 @torch.no_grad()
-def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem):
+def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem):
     hr = batch["hr"].to(device)
     lr = batch["lr"].to(device)
     lr_small = batch["lr_small"].to(device)
@@ -611,6 +627,8 @@ def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, de
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
+            if not bool(args.disable_semantic_branch):
+                cond["sem_tokens"] = sem_adapter(((adapter_in.clamp(-1, 1) + 1.0) * 0.5).float())
             if "ip_tokens" not in cond and "cond_tokens" not in cond:
                 raise KeyError("adapter output missing ip_tokens/cond_tokens")
             if "local_entry_tokens" not in cond and "cond_map" not in cond:
@@ -743,7 +761,7 @@ def nanmean(xs):
     return float(sum(vals) / len(vals))
 
 
-def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype):
+def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype):
     base_out = Path(args.output_dir) / dataset_name
     preds_dir = base_out / "preds"
     trip_dir = base_out / "triptychs"
@@ -764,7 +782,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.max_samples > 0 and idx >= args.max_samples:
             break
 
-        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem)
+        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem)
         m = metric_suite.compute(pred, hr)
         m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
         m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
@@ -975,6 +993,10 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--sft_strength", type=float, default=1.0)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
+    parser.add_argument("--semantic-encoder-name-or-path", type=str, default="openai/clip-vit-large-patch14")
+    parser.add_argument("--lambda-pix", type=float, default=1.0)
+    parser.add_argument("--lambda-sem", type=float, default=1.0)
+    parser.add_argument("--disable-semantic-branch", action="store_true")
 
     parser.add_argument("--output_dir", type=str, default="/home/hello/HJT/SRConvnetAdapter/experiments_results")
     parser.add_argument("--save_preds", dest="save_preds", action="store_true")
@@ -1004,19 +1026,19 @@ def main():
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    pixart, adapter, vae, null_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
+    pixart, adapter, sem_adapter, vae, null_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
     metric_suite = MetricSuite()
 
     paper_rows = []
     if args.dataset in ("realsr", "both"):
         realsr_ds = RealSRValPairedDataset(roots=args.realsr_roots, crop_size=args.crop_size)
         realsr_loader = DataLoader(realsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype))
+        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype))
 
     if args.dataset in ("drealsr", "both"):
         drealsr_ds = DRealSRPairedDataset(args.drealsr_hr_dir, args.drealsr_lr_dir, crop_size=args.crop_size)
         drealsr_loader = DataLoader(drealsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype))
+        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype))
 
     if args.dataset == "both" and len(paper_rows) > 0:
         ckpt_name = Path(args.ckpt_path).stem
