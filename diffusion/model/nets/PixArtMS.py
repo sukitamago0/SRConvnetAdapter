@@ -311,6 +311,9 @@ class PixArtMS(PixArt):
         for block in self.blocks:
             nn.init.constant_(block.cross_attn.proj.weight, 0)
             nn.init.constant_(block.cross_attn.proj.bias, 0)
+            if hasattr(block, "lr_ip_attn"):
+                nn.init.constant_(block.lr_ip_attn.proj.weight, 0)
+                nn.init.constant_(block.lr_ip_attn.proj.bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.linear.weight, 0)

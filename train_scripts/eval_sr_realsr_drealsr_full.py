@@ -28,9 +28,12 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
+from diffusion.model.nets.adapter_cond import mask_adapter_cond
 
 USE_ADAPTIVE_TEXT_PROMPT = True
 ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
+STRICT_ADAPTIVE_PROMPT = bool(int(os.getenv("STRICT_ADAPTIVE_PROMPT", "0")))
 
 
 
@@ -246,77 +249,6 @@ def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context
     if len(skipped) > 0:
         print(f"[{context}] skipped examples: {skipped[:5]}")
     return missing, unexpected, skipped
-
-
-def infer_lora_rank_from_state_dict(state_dict: dict):
-    """
-    Infer LoRA rank from saved lora_A / lora_B tensors.
-    Returns int or None.
-    """
-    if not isinstance(state_dict, dict):
-        return None
-
-    for k, v in state_dict.items():
-        if not torch.is_tensor(v):
-            continue
-        if "lora_A" in k and v.ndim == 2:
-            return int(v.shape[0])
-        if "lora_B" in k and v.ndim == 2:
-            return int(v.shape[1])
-    return None
-
-
-
-def _block_id_from_name(name: str):
-    m = re.search(r"blocks\.(\d+)\.", name)
-    return int(m.group(1)) if m else None
-
-
-def _lora_target_kind(module_name: str):
-    if ("attn.qkv" in module_name) or ("attn.proj" in module_name):
-        return "attn"
-    return None
-
-
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, r: int, alpha: float):
-        super().__init__()
-        self.base = base
-        self.scaling = alpha / r
-        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
-        self.lora_A.to(base.weight.device)
-        self.lora_B.to(base.weight.device)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-        self.base.weight.requires_grad = False
-        if self.base.bias is not None:
-            self.base.bias.requires_grad = False
-
-    def forward(self, x):
-        out = self.base(x)
-        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
-        return out + delta.to(out.dtype)
-
-
-def apply_lora(model, lora_rank: int = 4, lora_alpha: float = 4.0):
-    cnt = 0
-    for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear):
-            continue
-        block_id = _block_id_from_name(name)
-        if block_id is None:
-            continue
-        kind = _lora_target_kind(name)
-        if kind is None:
-            continue
-        if not (0 <= block_id <= 27):
-            continue
-        parent = model.get_submodule(name.rsplit('.', 1)[0])
-        child = name.rsplit('.', 1)[1]
-        setattr(parent, child, LoRALinear(module, int(lora_rank), alpha=float(lora_alpha)))
-        cnt += 1
-    print(f"✅ Attention LoRA applied to {cnt} layers (rank={int(lora_rank)}, alpha={float(lora_alpha)}).")
 
 
 class RealSRValPairedDataset(Dataset):
@@ -566,29 +498,24 @@ def build_model_and_assets(args, device, compute_dtype):
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
 
-    has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in pixart_state.keys())
+    has_dual_lora = any(
+        ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
+        for k in pixart_state.keys()
+    )
+    dual_lora = bool(layer_cfg.get("dual_lora", False)) or has_dual_lora
+    lora_rank = int(layer_cfg.get("pixel_lora_rank", ckpt.get("lora_rank", cfg.get("lora_rank", 4))))
+    lora_alpha = float(layer_cfg.get("pixel_lora_alpha", ckpt.get("lora_alpha", cfg.get("lora_alpha", 4.0))))
 
-    lora_rank = ckpt.get("lora_rank", None)
-    if lora_rank is None:
-        lora_rank = cfg.get("lora_rank", None)
-    if lora_rank is None and has_lora:
-        lora_rank = infer_lora_rank_from_state_dict(pixart_state)
-    if lora_rank is None:
-        lora_rank = 4
-    lora_rank = int(lora_rank)
-
-    lora_alpha = ckpt.get("lora_alpha", None)
-    if lora_alpha is None:
-        lora_alpha = cfg.get("lora_alpha", None)
-    if lora_alpha is None and has_lora:
-        lora_alpha = float(lora_rank)
-    if lora_alpha is None:
-        lora_alpha = 4.0
-    lora_alpha = float(lora_alpha)
-
-    print(f"[Eval-Model] has_lora={has_lora} lora_rank={lora_rank} lora_alpha={lora_alpha}")
-    if has_lora:
-        apply_lora(pixart, lora_rank=lora_rank, lora_alpha=lora_alpha)
+    print(f"[Eval-Model] dual_lora={dual_lora} lora_rank={lora_rank} lora_alpha={lora_alpha}")
+    if dual_lora:
+        apply_dual_lora(
+            pixart,
+            pixel_rank=int(layer_cfg.get("pixel_lora_rank", lora_rank)),
+            semantic_rank=int(layer_cfg.get("semantic_lora_rank", lora_rank)),
+            pixel_alpha=float(layer_cfg.get("pixel_lora_alpha", lora_alpha)),
+            semantic_alpha=float(layer_cfg.get("semantic_lora_alpha", lora_alpha)),
+        )
+        set_dual_lora_scales(pixart, lambda_pix=1.0, lambda_sem=1.0)
 
     load_state_dict_shape_compatible(pixart, pixart_state, context="eval")
 
@@ -596,7 +523,7 @@ def build_model_and_assets(args, device, compute_dtype):
     skipped_lora_keys = []
 
     for k, v in pixart_state.items():
-        if ("lora_A" in k) or ("lora_B" in k):
+        if ("pixel_lora_" in k) or ("semantic_lora_" in k):
             curr = pixart.state_dict()
             if k in curr and tuple(curr[k].shape) == tuple(v.shape):
                 loaded_lora_keys.append(k)
@@ -605,11 +532,11 @@ def build_model_and_assets(args, device, compute_dtype):
 
     print(
         f"[LoRA Eval] requested rank={lora_rank}, alpha={lora_alpha}, "
-        f"saved_lora_tensors={len([k for k in pixart_state if ('lora_A' in k) or ('lora_B' in k)])}, "
+        f"saved_lora_tensors={len([k for k in pixart_state if ('pixel_lora_' in k) or ('semantic_lora_' in k)])}, "
         f"shape_compatible={len(loaded_lora_keys)}, skipped={len(skipped_lora_keys)}"
     )
 
-    if has_lora and len(loaded_lora_keys) == 0:
+    if dual_lora and len(loaded_lora_keys) == 0:
         raise RuntimeError(
             "Checkpoint contains LoRA weights, but none of them are shape-compatible with the eval model. "
             "This usually means the eval script rebuilt LoRA with the wrong rank/alpha."
@@ -695,11 +622,12 @@ def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, de
                 prompt_packs, prompt_cache_hit_rate, avg_prompt_token_count, avg_prompt_nonpad_ratio = load_adaptive_prompt_batch(
                     sample_keys, ADAPTIVE_PROMPT_CACHE_ROOT, prompt_cache_mem
                 )
-                if not all(p is not None for p in prompt_packs):
+                if (not all(p is not None for p in prompt_packs)) and STRICT_ADAPTIVE_PROMPT:
                     num_missing = int(sum(1 for p in prompt_packs if p is None))
                     raise RuntimeError(f"Adaptive prompt cache miss during full-eval: missing={num_missing}/{len(prompt_packs)}")
-                y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(device)
-                mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(device)
+                merged_packs = [p if p is not None else null_pack for p in prompt_packs]
+                y_cond = torch.cat([p["y"] for p in merged_packs], dim=0).to(device)
+                mask_cond = torch.cat([p["mask"] for p in merged_packs], dim=0).to(device)
             y_uncond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_uncond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
@@ -762,8 +690,11 @@ def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, de
         "cond_map_std": float(cond["cond_map"].detach().float().std().item()),
         "lr_cond_token_std": float(cond["cond_tokens"].detach().float().std().item()),
         "lr_cross_text_ctx_std": float(image_stats.get("lr_cross_text_ctx_std", 0.0)),
-        "lr_cross_img_delta_std": float(image_stats.get("lr_cross_img_delta_std", 0.0)),
-        "avg_image_alpha": float(image_stats.get("avg_image_alpha", 0.0)),
+        "lr_ip_attn_delta_std_mean": float(image_stats.get("lr_ip_attn_delta_std_mean", 0.0)),
+        "lr_stream_delta_std_mean": float(image_stats.get("lr_stream_delta_std_mean", 0.0)),
+        "lr_conv_delta_std_mean": float(image_stats.get("lr_conv_delta_std_mean", 0.0)),
+        "semantic_gate_mean": float(image_stats.get("semantic_gate_mean", 0.0)),
+        "semantic_img_delta_std_mean": float(image_stats.get("semantic_img_delta_std_mean", 0.0)),
         "local_entry_gate": float(sft_stats.get("local_entry_gate", 0.0)),
         "text_cond_delta": float(sum(text_cond_delta_vals) / max(1, len(text_cond_delta_vals))),
         "prompt_cache_hit_rate": float(prompt_cache_hit_rate),

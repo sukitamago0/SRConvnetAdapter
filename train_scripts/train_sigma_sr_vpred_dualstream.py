@@ -48,6 +48,8 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
+from diffusion.model.nets.adapter_cond import mask_adapter_cond
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -63,8 +65,10 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "lr_ip_gate",
     "local_entry_proj",
     "local_entry_gate",
-    "lora_A",
-    "lora_B",
+    "pixel_lora_A",
+    "pixel_lora_B",
+    "semantic_lora_A",
+    "semantic_lora_B",
 )
 FP32_SAVE_KEY_FRAGMENTS = ACTIVE_PIXART_KEY_FRAGMENTS
 FINAL_LAYER_KEYWORD = "final_layer"
@@ -696,55 +700,6 @@ def assert_strict_tala_configuration():
     if bad:
         raise RuntimeError(f"Strict TALA violation: banned legacy tokens still present: {bad}")
 
-def mask_adapter_cond(cond, keep_mask: torch.Tensor):
-    if cond is None:
-        return None
-    if not torch.is_tensor(keep_mask):
-        keep_mask = torch.tensor(keep_mask)
-
-    def _find_device_dtype(x):
-        if torch.is_tensor(x):
-            return x.device, x.dtype
-        if isinstance(x, dict):
-            for v in x.values():
-                found = _find_device_dtype(v)
-                if found is not None:
-                    return found
-        if isinstance(x, (list, tuple)):
-            for item in x:
-                found = _find_device_dtype(item)
-                if found is not None:
-                    return found
-        return None
-
-    found = _find_device_dtype(cond)
-    if found is None:
-        return cond
-
-    dev, _ = found
-    keep_mask = keep_mask.to(device=dev, dtype=torch.float32)
-
-    def _mask_tensor(x: torch.Tensor):
-        m = keep_mask
-        while m.ndim < x.ndim:
-            m = m.unsqueeze(-1)
-        return x * m.to(dtype=x.dtype)
-
-    def _mask_obj(x):
-        if torch.is_tensor(x):
-            return _mask_tensor(x)
-        if isinstance(x, dict):
-            return {k: _mask_obj(v) for k, v in x.items()}
-        if isinstance(x, list):
-            return [_mask_obj(v) for v in x]
-        if isinstance(x, tuple):
-            return tuple(_mask_obj(v) for v in x)
-        return x
-
-    return _mask_obj(cond)
-
-
-
 def file_sha256(path):
     sha = hashlib.sha256()
     with open(path, "rb") as f:
@@ -1361,51 +1316,15 @@ class RealSR_Val_Paired_Dataset(Dataset):
 
 
 # ================= 7. LoRA =================
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, r: int, alpha: float):
-        super().__init__()
-        self.base = base; self.scaling = alpha / r
-        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
-        self.lora_A.to(base.weight.device); self.lora_B.to(base.weight.device)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5)); nn.init.zeros_(self.lora_B.weight)
-        self.base.weight.requires_grad = False
-        if self.base.bias is not None: self.base.bias.requires_grad = False
-    def forward(self, x):
-        out = self.base(x)
-        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
-        return out + delta.to(out.dtype)
-
-def _block_id_from_name(name: str):
-    m = re.search(r"blocks\.(\d+)\.", name)
-    return int(m.group(1)) if m else None
-
-
-def _lora_target_kind(module_name: str):
-    if ("attn.qkv" in module_name) or ("attn.proj" in module_name):
-        return "attn"
-    return None
-
-
 def apply_lora(model):
-    cnt = 0
-    for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear):
-            continue
-        block_id = _block_id_from_name(name)
-        if block_id is None:
-            continue
-        kind = _lora_target_kind(name)
-        if kind is None:
-            continue
-        if not (0 <= block_id <= 27):
-            continue
-        rank = int(LORA_RANK)
-        parent = model.get_submodule(name.rsplit('.', 1)[0])
-        child = name.rsplit('.', 1)[1]
-        setattr(parent, child, LoRALinear(module, rank, alpha=float(LORA_ALPHA)))
-        cnt += 1
-    print(f"✅ Attention LoRA applied to {cnt} layers (rank={LORA_RANK}, alpha={LORA_ALPHA}).")
+    cnt = apply_dual_lora(
+        model,
+        pixel_rank=int(LORA_RANK),
+        semantic_rank=int(LORA_RANK),
+        pixel_alpha=float(LORA_ALPHA),
+        semantic_alpha=float(LORA_ALPHA),
+    )
+    print(f"✅ Dual LoRA applied to {cnt} layers (pixel_rank={LORA_RANK}, semantic_rank={LORA_RANK}).")
 
 
 def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False):
@@ -1416,8 +1335,10 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for name, p in pixart.named_parameters():
         if (
             "final_layer" in name
-            or "lora_A" in name
-            or "lora_B" in name
+            or "pixel_lora_A" in name
+            or "pixel_lora_B" in name
+            or "semantic_lora_A" in name
+            or "semantic_lora_B" in name
             or "lr_ip_proj" in name
             or "lr_ip_attn" in name
             or "lr_ip_gate" in name
@@ -1436,10 +1357,8 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             if ".base.weight" in n or ".base.bias" in n:
                 p.requires_grad_(False)
                 continue
-            if ("lora_A" in n) or ("lora_B" in n):
-                bid = _block_id_from_name(n)
-                kind = _lora_target_kind(n)
-                p.requires_grad_(bool(bid is not None and 0 <= bid <= 27 and kind == "attn"))
+            if ("pixel_lora_" in n) or ("semantic_lora_" in n):
+                p.requires_grad_(True)
 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
@@ -1472,7 +1391,7 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if ("lora_A" in n) or ("lora_B" in n):
+        if ("pixel_lora_" in n) or ("semantic_lora_" in n):
             lora_params.append(p)
         else:
             ip_control_params.append(p)
@@ -1503,18 +1422,25 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
     return optimizer, params_to_clip, group_counts
 
 
-def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module):
-    if step > 200 or (step % 50 != 0):
+def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module = None):
+    if step > 300 or (step % 50 != 0):
         return
     pix_named = dict(pixart.named_parameters())
     ad_named = dict(adapter.named_parameters())
+    sem_named = dict(sem_adapter.named_parameters()) if sem_adapter is not None else {}
+    first_pixel_lora_B = next((p for n, p in pixart.named_parameters() if "pixel_lora_B.weight" in n), None)
+    first_sem_lora_B = next((p for n, p in pixart.named_parameters() if "semantic_lora_B.weight" in n), None)
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.lr_ip_proj.weight", pix_named.get("lr_ip_proj.weight", None)),
-        ("pixart.lr_ip_gate", pix_named.get("lr_ip_gate", None)),
+        ("pixart.blocks.0.lr_ip_attn.proj.weight", pix_named.get("blocks.0.lr_ip_attn.proj.weight", None)),
+        ("pixart.blocks.20.cross_attn.img_residual_linear.weight", pix_named.get("blocks.20.cross_attn.img_residual_linear.weight", None)),
+        ("pixart.blocks.20.cross_attn.k_img_linear.weight", pix_named.get("blocks.20.cross_attn.k_img_linear.weight", None)),
+        ("pixart.first_pixel_lora_B.weight", first_pixel_lora_B),
+        ("pixart.first_semantic_lora_B.weight", first_sem_lora_B),
         ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
-        ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
-        ("adapter.to32.1.weight", ad_named.get("to32.1.weight", None)),
+        ("sem_adapter.proj.weight", sem_named.get("proj.weight", None)),
+        ("sem_adapter.resampler.latents", sem_named.get("resampler.latents", None)),
     ]
     msg = [f"[GradSanity][step={step}]"]
     warnings = []
@@ -1529,6 +1455,8 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
             warnings.append(name)
     print(" | ".join(msg))
     if warnings:
+        if step > 100:
+            raise RuntimeError(f"[GradSanity] near-zero grad on critical paths: {warnings}")
         print(f"⚠️ [GradSanity] near-zero grad on critical paths: {warnings}")
 
 
@@ -1650,7 +1578,10 @@ def save_smart(
         pixart_sd = collect_trainable_state_dict(pixart)
         required_frags = get_required_active_key_fragments_for_model(pixart)
         active_key_counts = validate_active_trainable_state_keys(pixart_sd, required_frags)
-        lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
+        lora_key_count = sum(
+            ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
+            for k in pixart_sd.keys()
+        )
         if ENABLE_LORA and lora_key_count == 0:
             raise RuntimeError("LoRA is enabled but no LoRA keys found in pixart_trainable.")
         if lora_key_count == 0:
@@ -1701,6 +1632,11 @@ def save_smart(
                 "tala_max_ratio": float(TALA_TRAIN_MAX_RATIO),
                 "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
                 "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
+                "dual_lora": bool(ENABLE_LORA),
+                "pixel_lora_rank": int(LORA_RANK),
+                "semantic_lora_rank": int(LORA_RANK),
+                "pixel_lora_alpha": float(LORA_ALPHA),
+                "semantic_lora_alpha": float(LORA_ALPHA),
                 "ckpt_select_mode": str(CKPT_SELECT_MODE),
                 "ckpt_select_psnr_gate": float(CKPT_SELECT_PSNR_GATE),
                 "gate_passed_when_saved": bool(gate_passed),
@@ -1712,7 +1648,10 @@ def save_smart(
         pixart_sd = collect_trainable_state_dict(pixart)
         required_frags = get_required_active_key_fragments_for_model(pixart)
         active_key_counts = validate_active_trainable_state_keys(pixart_sd, required_frags)
-        lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
+        lora_key_count = sum(
+            ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
+            for k in pixart_sd.keys()
+        )
         if ENABLE_LORA and lora_key_count == 0:
             raise RuntimeError("LoRA is enabled but no LoRA keys found in pixart_trainable.")
         if lora_key_count == 0:
@@ -1754,6 +1693,11 @@ def save_smart(
                 "tala_max_ratio": float(TALA_TRAIN_MAX_RATIO),
                 "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
                 "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
+                "dual_lora": bool(ENABLE_LORA),
+                "pixel_lora_rank": int(LORA_RANK),
+                "semantic_lora_rank": int(LORA_RANK),
+                "pixel_lora_alpha": float(LORA_ALPHA),
+                "semantic_lora_alpha": float(LORA_ALPHA),
                 "ckpt_select_mode": str(CKPT_SELECT_MODE),
                 "ckpt_select_psnr_gate": float(CKPT_SELECT_PSNR_GATE),
                 "gate_passed_when_saved": bool(gate_passed),
@@ -1873,6 +1817,11 @@ def save_last_resume_only(
             "tala_max_ratio": float(TALA_TRAIN_MAX_RATIO),
             "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
             "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
+            "dual_lora": bool(ENABLE_LORA),
+            "pixel_lora_rank": int(LORA_RANK),
+            "semantic_lora_rank": int(LORA_RANK),
+            "pixel_lora_alpha": float(LORA_ALPHA),
+            "semantic_lora_alpha": float(LORA_ALPHA),
             "ckpt_select_mode": str(CKPT_SELECT_MODE),
             "ckpt_select_psnr_gate": float(CKPT_SELECT_PSNR_GATE),
             "gate_passed_when_saved": False,
@@ -2096,12 +2045,12 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
                         prompt_hit_rates.append(hit_rate)
                         prompt_tok_counts.append(tok_cnt)
                         prompt_nonpad_ratios.append(nonpad_ratio)
-                        if not all(p is not None for p in prompt_packs):
-                            if STRICT_ADAPTIVE_PROMPT:
-                                missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
-                                raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
-                        y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(DEVICE)
-                        y_mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
+                        if not all(p is not None for p in prompt_packs) and STRICT_ADAPTIVE_PROMPT:
+                            missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
+                            raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
+                        merged_packs = [p if p is not None else null_pack for p in prompt_packs]
+                        y_cond = torch.cat([p["y"] for p in merged_packs], dim=0).to(DEVICE)
+                        y_mask_cond = torch.cat([p["mask"] for p in merged_packs], dim=0).to(DEVICE)
                     y_uncond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_uncond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     out_uncond = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
@@ -2117,9 +2066,9 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
                     ip_pre_stds.append(0.0)
                     ip_post_stds.append(0.0)
                     ip_out_scales.append(0.0)
-                    ip_stats = getattr(pixart, "_last_image_cond_stats", {}) or {}
-                    ip_out_stds.append(float(ip_stats.get("lr_cross_img_delta_std", 0.0)))
-                    ip_alphas.append(float(ip_stats.get("avg_image_alpha", 0.0)))
+                    ip_stats = getattr(pixart, "_last_image_stats", {}) or {}
+                    ip_out_stds.append(float(ip_stats.get("lr_ip_attn_delta_std_mean", 0.0)))
+                    ip_alphas.append(float(ip_stats.get("semantic_gate_mean", 0.0)))
 
                     sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                     tasr_gate_means.append(float(sft_stats.get("tasr_gate_mean", 0.0)))
@@ -2288,6 +2237,7 @@ def main():
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
     if ENABLE_LORA:
         apply_lora(pixart)
+        set_dual_lora_scales(pixart, lambda_pix=1.0, lambda_sem=1.0)
     else:
         print("ℹ️ LoRA disabled.")
     pixart.train()
@@ -2487,15 +2437,7 @@ def main():
             cond_in = cond
             cond_drop_prob = float(COND_DROP_PROB)
             if USE_ADAPTER_CFDROPOUT and torch.rand(1, device=DEVICE).item() < cond_drop_prob:
-                cond_in = dict(cond)
-                if "ip_tokens" in cond_in:
-                    cond_in["ip_tokens"] = torch.zeros_like(cond_in["ip_tokens"])
-                if "cond_tokens" in cond_in:
-                    cond_in["cond_tokens"] = torch.zeros_like(cond_in["cond_tokens"])
-                if "local_entry_tokens" in cond_in:
-                    cond_in["local_entry_tokens"] = torch.zeros_like(cond_in["local_entry_tokens"])
-                if "cond_map" in cond_in:
-                    cond_in["cond_map"] = torch.zeros_like(cond_in["cond_map"])
+                cond_in = mask_adapter_cond(cond, torch.zeros((zt_in.shape[0],), device=DEVICE))
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 # conditional prompt source = adaptive cache (if enabled); unconditional prompt source = null prompt.
@@ -2512,13 +2454,12 @@ def main():
                         prompt_cache_mem,
                         max_cache_items=TRAIN_PROMPT_CACHE_MAX_ITEMS,
                     )
-                    if not all(p is not None for p in prompt_packs):
-                        if STRICT_ADAPTIVE_PROMPT:
-                            missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
-                            raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
-                    else:
-                        y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(DEVICE)
-                        y_mask = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
+                    if not all(p is not None for p in prompt_packs) and STRICT_ADAPTIVE_PROMPT:
+                        missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
+                        raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
+                    merged_packs = [p if p is not None else null_pack for p in prompt_packs]
+                    y_cond = torch.cat([p["y"] for p in merged_packs], dim=0).to(DEVICE)
+                    y_mask = torch.cat([p["mask"] for p in merged_packs], dim=0).to(DEVICE)
                 drop_cond = torch.zeros(zt_in.shape[0], device=DEVICE, dtype=torch.long)
                 sft_strength = get_sft_strength(epoch + 1)
                 kwargs = dict(
@@ -2597,11 +2538,30 @@ def main():
                             force_drop_ids=drop_cond,
                             sft_strength=sft_strength,
                         ).float()
+                        out_same_text_no_adapter = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_zero_guard,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
                     assert_finite_tensor("out_uncond", out_uncond_guard, guard_stats)
                     cond_delta_curr = float((model_pred.detach() - out_uncond_guard).abs().mean().item())
                     text_cond_delta_curr = float((model_pred.detach() - out_text_null_guard).abs().mean().item())
+                    adapter_delta_same_text = float((model_pred.detach() - out_same_text_no_adapter).abs().mean().item())
                     last_cond_delta_curr = cond_delta_curr
                     last_text_cond_delta_curr = text_cond_delta_curr
+                    guard_stats["adapter_delta_same_text"] = adapter_delta_same_text
+                    if step > 100:
+                        image_stats = getattr(pixart, "_last_image_stats", {}) or {}
+                        if adapter_delta_same_text <= 1e-6:
+                            raise RuntimeError("adapter_delta_same_text is zero; adapter path is likely dead.")
+                        if float(image_stats.get("lr_ip_attn_delta_std_mean", 0.0)) <= 1e-8:
+                            raise RuntimeError("lr_ip_attn_delta_std_mean is zero; LR attention path is likely dead.")
                 else:
                     cond_delta_curr = float(last_cond_delta_curr)
                     text_cond_delta_curr = float(last_text_cond_delta_curr)
@@ -2613,15 +2573,22 @@ def main():
                 gamma = 5.0
                 min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
                 loss_weights = min_snr_gamma / snr
-                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1, 2, 3]) * loss_weights).mean()
+                pixel_loss_weight = batch.get("pixel_loss_weight", None)
+                if pixel_loss_weight is None:
+                    pixel_loss_weight = torch.ones((zh.shape[0],), device=DEVICE, dtype=torch.float32)
+                else:
+                    pixel_loss_weight = pixel_loss_weight.to(DEVICE, dtype=torch.float32).view(-1)
+                mse_per = F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1, 2, 3])
+                loss_v = (mse_per * loss_weights * pixel_loss_weight).sum() / pixel_loss_weight.sum().clamp_min(1.0)
 
                 # Reconstruct x0 for other losses (x0 = alpha * zt_in - sigma * v)
                 z0 = alpha_t * zt_in.float() - sigma_t * model_pred
 
                 latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
                 latent_l1_mask = (t >= int(LATENT_L1_T_MIN)).float()
-                if float(latent_l1_mask.sum().item()) > 0:
-                    loss_latent_l1 = (latent_l1_per * latent_l1_mask).sum() / latent_l1_mask.sum().clamp_min(1.0)
+                latent_w = latent_l1_mask * pixel_loss_weight
+                if float(latent_w.sum().item()) > 0:
+                    loss_latent_l1 = (latent_l1_per * latent_w).sum() / latent_w.sum().clamp_min(1.0)
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
@@ -2702,7 +2669,7 @@ def main():
             accum_micro_steps += 1
 
             if accum_micro_steps == GRAD_ACCUM_STEPS:
-                log_critical_path_gradients(step + 1, pixart, adapter)
+                log_critical_path_gradients(step + 1, pixart, adapter, None)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -2817,7 +2784,7 @@ def main():
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
-            log_critical_path_gradients(step + 1, pixart, adapter)
+            log_critical_path_gradients(step + 1, pixart, adapter, None)
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
             optimizer.zero_grad()

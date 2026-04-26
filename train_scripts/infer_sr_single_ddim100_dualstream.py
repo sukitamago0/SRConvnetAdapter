@@ -1,6 +1,5 @@
 import os
 import sys
-import math
 import argparse
 from pathlib import Path
 
@@ -17,6 +16,8 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
+from diffusion.model.nets.adapter_cond import mask_adapter_cond
 
 
 def randn_like_with_generator(tensor, generator):
@@ -42,89 +43,6 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
 
 def build_adapter_struct_input(lr_small_m11: torch.Tensor) -> torch.Tensor:
     return lr_small_m11.float().clamp(-1.0, 1.0)
-
-def mask_adapter_cond(cond, keep_mask: torch.Tensor):
-    if cond is None:
-        return None
-    if not torch.is_tensor(keep_mask):
-        keep_mask = torch.tensor(keep_mask)
-
-    def _find_device_dtype(x):
-        if torch.is_tensor(x):
-            return x.device, x.dtype
-        if isinstance(x, (list, tuple)):
-            for item in x:
-                found = _find_device_dtype(item)
-                if found is not None:
-                    return found
-        return None
-
-    found = _find_device_dtype(cond)
-    if found is None:
-        return cond
-    dev, _ = found
-    keep_mask = keep_mask.to(device=dev, dtype=torch.float32)
-
-    def _mask(x: torch.Tensor):
-        m = keep_mask
-        while m.ndim < x.ndim:
-            m = m.unsqueeze(-1)
-        return x * m.to(dtype=x.dtype)
-
-    if torch.is_tensor(cond):
-        return _mask(cond)
-    if isinstance(cond, dict):
-        return {k: (_mask(v) if torch.is_tensor(v) else v) for k, v in cond.items()}
-    if isinstance(cond, (list, tuple)):
-        if len(cond) == 2 and isinstance(cond[0], list) and torch.is_tensor(cond[1]):
-            spatial = [_mask(c) for c in cond[0]]
-            style = _mask(cond[1])
-            return (spatial, style)
-        masked = []
-        for c in cond:
-            if torch.is_tensor(c):
-                masked.append(_mask(c))
-            elif isinstance(c, list):
-                masked.append([_mask(ci) if torch.is_tensor(ci) else ci for ci in c])
-            else:
-                masked.append(c)
-        return masked if isinstance(cond, list) else tuple(masked)
-    return cond
-
-
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, r: int, alpha: float):
-        super().__init__()
-        self.base = base
-        self.scaling = alpha / r
-        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
-        self.lora_A.to(base.weight.device)
-        self.lora_B.to(base.weight.device)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-        self.base.weight.requires_grad = False
-        if self.base.bias is not None:
-            self.base.bias.requires_grad = False
-
-    def forward(self, x):
-        out = self.base(x)
-        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
-        return out + delta.to(out.dtype)
-
-
-def apply_lora(model, rank=16, alpha=16):
-    cnt = 0
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and any(
-            key in name for key in ("qkv", "proj", "to_q", "to_k", "to_v", "q_linear", "kv_linear")
-        ):
-            parent = model.get_submodule(name.rsplit('.', 1)[0])
-            child = name.rsplit('.', 1)[1]
-            setattr(parent, child, LoRALinear(module, rank, alpha))
-            cnt += 1
-    print(f"✅ LoRA applied to {cnt} layers.")
-
 
 def _load_pixart_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
     saved = set(saved_trainable.keys())
@@ -179,17 +97,20 @@ def run(args):
 
     saved_trainable = ckpt.get("pixart_trainable", {})
 
-    has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
-    if "lora_rank" in ckpt:
-        ckpt_lora_rank = int(ckpt["lora_rank"])
-    else:
-        ckpt_lora_rank = int(args.lora_rank)
-    if "lora_alpha" in ckpt:
-        ckpt_lora_alpha = int(ckpt["lora_alpha"])
-    else:
-        ckpt_lora_alpha = int(args.lora_alpha)
-    if has_lora:
-        apply_lora(pixart, rank=ckpt_lora_rank, alpha=ckpt_lora_alpha)
+    has_dual_lora = any(
+        ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
+        for k in saved_trainable.keys()
+    )
+    dual_lora = bool(layer_cfg.get("dual_lora", False))
+    if dual_lora or has_dual_lora:
+        apply_dual_lora(
+            pixart,
+            pixel_rank=int(layer_cfg.get("pixel_lora_rank", args.lora_rank)),
+            semantic_rank=int(layer_cfg.get("semantic_lora_rank", args.lora_rank)),
+            pixel_alpha=float(layer_cfg.get("pixel_lora_alpha", args.lora_alpha)),
+            semantic_alpha=float(layer_cfg.get("semantic_lora_alpha", args.lora_alpha)),
+        )
+        set_dual_lora_scales(pixart, lambda_pix=1.0, lambda_sem=1.0)
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
