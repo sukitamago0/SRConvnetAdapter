@@ -1445,6 +1445,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             or "semantic_lora_A" in name
             or "semantic_lora_B" in name
             or "lr_ip_proj" in name
+            or "sem_ip_proj" in name
             or "lr_ip_attn" in name
             or "lr_ip_gate" in name
             or "local_entry_proj" in name
@@ -1566,7 +1567,10 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.lr_ip_proj.weight", pix_named.get("lr_ip_proj.weight", None)),
+        ("pixart.sem_ip_proj.weight", pix_named.get("sem_ip_proj.weight", None)),
         ("pixart.blocks.0.lr_ip_attn.proj.weight", pix_named.get("blocks.0.lr_ip_attn.proj.weight", None)),
+        ("pixart.blocks.0.lr_stream_attn.proj.weight", pix_named.get("blocks.0.lr_stream_attn.proj.weight", None)),
+        ("pixart.blocks.0.lr_cross_conv.dw.weight", pix_named.get("blocks.0.lr_cross_conv.dw.weight", None)),
         ("pixart.blocks.20.cross_attn.img_residual_linear.weight", pix_named.get("blocks.20.cross_attn.img_residual_linear.weight", None)),
         ("pixart.blocks.20.cross_attn.k_img_linear.weight", pix_named.get("blocks.20.cross_attn.k_img_linear.weight", None)),
         ("pixart.first_pixel_lora_B.weight", first_pixel_lora_B),
@@ -2173,7 +2177,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         cond_map_stds = []
         ip_tok_stds, ip_out_stds, ip_alphas = [], [], []
         ip_pre_stds, ip_post_stds, ip_out_scales = [], [], []
-        tasr_gate_means, sft_alpha_means = [], []
+        
         prompt_hit_rates, prompt_tok_counts, prompt_nonpad_ratios = [], [], []
         prompt_cache_mem = OrderedDict()
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
@@ -2243,9 +2247,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                     ip_out_stds.append(float(ip_stats.get("lr_ip_attn_delta_std_mean", 0.0)))
                     ip_alphas.append(float(ip_stats.get("semantic_gate_mean", 0.0)))
 
-                    sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
-                    tasr_gate_means.append(float(sft_stats.get("tasr_gate_mean", 0.0)))
-                    sft_alpha_means.append(float(sft_stats.get("alpha_mean", 0.0)))
+                    
 
                     if CFG_SCALE == 1.0:
                         out = out_cond
@@ -2300,12 +2302,9 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         ip_out_scale = float(np.mean(ip_out_scales)) if len(ip_out_scales) > 0 else 1.0
         ip_out_std = float(np.mean(ip_out_stds)) if len(ip_out_stds) > 0 else 0.0
         ip_alpha = float(np.mean(ip_alphas)) if len(ip_alphas) > 0 else 0.0
-        tasr_gate_mean_val = float(np.mean(tasr_gate_means)) if len(tasr_gate_means) > 0 else 0.0
-        sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         msg = (
             f"[VAL-PROXY@{steps}][{tag}] Ep{epoch+1}: proxy_psnr={res[0]:.2f} | proxy_ssim={res[1]:.4f} | proxy_lpips={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | text_cond_delta={text_cdelta:.5f} | prompt_cache_hit_rate={prompt_hit_rate:.3f} | avg_prompt_token_count={avg_prompt_token_count:.2f} | avg_prompt_nonpad_ratio={avg_prompt_nonpad_ratio:.3f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | ip_tok_std={ip_tok_std:.4f} | ip_pre_std={ip_pre_std:.4f} | ip_post_std={ip_post_std:.4f} | ip_out_scale={ip_out_scale:.4f} | ip_out_std={ip_out_std:.4f} | ip_alpha={ip_alpha:.4f} | ip_K={16} | "
-            f"tasr_gate_mean={tasr_gate_mean_val:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
