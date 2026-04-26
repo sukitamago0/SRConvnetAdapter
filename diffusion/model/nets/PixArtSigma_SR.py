@@ -26,50 +26,9 @@ class SFTLayer(nn.Module):
         return feat * (1 + gain * scale) + gain * shift, scale, shift
 
 
-class KVInjectAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int):
-        super().__init__()
-        assert hidden_size % num_heads == 0
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.gamma = nn.Parameter(torch.tensor(0.0))
-
-        nn.init.zeros_(self.k_proj.weight)
-        nn.init.zeros_(self.k_proj.bias)
-        nn.init.zeros_(self.v_proj.weight)
-        nn.init.zeros_(self.v_proj.bias)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
-
-    def forward(self, q_tokens: torch.Tensor, cond_tokens: torch.Tensor):
-        b, n, c = q_tokens.shape
-        m = cond_tokens.shape[1]
-
-        q = q_tokens.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(cond_tokens).view(b, m, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(cond_tokens).view(b, m, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-        attn = attn.transpose(1, 2).contiguous().view(b, n, c)
-        attn = self.out_proj(attn)
-        return self.gamma.to(attn.dtype) * attn
-
-
 @MODELS.register_module()
 class PixArtSigmaSR(PixArtMS):
-    def __init__(
-        self,
-        force_null_caption: bool = True,
-        hard_injection_layers=None,
-        detail_injection_layers=None,
-        injection_layer_to_level=None,
-        **kwargs
-    ):
+    def __init__(self, force_null_caption: bool = True, **kwargs):
         kwargs.setdefault("model_max_length", 300)
         kwargs.setdefault("pred_sigma", False)
         kwargs.setdefault("learn_sigma", False)
@@ -88,26 +47,22 @@ class PixArtSigmaSR(PixArtMS):
         self.force_null_caption = bool(force_null_caption)
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
-        # keep hard-layer SFT family
-        self.sft_cond_reduce = nn.Sequential(
-            nn.Conv2d(self.hidden_size, 64, 1),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
-        self.sft_layers = nn.ModuleList([SFTLayer(cond_nc=64, feat_nc=self.hidden_size) for _ in range(self.depth)])
-        self.hard_injection_layers = set(hard_injection_layers or [2, 4, 6, 8, 10, 12])
-        self.anchor_layers = set([2, 4, 6])
-        self.kv_inject_layers = set([8, 12, 16, 20, 24, 26])
-        self.kv_inject = nn.ModuleDict({
-            str(i): KVInjectAttention(hidden_size=self.hidden_size, num_heads=self.num_heads)
-            for i in sorted(self.kv_inject_layers)
-        })
+        self.lr_ip_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+        self.lr_ip_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        nn.init.normal_(self.lr_ip_proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.lr_ip_proj.bias)
+
+        self.local_entry_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+        self.local_entry_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.local_entry_gate = nn.Parameter(torch.full((1,), -6.0))
+        nn.init.zeros_(self.local_entry_proj.weight)
+        nn.init.zeros_(self.local_entry_proj.bias)
 
         self._last_sft_stats = None
-        self._last_kv_stats = None
+        self._last_image_stats = None
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
-        _ = kwargs.pop("sft_strength", 1.0)
         bs = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
@@ -119,6 +74,32 @@ class PixArtSigmaSR(PixArtMS):
         ).unsqueeze(0).to(x.device).to(self.dtype)
 
         x = self.x_embedder(x) + pos_embed
+
+        ip_tokens = None
+        local_entry_tokens = None
+        if isinstance(adapter_cond, dict):
+            ip_tokens = adapter_cond.get("ip_tokens", None)
+            if ip_tokens is None:
+                ip_tokens = adapter_cond.get("cond_tokens", None)
+
+            local_entry_tokens = adapter_cond.get("local_entry_tokens", None)
+            if local_entry_tokens is None:
+                cond_map = adapter_cond.get("cond_map", None)
+                if cond_map is not None:
+                    local_entry_tokens = cond_map.flatten(2).transpose(1, 2).contiguous()
+
+        lr_ip_tokens = None
+        if ip_tokens is not None:
+            lr_ip_tokens = self.lr_ip_proj(self.lr_ip_norm(ip_tokens.to(dtype=x.dtype)))
+
+        if local_entry_tokens is not None:
+            if local_entry_tokens.shape[1] != x.shape[1]:
+                raise RuntimeError(
+                    f"local_entry_tokens length mismatch: got {local_entry_tokens.shape[1]}, expected {x.shape[1]}"
+                )
+            local_bias = self.local_entry_proj(self.local_entry_norm(local_entry_tokens.to(dtype=x.dtype)))
+            x = x + torch.sigmoid(self.local_entry_gate).to(dtype=x.dtype).view(1, 1, 1) * local_bias
+
         t = self.t_embedder(timestep)
         if aug_level is not None:
             t = t + self.aug_embedder(aug_level.to(self.dtype))
@@ -126,12 +107,6 @@ class PixArtSigmaSR(PixArtMS):
         if self.micro_conditioning:
             c_size, ar = data_info['img_hw'].to(self.dtype), data_info['aspect_ratio'].to(self.dtype)
             t = t + torch.cat([self.csize_embedder(c_size, bs), self.ar_embedder(ar, bs)], dim=1)
-
-        cond_map = None
-        cond_tokens = None
-        if adapter_cond is not None:
-            cond_map = adapter_cond.get("cond_map", None)
-            cond_tokens = adapter_cond.get("cond_tokens", None)
 
         t0 = self.t_block(t)
         if force_drop_ids is None and self.force_null_caption:
@@ -148,27 +123,8 @@ class PixArtSigmaSR(PixArtMS):
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
-        tau_mean_vals, tau_min_vals, tau_max_vals = [], [], []
-        cond_red = None
-        if cond_map is not None:
-            cond_red = self.sft_cond_reduce(cond_map.to(dtype=x.dtype))
-
-        for i, block in enumerate(self.blocks):
-            if cond_red is not None and i in self.anchor_layers:
-                b, n, c = x.shape
-                if n != self.h * self.w:
-                    raise RuntimeError(f"Token grid mismatch: N={n}, expected H*W={self.h * self.w} from input/patch rule")
-                x_map_pre = x.transpose(1, 2).reshape(b, c, self.h, self.w)
-                x_map_post, _, _ = self.sft_layers[i](x_map_pre, cond_red, strength=1.0)
-                t_norm = timestep.float() / 1000.0
-                tau = t_norm.pow(1.5).view(-1, 1, 1, 1).to(x_map_pre.dtype)
-                x_map = x_map_pre + (x_map_post - x_map_pre) * tau
-                x = x_map.reshape(b, c, n).transpose(1, 2).contiguous()
-                tau_mean_vals.append(float(tau.detach().float().mean().item()))
-                tau_min_vals.append(float(tau.detach().float().min().item()))
-                tau_max_vals.append(float(tau.detach().float().max().item()))
-
-            # detail layers revert to original block-only forward
+        ip_gate_vals = []
+        for block in self.blocks:
             x = auto_grad_checkpoint(
                 block,
                 x,
@@ -176,34 +132,21 @@ class PixArtSigmaSR(PixArtMS):
                 t0,
                 y_lens,
                 HW=(self.h, self.w),
+                lr_ip_tokens=lr_ip_tokens,
+                lr_ip_scale=None,
                 base_size=self.base_size,
                 pe_interpolation=self.pe_interpolation,
                 **kwargs,
             )
-            if cond_tokens is not None and i in self.kv_inject_layers:
-                x = x + self.kv_inject[str(i)](x, cond_tokens.to(dtype=x.dtype))
+            ip_gate_vals.append(float(torch.sigmoid(block.lr_ip_gate.detach()).item()))
 
-        if len(tau_mean_vals) > 0:
-            self._last_sft_stats = {
-                "tau_mean": float(sum(tau_mean_vals) / len(tau_mean_vals)),
-                "tau_min": float(min(tau_min_vals)),
-                "tau_max": float(max(tau_max_vals)),
-            }
-        else:
-            self._last_sft_stats = None
-        if len(self.kv_inject) > 0:
-            gammas = [self.kv_inject[str(i)].gamma.item() for i in sorted(self.kv_inject_layers)]
-            self._last_kv_stats = {
-                "gamma_mean": float(sum(gammas) / len(gammas)),
-                "gamma_min": float(min(gammas)),
-                "gamma_max": float(max(gammas)),
-            }
-        else:
-            self._last_kv_stats = {
-                "gamma_mean": 0.0,
-                "gamma_min": 0.0,
-                "gamma_max": 0.0,
-            }
+        self._last_sft_stats = {
+            "local_entry_gate": float(torch.sigmoid(self.local_entry_gate.detach()).item()),
+        }
+        self._last_image_stats = {
+            "lr_ip_gate_mean": float(sum(ip_gate_vals) / max(1, len(ip_gate_vals))),
+            "lr_ip_gate_std": float(torch.tensor(ip_gate_vals).float().std(unbiased=False).item()) if len(ip_gate_vals) > 0 else 0.0,
+        }
 
         x = self.final_layer(x, t)
         x = self.unpatchify(x)
