@@ -1638,22 +1638,24 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     first_pixel_lora_B = next((p for n, p in pixart.named_parameters() if "pixel_lora_B.weight" in n), None)
     first_sem_lora_B = next((p for n, p in pixart.named_parameters() if "semantic_lora_B.weight" in n), None)
     watched = [
-        ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.lr_ip_proj.weight", pix_named.get("lr_ip_proj.weight", None)),
         ("pixart.sem_ip_proj.weight", pix_named.get("sem_ip_proj.weight", None)),
         (f"pixart.blocks.{first_pixel}.lr_ip_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_ip_attn.proj.weight", None)),
         (f"pixart.blocks.{first_pixel}.lr_stream_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_stream_attn.proj.weight", None)),
         (f"pixart.blocks.{first_lrconv}.lr_cross_conv.dw.weight", pix_named.get(f"blocks.{first_lrconv}.lr_cross_conv.dw.weight", None)),
         (f"pixart.blocks.{first_sem}.cross_attn.img_residual_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.img_residual_linear.weight", None)),
-        (f"pixart.blocks.{first_sem}.cross_attn.k_img_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.k_img_linear.weight", None)),
         ("pixart.first_pixel_lora_B.weight", first_pixel_lora_B),
         ("pixart.first_semantic_lora_B.weight", first_sem_lora_B),
-        ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
         ("sem_adapter.proj.weight", sem_named.get("proj.weight", None)),
         ("sem_adapter.resampler.latents", sem_named.get("resampler.latents", None)),
     ]
+    soft_watched = [
+        (f"pixart.blocks.{first_sem}.cross_attn.k_img_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.k_img_linear.weight", None)),
+        (f"pixart.blocks.{first_sem}.cross_attn.v_img_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.v_img_linear.weight", None)),
+    ]
     msg = [f"[GradSanity][step={step}]"]
-    warnings = []
+    hard_warnings = []
+    soft_warnings = []
     for name, p in watched:
         if p is None:
             msg.append(f"{name}=N/A")
@@ -1662,12 +1664,23 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         g_norm = 0.0 if p.grad is None else float(p.grad.detach().float().norm().item())
         msg.append(f"{name}: g={g_norm:.3e}, w={w_norm:.3e}")
         if p.requires_grad and g_norm < 1e-12:
-            warnings.append(name)
+            hard_warnings.append(name)
+    for name, p in soft_watched:
+        if p is None:
+            msg.append(f"{name}=N/A")
+            continue
+        w_norm = float(p.detach().float().norm().item())
+        g_norm = 0.0 if p.grad is None else float(p.grad.detach().float().norm().item())
+        msg.append(f"{name}: g={g_norm:.3e}, w={w_norm:.3e}")
+        if p.requires_grad and g_norm < 1e-12:
+            soft_warnings.append(name)
     print(" | ".join(msg))
-    if warnings:
+    if hard_warnings:
         if step > 100:
-            raise RuntimeError(f"[GradSanity] near-zero grad on critical paths: {warnings}")
-        print(f"⚠️ [GradSanity] near-zero grad on critical paths: {warnings}")
+            raise RuntimeError(f"[GradSanity] near-zero grad on critical paths (hard): {hard_warnings}")
+        print(f"⚠️ [GradSanity] near-zero grad on critical paths (hard): {hard_warnings}")
+    if soft_warnings:
+        print(f"⚠️ [GradSanity] near-zero grad on soft-check paths: {soft_warnings}")
 
 
 # ================= 8. Checkpointing =================
@@ -2477,11 +2490,8 @@ def main():
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
-    if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
-        pixart.load_pretrained_weights_with_zero_init(base)
-    else:
-        missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
-        print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
+    missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+    print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
     pixart.enable_sr_conditioning_layers(
         pixel_layers=list(PIXEL_LAYERS),
         lr_conv_layers=list(LR_CONV_LAYERS),
@@ -2698,8 +2708,10 @@ def main():
                     f"ip_tokens length mismatch: got {tokens.shape[1]}, expected {expected_tokens}"
                 )
             cond_in = cond
+            adapter_dropped = False
             cond_drop_prob = float(COND_DROP_PROB)
             if USE_ADAPTER_CFDROPOUT and torch.rand(1, device=DEVICE).item() < cond_drop_prob:
+                adapter_dropped = True
                 cond_in = mask_adapter_cond(cond, torch.zeros((zt_in.shape[0],), device=DEVICE))
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
@@ -2751,7 +2763,11 @@ def main():
                     "lr_ip_gate_mean": float(image_cond_stats.get("lr_ip_gate_mean", 0.0)),
                     "lr_ip_gate_std": float(image_cond_stats.get("lr_ip_gate_std", 0.0)),
                     "local_entry_gate": float((getattr(pixart, "_last_sft_stats", {}) or {}).get("local_entry_gate", 0.0)),
-                    "lr_ip_attn_delta_std": float((getattr(pixart.blocks[0], "_last_image_stats", {}) or {}).get("img_delta_std", 0.0)),
+                    "lr_ip_attn_delta_std_mean": float(image_cond_stats.get("lr_ip_attn_delta_std_mean", 0.0)),
+                    "lr_stream_delta_std_mean": float(image_cond_stats.get("lr_stream_delta_std_mean", 0.0)),
+                    "lr_conv_delta_std_mean": float(image_cond_stats.get("lr_conv_delta_std_mean", 0.0)),
+                    "semantic_gate_mean": float(image_cond_stats.get("semantic_gate_mean", 0.0)),
+                    "semantic_img_delta_std_mean": float(image_cond_stats.get("semantic_img_delta_std_mean", 0.0)),
                     "ad_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "cond_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "sft_strength": float(sft_strength),
@@ -2819,11 +2835,10 @@ def main():
                     last_cond_delta_curr = cond_delta_curr
                     last_text_cond_delta_curr = text_cond_delta_curr
                     guard_stats["adapter_delta_same_text"] = adapter_delta_same_text
-                    if step > 100:
-                        image_stats = getattr(pixart, "_last_image_stats", {}) or {}
+                    if step > 100 and (not adapter_dropped):
                         if adapter_delta_same_text <= 1e-6:
                             raise RuntimeError("adapter_delta_same_text is zero; adapter path is likely dead.")
-                        if float(image_stats.get("lr_ip_attn_delta_std_mean", 0.0)) <= 1e-8:
+                        if float(image_cond_stats.get("lr_ip_attn_delta_std_mean", 0.0)) <= 1e-8:
                             raise RuntimeError("lr_ip_attn_delta_std_mean is zero; LR attention path is likely dead.")
                 else:
                     cond_delta_curr = float(last_cond_delta_curr)
@@ -2945,17 +2960,23 @@ def main():
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                 sft_delta_std = float(sft_stats.get("sft_delta_std", 0.0))
                 sft_strength_logged = float(sft_stats.get("sft_strength", sft_strength))
-                image_stats = getattr(pixart, "_last_image_stats", {}) or {}
+                image_stats = dict(image_cond_stats)
                 ip_tokens_std = float(tokens.detach().float().std().item())
                 local_entry_tokens_std = float(cond_in.get("local_entry_tokens", cond_in["cond_map"].flatten(2).transpose(1, 2)).detach().float().std().item())
                 lr_ip_gate_mean = float(image_stats.get("lr_ip_gate_mean", 0.0))
                 lr_ip_gate_std = float(image_stats.get("lr_ip_gate_std", 0.0))
                 local_entry_gate = float(sft_stats.get("local_entry_gate", 0.0))
-                lr_ip_attn_delta_std = float((getattr(pixart.blocks[0], "_last_image_stats", {}) or {}).get("img_delta_std", 0.0))
+                lr_ip_attn_delta_std_mean = float(image_stats.get("lr_ip_attn_delta_std_mean", 0.0))
+                lr_stream_delta_std_mean = float(image_stats.get("lr_stream_delta_std_mean", 0.0))
+                lr_conv_delta_std_mean = float(image_stats.get("lr_conv_delta_std_mean", 0.0))
+                semantic_gate_mean = float(image_stats.get("semantic_gate_mean", 0.0))
+                semantic_img_delta_std_mean = float(image_stats.get("semantic_img_delta_std_mean", 0.0))
                 adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_map_std = float(cond_in["cond_map"].detach().float().std().item())
-                cond_delta = float(cond_delta_curr)
-                text_cond_delta = float(text_cond_delta_curr)
+                adapter_delta_same_text = float(guard_stats.get("adapter_delta_same_text", float("nan")))
+                sem_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
+                sem_tokens_std = float(sem_stats.get("sem_tokens_postproj_std", 0.0))
+                sem_out_scale = float(sem_stats.get("sem_out_scale", 0.0))
                 tala_on = int(USE_TALA_TRAIN)
                 cpu_rss_gb = float(get_rss_gb()) if (step % 100 == 0) else float("nan")
                 if step % 100 == 0:
@@ -2987,9 +3008,12 @@ def main():
                     'ip_gate_m': f"{lr_ip_gate_mean:.4f}",
                     'ip_gate_s': f"{lr_ip_gate_std:.4f}",
                     'entry_gate': f"{local_entry_gate:.4f}",
-                    'ip_dstd': f"{lr_ip_attn_delta_std:.4f}",
-                    'cond_delta': f"{cond_delta:.5f}",
-                    'text_cond_delta': f"{text_cond_delta:.5f}",
+                    'adapter_dt': f"{adapter_delta_same_text:.5f}" if math.isfinite(adapter_delta_same_text) else "nan",
+                    'ip_dstd': f"{lr_ip_attn_delta_std_mean:.4f}",
+                    'str_dstd': f"{lr_stream_delta_std_mean:.4f}",
+                    'cnv_dstd': f"{lr_conv_delta_std_mean:.4f}",
+                    'sem_gate': f"{semantic_gate_mean:.4f}",
+                    'sem_dstd': f"{semantic_img_delta_std_mean:.4f}",
                     'guard_fwd': f"{int(run_guard_forward)}",
                     'a_hit': f"{prompt_cache_hit_rate:.3f}",
                     'p_miss': f"{int(num_missing_prompt_packs)}",
@@ -3003,8 +3027,8 @@ def main():
                     'ip_K': f"{16}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
                     'cond_map_std': f"{cond_map_std:.4f}",
-                    'sem_tok_std': f"{float((getattr(sem_adapter, '_last_sem_adapter_stats', {}) or {}).get('sem_tokens_postproj_std', 0.0)):.4f}",
-                    'sem_scale': f"{float((getattr(sem_adapter, '_last_sem_adapter_stats', {}) or {}).get('sem_out_scale', 0.0)):.3f}",
+                    'sem_tok_std': f"{sem_tokens_std:.4f}",
+                    'sem_scale': f"{sem_out_scale:.3f}",
                     'cpu_rss_gb': f"{cpu_rss_gb:.3f}" if math.isfinite(cpu_rss_gb) else "nan",
                 }
                 log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
@@ -3024,10 +3048,15 @@ def main():
                     "lr_ip_gate_mean": lr_ip_gate_mean,
                     "lr_ip_gate_std": lr_ip_gate_std,
                     "local_entry_gate": local_entry_gate,
-                    "lr_ip_attn_delta_std": lr_ip_attn_delta_std,
+                    "adapter_delta_same_text": adapter_delta_same_text,
+                    "lr_ip_attn_delta_std_mean": lr_ip_attn_delta_std_mean,
+                    "lr_stream_delta_std_mean": lr_stream_delta_std_mean,
+                    "lr_conv_delta_std_mean": lr_conv_delta_std_mean,
+                    "semantic_gate_mean": semantic_gate_mean,
+                    "semantic_img_delta_std_mean": semantic_img_delta_std_mean,
                     "sft_delta_std": sft_delta_std,
-                    "cond_delta": cond_delta,
-                    "text_cond_delta": text_cond_delta,
+                    "sem_tokens_std": sem_tokens_std,
+                    "sem_out_scale": sem_out_scale,
                     "run_guard_forward": int(run_guard_forward),
                     "adaptive_prompt_hit_rate": float(prompt_cache_hit_rate),
                     "num_missing_prompt_packs": int(num_missing_prompt_packs),

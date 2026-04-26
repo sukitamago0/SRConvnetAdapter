@@ -86,10 +86,7 @@ def run(args):
         base = base["state_dict"]
     if "pos_embed" in base:
         del base["pos_embed"]
-    if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
-        pixart.load_pretrained_weights_with_zero_init(base)
-    else:
-        pixart.load_state_dict(base, strict=False)
+    load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
     pixart.enable_sr_conditioning_layers(
         pixel_layers=list(layer_cfg.get("pixel_layers", anchor_layers)),
         lr_conv_layers=list(layer_cfg.get("lr_conv_layers", anchor_layers)),
@@ -133,7 +130,11 @@ def run(args):
     adapter.load_state_dict(ckpt["adapter"], strict=True)
     sem_adapter_sd = ckpt.get("sem_adapter", None)
     if not bool(args.disable_semantic_branch):
-        if isinstance(sem_adapter_sd, dict):
+        if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
+            required_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+            missing_sem_keys = [k for k in required_sem_keys if k not in sem_adapter_sd]
+            if missing_sem_keys:
+                raise RuntimeError(f"Checkpoint sem_adapter missing required keys in infer: {missing_sem_keys}")
             sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
         else:
             raise RuntimeError("Checkpoint missing sem_adapter while semantic branch is enabled in infer.")

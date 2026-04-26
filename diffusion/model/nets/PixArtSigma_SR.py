@@ -73,6 +73,10 @@ class PixArtSigmaSR(PixArtMS):
         pset = {int(i) for i in pixel_layers}
         cset = {int(i) for i in lr_conv_layers}
         sset = {int(i) for i in semantic_layers}
+        self.pixel_layers = sorted(list(pset))
+        self.lr_conv_layers = sorted(list(cset))
+        self.semantic_layers = sorted(list(sset))
+        self.anchor_layers = list(self.pixel_layers)
         for i, block in enumerate(self.blocks):
             block.is_pixel_layer = i in pset
             block.is_lr_conv_layer = i in cset
@@ -86,6 +90,13 @@ class PixArtSigmaSR(PixArtMS):
                 nn.init.constant_(block.semantic_gate, float(init_gate))
             if (i in sset) and (not isinstance(block.cross_attn, DecoupledImageTextCrossAttention)):
                 block.cross_attn = DecoupledImageTextCrossAttention.from_text_cross_attn(block.cross_attn)
+            if (i in sset) and isinstance(block.cross_attn, DecoupledImageTextCrossAttention):
+                ca_dev = next(block.cross_attn.parameters()).device
+                attn_dev = next(block.attn.parameters()).device
+                if ca_dev != attn_dev:
+                    raise RuntimeError(
+                        f"semantic layer {i} device mismatch: cross_attn on {ca_dev}, block.attn on {attn_dev}."
+                    )
             if (i in sset) and isinstance(block.cross_attn, DecoupledImageTextCrossAttention):
                 out_std = float(block.cross_attn.out_proj.weight.detach().float().std().item())
                 if out_std <= 1e-8:

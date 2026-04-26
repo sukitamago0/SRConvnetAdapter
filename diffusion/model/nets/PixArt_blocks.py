@@ -155,7 +155,14 @@ class DecoupledImageTextCrossAttention(nn.Module):
 
     @classmethod
     def from_text_cross_attn(cls, old_attn: MultiHeadCrossAttention):
-        new = cls(old_attn.q_linear.in_features, old_attn.num_heads, attn_drop=old_attn.attn_drop.p, proj_drop=old_attn.proj_drop.p)
+        device = old_attn.q_linear.weight.device
+        dtype = old_attn.q_linear.weight.dtype
+        new = cls(
+            old_attn.q_linear.in_features,
+            old_attn.num_heads,
+            attn_drop=old_attn.attn_drop.p,
+            proj_drop=old_attn.proj_drop.p,
+        ).to(device=device, dtype=dtype)
         new.q_linear.load_state_dict(old_attn.q_linear.state_dict())
         new.out_proj.load_state_dict(old_attn.proj.state_dict())
         with torch.no_grad():

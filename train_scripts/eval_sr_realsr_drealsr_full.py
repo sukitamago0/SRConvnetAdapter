@@ -566,7 +566,11 @@ def build_model_and_assets(args, device, compute_dtype):
     ).to(device).eval()
     sem_adapter_sd = ckpt.get("sem_adapter", None)
     if not bool(args.disable_semantic_branch):
-        if isinstance(sem_adapter_sd, dict):
+        if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
+            required_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+            missing_sem_keys = [k for k in required_sem_keys if k not in sem_adapter_sd]
+            if missing_sem_keys:
+                raise RuntimeError(f"Checkpoint sem_adapter missing required keys in eval: {missing_sem_keys}")
             load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="eval-sem-adapter")
         else:
             raise RuntimeError("Checkpoint missing sem_adapter while semantic branch is enabled in eval.")
