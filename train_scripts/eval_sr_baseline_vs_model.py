@@ -331,6 +331,10 @@ def evaluate(args):
             t_b = torch.tensor([t], device=device).expand(latents.shape[0])
             with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
                 drop_cond = torch.ones(latents.shape[0], device=device)
+                if "ip_tokens" not in cond and "cond_tokens" not in cond:
+                    raise KeyError("adapter output missing ip_tokens/cond_tokens")
+                if "local_entry_tokens" not in cond and "cond_map" not in cond:
+                    raise KeyError("adapter output missing local_entry_tokens/cond_map")
                 model_in = torch.cat([latents.to(compute_dtype), z_lr.to(compute_dtype)], dim=1)
                 out = pixart(
                     x=model_in,
