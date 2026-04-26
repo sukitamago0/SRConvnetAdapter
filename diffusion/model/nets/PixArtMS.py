@@ -15,7 +15,10 @@ from timm.models.vision_transformer import Mlp
 
 from diffusion.model.builder import MODELS
 from diffusion.model.utils import auto_grad_checkpoint, to_2tuple
-from diffusion.model.nets.PixArt_blocks import t2i_modulate, CaptionEmbedder, AttentionKVCompress, MultiHeadCrossAttention, T2IFinalLayer, TimestepEmbedder, SizeEmbedder
+from diffusion.model.nets.PixArt_blocks import (
+    t2i_modulate, CaptionEmbedder, AttentionKVCompress, MultiHeadCrossAttention,
+    T2IFinalLayer, TimestepEmbedder, SizeEmbedder, DecoupledImageTextCrossAttention, TokenCrossStreamConv
+)
 from diffusion.model.nets.PixArt import PixArt, get_2d_sincos_pos_embed
 
 
@@ -52,36 +55,117 @@ class PixArtMSBlock(nn.Module):
     """
 
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0., input_size=None,
-                 sampling=None, sr_ratio=1, qk_norm=False, **block_kwargs):
+                 sampling=None, sr_ratio=1, qk_norm=False, block_id: int = -1, **block_kwargs):
         super().__init__()
         self.hidden_size = hidden_size
+        self.block_id = int(block_id)
+        self.is_pixel_layer = False
+        self.is_lr_conv_layer = False
+        self.is_semantic_layer = False
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = AttentionKVCompress(
             hidden_size, num_heads=num_heads, qkv_bias=True, sampling=sampling, sr_ratio=sr_ratio,
             qk_norm=qk_norm, **block_kwargs
         )
         self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.lr_ip_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.lr_ip_gate = nn.Parameter(torch.full((1,), -4.0))
+        self.lr_stream_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.lr_stream_gate = nn.Parameter(torch.full((1,), -4.0))
+        self.lr_cross_conv = TokenCrossStreamConv(hidden_size)
+        self.lr_cross_conv_gate = nn.Parameter(torch.full((1,), -4.0))
+        self.semantic_gate = nn.Parameter(torch.full((1,), -4.0))
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # to be compatible with lower version pytorch
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
+        nn.init.constant_(self.lr_ip_attn.proj.weight, 0)
+        nn.init.constant_(self.lr_ip_attn.proj.bias, 0)
+        nn.init.constant_(self.lr_stream_attn.proj.weight, 0)
+        nn.init.constant_(self.lr_stream_attn.proj.bias, 0)
+        self._last_image_stats = None
+        self._last_semantic_stats = None
 
-    def forward(self, x, y, t, mask=None, HW=None, **kwargs):
+    def forward(
+        self,
+        x,
+        y,
+        t,
+        mask=None,
+        HW=None,
+        lr_ip_tokens=None,
+        lr_stream_tokens=None,
+        sem_tokens=None,
+        sem_scale=None,
+        lr_ip_scale=None,
+        return_lr_stream=False,
+        **kwargs,
+    ):
         B, N, C = x.shape
         adaln_shift = kwargs.get("adaln_shift", None)
         adaln_scale = kwargs.get("adaln_scale", None)
         adaln_alpha = kwargs.get("adaln_alpha", None)
-
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
         h = self.norm1(x)
         if adaln_shift is not None and adaln_scale is not None and adaln_alpha is not None:
             h = h * (1.0 + adaln_alpha * adaln_scale.to(h.dtype)) + adaln_alpha * adaln_shift.to(h.dtype)
-        x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
-        x = x + self.cross_attn(x, y, mask)
-        x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
+        x_ca = x + self.drop_path(gate_msa * self.attn(t2i_modulate(h, shift_msa, scale_msa), HW=HW))
+        if isinstance(self.cross_attn, DecoupledImageTextCrossAttention):
+            sem_cond = sem_tokens if (self.is_semantic_layer and sem_tokens is not None) else None
+            sem_gate = torch.sigmoid(self.semantic_gate).to(dtype=x.dtype)
+            if sem_scale is not None:
+                sem_gate = sem_gate * sem_scale.to(dtype=x.dtype)
+            ca_out, ca_stats = self.cross_attn(
+                x_ca, text_cond=y, image_cond=sem_cond, text_mask=mask, image_gate=sem_gate
+            )
+            self._last_semantic_stats = {
+                "semantic_gate": float(sem_gate.detach().float().item()),
+                "semantic_img_delta_std": float(ca_stats.get("img_delta_std", 0.0)),
+                "semantic_text_ctx_std": float(ca_stats.get("text_ctx_std", 0.0)),
+            }
+        else:
+            ca_out = self.cross_attn(x_ca, y, mask)
+            self._last_semantic_stats = {
+                "semantic_gate": 0.0, "semantic_img_delta_std": 0.0, "semantic_text_ctx_std": 0.0,
+            }
+        x = x_ca + self.drop_path(ca_out)
 
+        lr_delta = torch.zeros_like(x)
+        lr_conv_delta = torch.zeros_like(x)
+        lr_stream_delta = None
+        if lr_stream_tokens is None:
+            lr_stream_tokens = lr_ip_tokens
+        if lr_stream_tokens is not None and self.is_pixel_layer:
+            lr_scale = torch.sigmoid(self.lr_ip_gate).to(dtype=x.dtype)
+            stream_scale = torch.sigmoid(self.lr_stream_gate).to(dtype=x.dtype)
+            if lr_ip_scale is not None:
+                lr_scale = lr_scale * lr_ip_scale.to(dtype=x.dtype)
+                stream_scale = stream_scale * lr_ip_scale.to(dtype=x.dtype)
+
+            lr_stream_delta = stream_scale.view(1, 1, 1) * self.lr_stream_attn(lr_stream_tokens, x, None)
+            lr_stream_tokens = lr_stream_tokens + self.drop_path(lr_stream_delta)
+            lr_delta = lr_delta + lr_scale.view(1, 1, 1) * self.lr_ip_attn(x, lr_stream_tokens, None)
+
+            if self.is_lr_conv_layer:
+                conv_scale = torch.sigmoid(self.lr_cross_conv_gate).to(dtype=x.dtype)
+                if lr_ip_scale is not None:
+                    conv_scale = conv_scale * lr_ip_scale.to(dtype=x.dtype)
+                lr_conv_delta = conv_scale.view(1, 1, 1) * self.lr_cross_conv(x, lr_stream_tokens, HW)
+                lr_delta = lr_delta + lr_conv_delta
+            x = x + self.drop_path(lr_delta)
+        self._last_image_stats = {
+            "image_alpha_value": float(torch.sigmoid(self.lr_ip_gate.detach()).float().item()),
+            "lr_stream_gate": float(torch.sigmoid(self.lr_stream_gate.detach()).float().item()),
+            "lr_cross_conv_gate": float(torch.sigmoid(self.lr_cross_conv_gate.detach()).float().item()),
+            "img_delta_std": float(lr_delta.detach().float().std().item()),
+            "lr_stream_delta_std": 0.0 if lr_stream_delta is None else float(lr_stream_delta.detach().float().std().item()),
+            "lr_conv_delta_std": float(lr_conv_delta.detach().float().std().item()),
+        }
+        x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
+        if return_lr_stream:
+            return x, lr_stream_tokens
         return x
 
 
@@ -161,6 +245,7 @@ class PixArtMS(PixArt):
                 sampling=kv_compress_config['sampling'],
                 sr_ratio=int(kv_compress_config['scale_factor']) if i in kv_compress_config['kv_compress_layer'] else 1,
                 qk_norm=qk_norm,
+                block_id=i,
             )
             for i in range(depth)
         ])
