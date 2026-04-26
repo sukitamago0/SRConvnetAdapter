@@ -96,6 +96,11 @@ def run(args):
         semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
         init_gate=-4.0,
     )
+    sem0 = int(layer_cfg.get("semantic_layers", [24, 25, 26, 27])[0])
+    sem_std = float(pixart.blocks[sem0].cross_attn.out_proj.weight.detach().float().std().item())
+    print(f"[semantic-enable-check] layer={sem0} out_proj.weight.std={sem_std:.6e}")
+    if sem_std <= 1e-8:
+        raise RuntimeError("semantic layer out_proj.weight.std() is zero after enable; call order is wrong.")
 
     adapter = build_adapter_v12(
         in_channels=3,
@@ -127,8 +132,11 @@ def run(args):
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
     sem_adapter_sd = ckpt.get("sem_adapter", None)
-    if (not bool(args.disable_semantic_branch)) and isinstance(sem_adapter_sd, dict):
-        sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
+    if not bool(args.disable_semantic_branch):
+        if isinstance(sem_adapter_sd, dict):
+            sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
+        else:
+            raise RuntimeError("Checkpoint missing sem_adapter while semantic branch is enabled in infer.")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()

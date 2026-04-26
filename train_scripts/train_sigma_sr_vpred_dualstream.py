@@ -64,6 +64,15 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "lr_ip_proj",
     "lr_ip_attn",
     "lr_ip_gate",
+    "lr_stream_attn",
+    "lr_stream_gate",
+    "lr_cross_conv",
+    "lr_cross_conv_gate",
+    "sem_ip_proj",
+    "semantic_gate",
+    "cross_attn.k_img_linear",
+    "cross_attn.v_img_linear",
+    "cross_attn.img_residual_linear",
     "local_entry_proj",
     "local_entry_gate",
     "pixel_lora_A",
@@ -1193,39 +1202,88 @@ class MixedRealISRDataset(Dataset):
     def __init__(self, crop_size=512, scale=4):
         self.crop_size = int(crop_size)
         self.scale = int(scale)
-        self.df2k = DF2K_Online_Dataset(crop_size=crop_size, is_train=True, scale=scale)
         self.pipeline = DegradationPipeline(crop_size)
         self.norm = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
         self.to_tensor = transforms.ToTensor()
         self.epoch = 0
-        self.sources = ["paired_df2k", "paired_realsr", "syn_realesrgan", "syn_bsrgan"]
+        self.df2k_pairs = []
+        self.realsr_pairs = []
+        self.synthetic_hr_paths = []
+
+        for lr_path, hr_path in build_paired_file_list(TRAIN_DF2K_HR_DIR, TRAIN_DF2K_LR_DIR, []):
+            self.df2k_pairs.append((lr_path, hr_path))
+            self.synthetic_hr_paths.append(hr_path)
+
+        for root in TRAIN_REALSR_DIRS:
+            for hr_path in sorted(glob.glob(os.path.join(root, "*_HR.*"))):
+                lr_path = hr_path.replace("_HR", "_LR4")
+                if os.path.exists(lr_path):
+                    self.realsr_pairs.append((lr_path, hr_path))
+                    self.synthetic_hr_paths.append(hr_path)
+
+        if len(self.df2k_pairs) == 0:
+            raise RuntimeError("MixedRealISRDataset: no DF2K pairs found.")
+        if len(self.synthetic_hr_paths) == 0:
+            self.synthetic_hr_paths = [p[1] for p in self.df2k_pairs]
+
+        self.source_probs = {
+            "paired_df2k": 0.45,
+            "paired_realsr": 0.20 if len(self.realsr_pairs) > 0 else 0.0,
+            "syn_realesrgan": 0.20,
+            "syn_bsrgan": 0.15,
+        }
+        s = sum(self.source_probs.values())
+        for k in self.source_probs:
+            self.source_probs[k] /= max(1e-6, s)
 
     def __len__(self):
-        return len(self.df2k)
+        return max(len(self.df2k_pairs), len(self.synthetic_hr_paths))
 
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
-        if hasattr(self.df2k, "set_epoch"):
-            self.df2k.set_epoch(epoch)
+
+    def _rng(self, idx: int):
+        r = random.Random(SEED + self.epoch * 1000003 + int(idx))
+        return r
+
+    def _sample_source(self, idx: int):
+        r = self._rng(idx).random()
+        acc = 0.0
+        for k, p in self.source_probs.items():
+            acc += float(p)
+            if r <= acc:
+                return k
+        return "paired_df2k"
 
     def _sample_syn(self, mode: str, hr_path: str):
         hr_pil = Image.open(hr_path).convert("RGB")
         hr_crop = random_crop_pil(hr_pil, self.crop_size, self.crop_size)
         hr = self.norm(self.to_tensor(hr_crop))
         lr, lr_small, _meta = self.pipeline(hr, mode=mode, return_meta=True, return_small=True)
-        return {"hr": hr, "lr": lr, "lr_small": lr_small, "path": hr_path, "sample_key": make_sample_key(hr_path), "source_type": f"syn_{mode}", "pixel_loss_weight": 0.8}
+        return {"hr": hr, "lr": lr, "lr_small": lr_small, "path": hr_path, "sample_key": make_sample_key(hr_path), "source_type": f"syn_{mode}", "pixel_loss_weight": 1.0}
 
     def __getitem__(self, idx):
-        base = self.df2k[idx % len(self.df2k)]
-        src = self.sources[(idx + self.epoch) % len(self.sources)]
+        src = self._sample_source(idx)
         if src == "paired_df2k":
-            base["source_type"] = src
-            base["pixel_loss_weight"] = 1.0
-            return base
+            lr_path, hr_path = self.df2k_pairs[idx % len(self.df2k_pairs)]
+            lr_pil = Image.open(lr_path).convert("RGB")
+            hr_pil = Image.open(hr_path).convert("RGB")
+            lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=self.scale)
+            lr_crop = TF.center_crop(lr_aligned, (self.crop_size // self.scale, self.crop_size // self.scale))
+            hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
+            lr_up = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            return {
+                "hr": self.norm(self.to_tensor(hr_crop)),
+                "lr": self.norm(self.to_tensor(lr_up)),
+                "lr_small": self.norm(self.to_tensor(lr_crop)),
+                "path": hr_path,
+                "sample_key": make_sample_key(lr_path),
+                "source_type": src,
+                "pixel_loss_weight": 1.0,
+            }
         if src == "paired_realsr":
-            hr_path = base["path"]
-            lr_path = hr_path.replace("_HR", "_LR4")
-            if os.path.exists(lr_path) and os.path.exists(hr_path):
+            if len(self.realsr_pairs) > 0:
+                lr_path, hr_path = self.realsr_pairs[idx % len(self.realsr_pairs)]
                 hr_pil = Image.open(hr_path).convert("RGB")
                 lr_pil = Image.open(lr_path).convert("RGB")
                 lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=self.scale)
@@ -1241,7 +1299,8 @@ class MixedRealISRDataset(Dataset):
                     "source_type": src,
                     "pixel_loss_weight": 0.5,
                 }
-        return self._sample_syn("realesrgan" if src == "syn_realesrgan" else "bsrgan", base["path"])
+        hr_path = self.synthetic_hr_paths[idx % len(self.synthetic_hr_paths)]
+        return self._sample_syn("realesrgan" if src == "syn_realesrgan" else "bsrgan", hr_path)
 
 class DF2K_Online_Dataset(Dataset):
     def __init__(self, crop_size=512, is_train=True, scale=4):
@@ -1447,7 +1506,6 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             or "lr_ip_proj" in name
             or "sem_ip_proj" in name
             or "lr_ip_attn" in name
-            or "lr_ip_gate" in name
             or "local_entry_proj" in name
             or "local_entry_gate" in name
         ):
@@ -1479,7 +1537,11 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             continue
         if ("lr_ip_attn" in n) or ("lr_stream_attn" in n):
             p.requires_grad_(bid in pixel_layer_ids)
+        if ("lr_ip_gate" in n) or ("lr_stream_gate" in n):
+            p.requires_grad_(bid in pixel_layer_ids)
         if ("lr_cross_conv" in n):
+            p.requires_grad_(bid in lr_conv_layer_ids)
+        if ("lr_cross_conv_gate" in n):
             p.requires_grad_(bid in lr_conv_layer_ids)
         if ("cross_attn.k_img_linear" in n) or ("cross_attn.v_img_linear" in n) or ("cross_attn.img_residual_linear" in n) or ("semantic_gate" in n):
             p.requires_grad_(bid in semantic_layer_ids)
@@ -1518,39 +1580,47 @@ def should_run_proxy_validation(epoch_1based: int) -> bool:
 def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module):
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
     sem_adapter_params = [p for p in sem_adapter.parameters() if p.requires_grad]
-    lora_params = []
-    ip_control_params = []
+    lora_params, cond_params, final_layer_params = [], [], []
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
         if ("pixel_lora_" in n) or ("semantic_lora_" in n):
             lora_params.append(p)
+        elif "final_layer" in n:
+            final_layer_params.append(p)
         else:
-            ip_control_params.append(p)
+            cond_params.append(p)
 
     optim_groups = []
-    if adapter_params or ip_control_params or sem_adapter_params:
-        optim_groups.append({"params": adapter_params + sem_adapter_params + ip_control_params, "lr": 3e-4, "weight_decay": 0.01})
+    if adapter_params:
+        optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
+    if sem_adapter_params:
+        optim_groups.append({"params": sem_adapter_params, "lr": 1e-4, "weight_decay": 0.01})
+    if cond_params:
+        optim_groups.append({"params": cond_params, "lr": 1e-4, "weight_decay": 0.01})
+    if final_layer_params:
+        optim_groups.append({"params": final_layer_params, "lr": 5e-5, "weight_decay": 0.01})
     if lora_params:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + sem_adapter_params + ip_control_params + lora_params
+    params_to_clip = adapter_params + sem_adapter_params + cond_params + final_layer_params + lora_params
 
-    pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped_pixart = ip_control_params + lora_params
-    if len({id(p) for p in grouped_pixart}) != len(grouped_pixart):
-        raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
-    if {id(p) for p in grouped_pixart} != {id(p) for p in pixart_trainable}:
-        raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
+    all_trainable = [p for p in list(pixart.parameters()) + list(adapter.parameters()) + list(sem_adapter.parameters()) if p.requires_grad]
+    grouped = adapter_params + sem_adapter_params + cond_params + final_layer_params + lora_params
+    if len({id(p) for p in grouped}) != len(grouped):
+        raise RuntimeError("Optimizer grouping has duplicate parameters across groups.")
+    if {id(p) for p in grouped} != {id(p) for p in all_trainable}:
+        raise RuntimeError("Optimizer grouping does not exactly cover all trainable parameters.")
 
     group_counts = {
         "adapter": len(adapter_params),
         "sem_adapter": len(sem_adapter_params),
-        "ip_control_pixart": len(ip_control_params),
+        "cond_pixart": len(cond_params),
+        "final_layer": len(final_layer_params),
         "lora": len(lora_params),
     }
     return optimizer, params_to_clip, group_counts
@@ -1562,17 +1632,20 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     pix_named = dict(pixart.named_parameters())
     ad_named = dict(adapter.named_parameters())
     sem_named = dict(sem_adapter.named_parameters()) if sem_adapter is not None else {}
+    first_pixel = int(PIXEL_LAYERS[0])
+    first_lrconv = int(LR_CONV_LAYERS[0])
+    first_sem = int(SEMANTIC_LAYERS[0])
     first_pixel_lora_B = next((p for n, p in pixart.named_parameters() if "pixel_lora_B.weight" in n), None)
     first_sem_lora_B = next((p for n, p in pixart.named_parameters() if "semantic_lora_B.weight" in n), None)
     watched = [
         ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.lr_ip_proj.weight", pix_named.get("lr_ip_proj.weight", None)),
         ("pixart.sem_ip_proj.weight", pix_named.get("sem_ip_proj.weight", None)),
-        ("pixart.blocks.0.lr_ip_attn.proj.weight", pix_named.get("blocks.0.lr_ip_attn.proj.weight", None)),
-        ("pixart.blocks.0.lr_stream_attn.proj.weight", pix_named.get("blocks.0.lr_stream_attn.proj.weight", None)),
-        ("pixart.blocks.0.lr_cross_conv.dw.weight", pix_named.get("blocks.0.lr_cross_conv.dw.weight", None)),
-        ("pixart.blocks.20.cross_attn.img_residual_linear.weight", pix_named.get("blocks.20.cross_attn.img_residual_linear.weight", None)),
-        ("pixart.blocks.20.cross_attn.k_img_linear.weight", pix_named.get("blocks.20.cross_attn.k_img_linear.weight", None)),
+        (f"pixart.blocks.{first_pixel}.lr_ip_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_ip_attn.proj.weight", None)),
+        (f"pixart.blocks.{first_pixel}.lr_stream_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_stream_attn.proj.weight", None)),
+        (f"pixart.blocks.{first_lrconv}.lr_cross_conv.dw.weight", pix_named.get(f"blocks.{first_lrconv}.lr_cross_conv.dw.weight", None)),
+        (f"pixart.blocks.{first_sem}.cross_attn.img_residual_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.img_residual_linear.weight", None)),
+        (f"pixart.blocks.{first_sem}.cross_attn.k_img_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.k_img_linear.weight", None)),
         ("pixart.first_pixel_lora_B.weight", first_pixel_lora_B),
         ("pixart.first_semantic_lora_B.weight", first_sem_lora_B),
         ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
@@ -1588,7 +1661,7 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         w_norm = float(p.detach().float().norm().item())
         g_norm = 0.0 if p.grad is None else float(p.grad.detach().float().norm().item())
         msg.append(f"{name}: g={g_norm:.3e}, w={w_norm:.3e}")
-        if g_norm < 1e-12:
+        if p.requires_grad and g_norm < 1e-12:
             warnings.append(name)
     print(" | ".join(msg))
     if warnings:
@@ -2391,8 +2464,8 @@ def main():
         input_size=64, in_channels=4, out_channels=4,
         force_null_caption=False,
         anchor_layers=list(ANCHOR_LAYERS),
-        pixel_layers=list(ANCHOR_LAYERS),
-        lr_conv_layers=list(ANCHOR_LAYERS),
+        pixel_layers=list(PIXEL_LAYERS),
+        lr_conv_layers=list(LR_CONV_LAYERS),
         semantic_layers=list(SEMANTIC_LAYERS),
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
@@ -2410,11 +2483,16 @@ def main():
         missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
         print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
     pixart.enable_sr_conditioning_layers(
-        pixel_layers=list(ANCHOR_LAYERS),
-        lr_conv_layers=list(ANCHOR_LAYERS),
+        pixel_layers=list(PIXEL_LAYERS),
+        lr_conv_layers=list(LR_CONV_LAYERS),
         semantic_layers=list(SEMANTIC_LAYERS),
         init_gate=-4.0,
     )
+    sem0 = int(SEMANTIC_LAYERS[0])
+    sem_std = float(pixart.blocks[sem0].cross_attn.out_proj.weight.detach().float().std().item())
+    print(f"[semantic-enable-check] layer={sem0} out_proj.weight.std={sem_std:.6e}")
+    if sem_std <= 1e-8:
+        raise RuntimeError("semantic layer out_proj.weight.std() is zero after enable; call order is wrong.")
     if ENABLE_LORA:
         apply_lora(pixart)
         set_dual_lora_scales(pixart, lambda_pix=1.0, lambda_sem=1.0)

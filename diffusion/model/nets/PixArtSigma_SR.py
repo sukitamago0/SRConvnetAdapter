@@ -68,12 +68,6 @@ class PixArtSigmaSR(PixArtMS):
 
         self._last_sft_stats = None
         self._last_image_stats = None
-        self.enable_sr_conditioning_layers(
-            pixel_layers=self.pixel_layers,
-            lr_conv_layers=self.lr_conv_layers,
-            semantic_layers=self.semantic_layers,
-            init_gate=-4.0,
-        )
 
     def enable_sr_conditioning_layers(self, pixel_layers, lr_conv_layers, semantic_layers, init_gate: float = -4.0):
         pset = {int(i) for i in pixel_layers}
@@ -92,6 +86,13 @@ class PixArtSigmaSR(PixArtMS):
                 nn.init.constant_(block.semantic_gate, float(init_gate))
             if (i in sset) and (not isinstance(block.cross_attn, DecoupledImageTextCrossAttention)):
                 block.cross_attn = DecoupledImageTextCrossAttention.from_text_cross_attn(block.cross_attn)
+            if (i in sset) and isinstance(block.cross_attn, DecoupledImageTextCrossAttention):
+                out_std = float(block.cross_attn.out_proj.weight.detach().float().std().item())
+                if out_std <= 1e-8:
+                    raise RuntimeError(
+                        f"semantic layer {i} has zero out_proj std after enable_sr_conditioning_layers; "
+                        "likely called before loading base checkpoint."
+                    )
         nn.init.constant_(self.local_entry_gate, float(init_gate))
 
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):

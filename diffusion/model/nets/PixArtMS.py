@@ -366,6 +366,8 @@ class PixArtMS(PixArt):
                 nn.init.constant_(block.lr_cross_conv.dw.weight, 0)
                 if block.lr_cross_conv.dw.bias is not None:
                     nn.init.constant_(block.lr_cross_conv.dw.bias, 0)
+                if block.lr_cross_conv.pw.bias is not None:
+                    nn.init.constant_(block.lr_cross_conv.pw.bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.linear.weight, 0)
