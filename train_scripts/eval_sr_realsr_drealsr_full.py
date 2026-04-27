@@ -35,6 +35,10 @@ from diffusion.model.nets.adapter_cond import mask_adapter_cond
 USE_ADAPTIVE_TEXT_PROMPT = True
 ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
 STRICT_ADAPTIVE_PROMPT = bool(int(os.getenv("STRICT_ADAPTIVE_PROMPT", "0")))
+DEFAULT_SEMANTIC_ENCODER = os.getenv(
+    "SEMANTIC_ENCODER_NAME_OR_PATH",
+    "/workspace/models/openai/clip-vit-large-patch14",
+)
 
 
 
@@ -559,8 +563,15 @@ def build_model_and_assets(args, device, compute_dtype):
         hidden_size=1152,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
+    semantic_encoder_path = (
+        args.semantic_encoder_name_or_path
+        or layer_cfg.get("semantic_encoder_name_or_path")
+        or cfg.get("semantic_encoder_name_or_path")
+        or os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH")
+        or "/workspace/models/openai/clip-vit-large-patch14"
+    )
     sem_adapter = CLIPSemanticAdapter(
-        encoder_name_or_path=args.semantic_encoder_name_or_path,
+        encoder_name_or_path=semantic_encoder_path,
         hidden_size=1152,
         num_prompt_tokens=16,
     ).to(device).eval()
@@ -1014,7 +1025,7 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--sft_strength", type=float, default=1.0)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
-    parser.add_argument("--semantic-encoder-name-or-path", type=str, default="openai/clip-vit-large-patch14")
+    parser.add_argument("--semantic-encoder-name-or-path", type=str, default=DEFAULT_SEMANTIC_ENCODER)
     parser.add_argument("--lambda-pix", type=float, default=1.0)
     parser.add_argument("--lambda-sem", type=float, default=1.0)
     parser.add_argument("--disable-semantic-branch", action="store_true")

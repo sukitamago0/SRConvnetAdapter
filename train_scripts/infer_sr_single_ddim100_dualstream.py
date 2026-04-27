@@ -20,6 +20,11 @@ from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
 from diffusion.model.nets.adapter_cond import mask_adapter_cond
 
+DEFAULT_SEMANTIC_ENCODER = os.getenv(
+    "SEMANTIC_ENCODER_NAME_OR_PATH",
+    "/workspace/models/openai/clip-vit-large-patch14",
+)
+
 
 def randn_like_with_generator(tensor, generator):
     return torch.randn(tensor.shape, device=tensor.device, dtype=tensor.dtype, generator=generator)
@@ -71,6 +76,7 @@ def run(args):
 
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
     layer_cfg = ckpt.get("layer_config", {}) if isinstance(ckpt, dict) else {}
+    cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
     anchor_layers = list(layer_cfg.get("anchor_layers", [2, 4, 6, 8]))
 
     pixart = PixArtSigmaSR_XL_2(
@@ -103,8 +109,15 @@ def run(args):
         in_channels=3,
         hidden_size=1152,
     ).to(device).float()
+    semantic_encoder_path = (
+        args.semantic_encoder_name_or_path
+        or layer_cfg.get("semantic_encoder_name_or_path")
+        or cfg.get("semantic_encoder_name_or_path")
+        or os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH")
+        or "/workspace/models/openai/clip-vit-large-patch14"
+    )
     sem_adapter = CLIPSemanticAdapter(
-        encoder_name_or_path=args.semantic_encoder_name_or_path,
+        encoder_name_or_path=semantic_encoder_path,
         hidden_size=1152,
         num_prompt_tokens=16,
     ).to(device).eval()
@@ -270,7 +283,7 @@ def parse_args():
     parser.add_argument("--vae-path", type=str, required=True)
     parser.add_argument("--null-t5-embed-path", type=str, required=True)
     parser.add_argument("--hard-prompt-embed-path", type=str, required=True)
-    parser.add_argument("--semantic-encoder-name-or-path", type=str, default="openai/clip-vit-large-patch14")
+    parser.add_argument("--semantic-encoder-name-or-path", type=str, default=DEFAULT_SEMANTIC_ENCODER)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--crop-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=3407)

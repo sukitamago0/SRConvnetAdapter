@@ -154,7 +154,7 @@ GUARD_FORWARD_EVERY = 50
 LR_BASE = 1e-5 
 LORA_RANK = 16
 LORA_ALPHA = 16
-SEMANTIC_ENCODER_NAME_OR_PATH = os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "openai/clip-vit-large-patch14")
+SEMANTIC_ENCODER_NAME_OR_PATH = os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "/workspace/models/openai/clip-vit-large-patch14")
 USE_SEMANTIC_BRANCH = True
 ALLOW_SEM_ADAPTER_NONSTRICT_RESUME = False
 USE_FIXED_HARD_PROMPT = False
@@ -856,6 +856,7 @@ def get_config_snapshot():
         "semantic_prompt_branch": ("enabled" if USE_SEMANTIC_BRANCH else "disabled"),
         "semantic_prompt_source": ("CLIPSemanticAdapter + decoupled cross-attn" if USE_SEMANTIC_BRANCH else "disabled"),
         "semantic_prompt_tokens": 16,
+        "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
         "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
         "use_native_text_path": True,
         "native_text_is_null": True,
@@ -1702,14 +1703,16 @@ def should_keep_ckpt(psnr_v, lpips_v):
     p = float(psnr_v)
     mode = str(CKPT_SELECT_MODE).lower()
     gate = float(CKPT_SELECT_PSNR_GATE)
+    gate_passed = p >= gate
     if mode == "psnr_gate_then_lpips":
-        gate_passed = p >= gate
         if gate_passed:
-            return (0, lp, -p, 1)
-        return (0, -p, lp, 0)
+            return (0, lp, -p)
+        return (1, -p, lp)
     if mode == "lpips_first":
-        return (0, lp, -p, int(p >= gate))
-    return (0, -p, lp, int(p >= gate))
+        if gate_passed:
+            return (0, lp, -p)
+        return (1, -p, lp)
+    return (0, -p, lp)
 
 def atomic_torch_save(state, path):
     tmp = path + ".tmp"
@@ -1870,6 +1873,7 @@ def save_smart(
                 "lr_conv_layers": list(LR_CONV_LAYERS),
                 "semantic_layers": list(SEMANTIC_LAYERS),
                 "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
+                "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
                 "use_tala_train": bool(USE_TALA_TRAIN),
                 "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
                 "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -1943,6 +1947,7 @@ def save_smart(
                 "lr_conv_layers": list(LR_CONV_LAYERS),
                 "semantic_layers": list(SEMANTIC_LAYERS),
                 "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
+                "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
                 "use_tala_train": bool(USE_TALA_TRAIN),
                 "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
                 "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -2080,6 +2085,7 @@ def save_last_resume_only(
             "lr_conv_layers": list(LR_CONV_LAYERS),
             "semantic_layers": list(SEMANTIC_LAYERS),
             "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
+            "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
             "use_tala_train": bool(USE_TALA_TRAIN),
             "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
             "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -2536,7 +2542,7 @@ def main():
         hidden_size=1152,
     ).to(DEVICE).train()
     sem_adapter = CLIPSemanticAdapter(
-        encoder_name_or_path=os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "/workspace/models/openai/clip-vit-large-patch14"),
+        encoder_name_or_path=SEMANTIC_ENCODER_NAME_OR_PATH,
         hidden_size=1152,
         num_prompt_tokens=16,
     ).to(DEVICE).train()
