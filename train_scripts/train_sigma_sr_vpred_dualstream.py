@@ -66,6 +66,7 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "lr_ip_gate",
     "lr_stream_attn",
     "lr_stream_gate",
+    "lr_memory_gate",
     "lr_cross_conv",
     "lr_cross_conv_gate",
     "sem_ip_proj",
@@ -1481,6 +1482,14 @@ def _block_id_from_name(name: str):
     m = re.search(r"blocks\.(\d+)\.", name)
     return int(m.group(1)) if m else None
 
+def first_param_in_layers(model: nn.Module, name_fragment: str, layer_ids):
+    layer_ids = set(int(i) for i in layer_ids)
+    for n, p in model.named_parameters():
+        bid = _block_id_from_name(n)
+        if bid in layer_ids and (name_fragment in n):
+            return n, p
+    return None, None
+
 
 def apply_lora(model):
     cnt = apply_dual_lora(
@@ -1646,22 +1655,26 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
     first_pixel = int(PIXEL_LAYERS[0])
     first_lrconv = int(LR_CONV_LAYERS[0])
     first_sem = int(SEMANTIC_LAYERS[0])
-    first_pixel_lora_B = next((p for n, p in pixart.named_parameters() if "pixel_lora_B.weight" in n), None)
-    first_sem_lora_B = next((p for n, p in pixart.named_parameters() if "semantic_lora_B.weight" in n), None)
+    first_pixel_lora_name, first_pixel_lora_B = first_param_in_layers(
+        pixart, "pixel_lora_B.weight", PIXEL_LAYERS
+    )
+    first_sem_lora_name, first_sem_lora_B = first_param_in_layers(
+        pixart, "semantic_lora_B.weight", SEMANTIC_LAYERS
+    )
     watched = [
         ("pixart.lr_ip_proj.weight", pix_named.get("lr_ip_proj.weight", None)),
         ("pixart.sem_ip_proj.weight", pix_named.get("sem_ip_proj.weight", None)),
         (f"pixart.blocks.{first_pixel}.lr_ip_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_ip_attn.proj.weight", None)),
         (f"pixart.blocks.{first_pixel}.lr_stream_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_stream_attn.proj.weight", None)),
-        (f"pixart.blocks.{first_pixel}.lr_memory_gate", pix_named.get(f"blocks.{first_pixel}.lr_memory_gate", None)),
         (f"pixart.blocks.{first_lrconv}.lr_cross_conv.dw.weight", pix_named.get(f"blocks.{first_lrconv}.lr_cross_conv.dw.weight", None)),
         (f"pixart.blocks.{first_sem}.cross_attn.img_residual_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.img_residual_linear.weight", None)),
-        ("pixart.first_pixel_lora_B.weight", first_pixel_lora_B),
-        ("pixart.first_semantic_lora_B.weight", first_sem_lora_B),
+        (first_pixel_lora_name or "pixart.first_pixel_lora_B.weight", first_pixel_lora_B),
+        (first_sem_lora_name or "pixart.first_semantic_lora_B.weight", first_sem_lora_B),
         ("sem_adapter.proj.weight", sem_named.get("proj.weight", None)),
         ("sem_adapter.resampler.latents", sem_named.get("resampler.latents", None)),
     ]
     soft_watched = [
+        (f"pixart.blocks.{first_pixel}.lr_memory_gate", pix_named.get(f"blocks.{first_pixel}.lr_memory_gate", None)),
         (f"pixart.blocks.{first_sem}.cross_attn.k_img_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.k_img_linear.weight", None)),
         (f"pixart.blocks.{first_sem}.cross_attn.v_img_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.v_img_linear.weight", None)),
     ]
