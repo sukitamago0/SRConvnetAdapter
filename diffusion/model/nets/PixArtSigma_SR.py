@@ -84,6 +84,8 @@ class PixArtSigmaSR(PixArtMS):
             nn.init.constant_(block.lr_ip_gate, float(init_gate))
             if hasattr(block, "lr_stream_gate"):
                 nn.init.constant_(block.lr_stream_gate, float(init_gate))
+            if hasattr(block, "lr_memory_gate"):
+                nn.init.constant_(block.lr_memory_gate, float(init_gate) - 1.0)
             if hasattr(block, "lr_cross_conv_gate"):
                 nn.init.constant_(block.lr_cross_conv_gate, float(init_gate))
             if hasattr(block, "semantic_gate"):
@@ -137,10 +139,12 @@ class PixArtSigmaSR(PixArtMS):
 
         lr_ip_tokens = None
         lr_stream_tokens = None
+        lr_base_tokens = None
         sem_ip_tokens = None
         if ip_tokens is not None:
             lr_ip_tokens = self.lr_ip_proj(self.lr_ip_norm(ip_tokens.to(dtype=x.dtype)))
             lr_stream_tokens = lr_ip_tokens
+            lr_base_tokens = lr_ip_tokens
         if sem_tokens is not None:
             sem_ip_tokens = self.sem_ip_proj(self.sem_ip_norm(sem_tokens.to(dtype=x.dtype)))
 
@@ -176,7 +180,7 @@ class PixArtSigmaSR(PixArtMS):
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
         ip_gate_vals = []
-        lr_ip_stds, lr_stream_stds, lr_conv_stds, sem_gate_vals, sem_img_stds = [], [], [], [], []
+        lr_ip_stds, lr_stream_stds, lr_conv_stds, sem_gate_vals, sem_img_stds, lr_memory_gates = [], [], [], [], [], []
         for block in self.blocks:
             x_out = auto_grad_checkpoint(
                 block,
@@ -187,6 +191,7 @@ class PixArtSigmaSR(PixArtMS):
                 HW=(self.h, self.w),
                 lr_ip_tokens=lr_ip_tokens,
                 lr_stream_tokens=lr_stream_tokens,
+                lr_base_tokens=lr_base_tokens,
                 sem_tokens=sem_ip_tokens,
                 sem_scale=None,
                 lr_ip_scale=None,
@@ -201,11 +206,15 @@ class PixArtSigmaSR(PixArtMS):
                 x = x_out
             ip_gate_vals.append(float(torch.sigmoid(block.lr_ip_gate.detach()).item()))
             bstats = getattr(block, "_last_image_stats", {}) or {}
-            lr_ip_stds.append(float(bstats.get("img_delta_std", 0.0)))
-            lr_stream_stds.append(float(bstats.get("lr_stream_delta_std", 0.0)))
-            lr_conv_stds.append(float(bstats.get("lr_conv_delta_std", 0.0)))
-            sem_gate_vals.append(float(bstats.get("semantic_gate", 0.0)))
-            sem_img_stds.append(float(bstats.get("semantic_img_delta_std", 0.0)))
+            if getattr(block, "is_pixel_layer", False):
+                lr_ip_stds.append(float(bstats.get("img_delta_std", 0.0)))
+                lr_stream_stds.append(float(bstats.get("lr_stream_delta_std", 0.0)))
+                lr_memory_gates.append(float(bstats.get("lr_memory_gate", 0.0)))
+            if getattr(block, "is_lr_conv_layer", False):
+                lr_conv_stds.append(float(bstats.get("lr_conv_delta_std", 0.0)))
+            if getattr(block, "is_semantic_layer", False):
+                sem_gate_vals.append(float(bstats.get("semantic_gate", 0.0)))
+                sem_img_stds.append(float(bstats.get("semantic_img_delta_std", 0.0)))
 
         self._last_sft_stats = {
             "local_entry_gate": float(torch.sigmoid(self.local_entry_gate.detach()).item()),
@@ -214,10 +223,15 @@ class PixArtSigmaSR(PixArtMS):
             "lr_ip_gate_mean": float(sum(ip_gate_vals) / max(1, len(ip_gate_vals))),
             "lr_ip_gate_std": float(torch.tensor(ip_gate_vals).float().std(unbiased=False).item()) if len(ip_gate_vals) > 0 else 0.0,
             "lr_ip_attn_delta_std_mean": float(sum(lr_ip_stds) / max(1, len(lr_ip_stds))),
+            "lr_ip_attn_delta_std_max": float(max(lr_ip_stds)) if len(lr_ip_stds) > 0 else 0.0,
             "lr_stream_delta_std_mean": float(sum(lr_stream_stds) / max(1, len(lr_stream_stds))),
+            "lr_stream_delta_std_max": float(max(lr_stream_stds)) if len(lr_stream_stds) > 0 else 0.0,
             "lr_conv_delta_std_mean": float(sum(lr_conv_stds) / max(1, len(lr_conv_stds))),
+            "lr_conv_delta_std_max": float(max(lr_conv_stds)) if len(lr_conv_stds) > 0 else 0.0,
             "semantic_gate_mean": float(sum(sem_gate_vals) / max(1, len(sem_gate_vals))),
             "semantic_img_delta_std_mean": float(sum(sem_img_stds) / max(1, len(sem_img_stds))),
+            "semantic_img_delta_std_max": float(max(sem_img_stds)) if len(sem_img_stds) > 0 else 0.0,
+            "lr_memory_gate_mean": float(sum(lr_memory_gates) / max(1, len(lr_memory_gates))),
         }
         self._last_image_cond_stats = self._last_image_stats
 

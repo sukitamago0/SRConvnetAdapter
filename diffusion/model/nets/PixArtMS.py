@@ -70,6 +70,7 @@ class PixArtMSBlock(nn.Module):
         self.lr_cross_conv = TokenCrossStreamConv(hidden_size)
         self.lr_ip_gate = nn.Parameter(torch.full((1,), -4.0))
         self.lr_stream_gate = nn.Parameter(torch.full((1,), -4.0))
+        self.lr_memory_gate = nn.Parameter(torch.full((1,), -5.0))
         self.lr_cross_conv_gate = nn.Parameter(torch.full((1,), -4.0))
         self.semantic_gate = nn.Parameter(torch.full((1,), -4.0))
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -93,6 +94,7 @@ class PixArtMSBlock(nn.Module):
         HW=None,
         lr_ip_tokens=None,
         lr_stream_tokens=None,
+        lr_base_tokens=None,
         sem_tokens=None,
         sem_scale=None,
         lr_ip_scale=None,
@@ -129,6 +131,9 @@ class PixArtMSBlock(nn.Module):
             g_stream = torch.sigmoid(self.lr_stream_gate).to(dtype=x.dtype).view(1, 1, 1)
             stream_delta = g_stream * self.lr_stream_attn(lr_stream_tokens, x, None)
             lr_stream_tokens = lr_stream_tokens + self.drop_path(stream_delta)
+        if self.is_pixel_layer and (lr_stream_tokens is not None) and (lr_base_tokens is not None):
+            g_mem = torch.sigmoid(self.lr_memory_gate).to(dtype=x.dtype).view(1, 1, 1)
+            lr_stream_tokens = lr_stream_tokens + g_mem * lr_base_tokens.to(dtype=x.dtype)
         if lr_ip_tokens is not None and (lr_stream_tokens is None):
             lr_stream_tokens = lr_ip_tokens
         if self.is_pixel_layer and (lr_stream_tokens is not None):
@@ -146,6 +151,7 @@ class PixArtMSBlock(nn.Module):
             "img_delta_std": float(lr_delta.detach().float().std().item()),
             "lr_stream_delta_std": float(stream_delta.detach().float().std().item()),
             "lr_conv_delta_std": float(conv_delta.detach().float().std().item()),
+            "lr_memory_gate": float(torch.sigmoid(self.lr_memory_gate.detach()).item()),
             "semantic_img_delta_std": float(sem_img_delta_std),
             "semantic_gate": float(torch.sigmoid(self.semantic_gate.detach()).item()),
         }

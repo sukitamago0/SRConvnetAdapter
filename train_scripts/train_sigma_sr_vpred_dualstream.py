@@ -150,6 +150,7 @@ VAL_NUM_WORKERS = 0
 TRAIN_PROMPT_CACHE_MAX_ITEMS = 0
 VAL_PROMPT_CACHE_MAX_ITEMS = 128
 GUARD_FORWARD_EVERY = 50
+MODULE_MONITOR_EVERY = int(os.getenv("MODULE_MONITOR_EVERY", "200"))
 
 LR_BASE = 1e-5 
 LORA_RANK = 16
@@ -170,11 +171,11 @@ INJECT_S_MIN = 0.1
 INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
 # anchor_layers = early structure-only band
-ANCHOR_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7]
-PIXEL_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7]
-LR_CONV_LAYERS = [2, 3, 4, 5, 6, 7]
+ANCHOR_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7, 10, 13, 16, 19, 22, 25, 27]
+PIXEL_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7, 10, 13, 16, 19, 22, 25, 27]
+LR_CONV_LAYERS = [2, 4, 6, 10, 13, 16, 19, 22, 25]
 # semantic_layers = late semantic-only band
-SEMANTIC_LAYERS = [24, 25, 26, 27]
+SEMANTIC_LAYERS = [20, 23, 26, 27]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -1538,7 +1539,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             continue
         if ("lr_ip_attn" in n) or ("lr_stream_attn" in n):
             p.requires_grad_(bid in pixel_layer_ids)
-        if ("lr_ip_gate" in n) or ("lr_stream_gate" in n):
+        if ("lr_ip_gate" in n) or ("lr_stream_gate" in n) or ("lr_memory_gate" in n):
             p.requires_grad_(bid in pixel_layer_ids)
         if ("lr_cross_conv" in n):
             p.requires_grad_(bid in lr_conv_layer_ids)
@@ -1554,7 +1555,7 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
     print(f"✅ PixArt trainable configured(IP-control): before={total_trainable_before}, after={total_trainable_after}")
     trainable_names = [n for n, p in pixart.named_parameters() if p.requires_grad]
-    must_have = ["lr_stream_attn", "lr_cross_conv", "sem_ip_proj", "cross_attn.k_img_linear", "cross_attn.img_residual_linear", "pixel_lora", "semantic_lora"]
+    must_have = ["lr_stream_attn", "lr_memory_gate", "lr_cross_conv", "sem_ip_proj", "cross_attn.k_img_linear", "cross_attn.img_residual_linear", "pixel_lora", "semantic_lora"]
     missing = [m for m in must_have if not any(m in n for n in trainable_names)]
     if missing:
         raise RuntimeError(f"Trainable paths missing required fragments: {missing}")
@@ -1652,6 +1653,7 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         ("pixart.sem_ip_proj.weight", pix_named.get("sem_ip_proj.weight", None)),
         (f"pixart.blocks.{first_pixel}.lr_ip_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_ip_attn.proj.weight", None)),
         (f"pixart.blocks.{first_pixel}.lr_stream_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_stream_attn.proj.weight", None)),
+        (f"pixart.blocks.{first_pixel}.lr_memory_gate", pix_named.get(f"blocks.{first_pixel}.lr_memory_gate", None)),
         (f"pixart.blocks.{first_lrconv}.lr_cross_conv.dw.weight", pix_named.get(f"blocks.{first_lrconv}.lr_cross_conv.dw.weight", None)),
         (f"pixart.blocks.{first_sem}.cross_attn.img_residual_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.img_residual_linear.weight", None)),
         ("pixart.first_pixel_lora_B.weight", first_pixel_lora_B),
@@ -2246,6 +2248,19 @@ def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_
     last_val_psnr = float(ckpt.get("last_val_psnr", -1.0))
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), None, last_val_psnr
 
+def clone_adapter_cond(cond):
+    out = {}
+    for k, v in cond.items():
+        out[k] = v.clone() if torch.is_tensor(v) else v
+    return out
+
+def zero_cond_keys(cond, keys):
+    out = clone_adapter_cond(cond)
+    for k in keys:
+        if k in out and torch.is_tensor(out[k]):
+            out[k] = torch.zeros_like(out[k])
+    return out
+
 # ================= 9. Validation =================
 @torch.no_grad()
 def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
@@ -2811,6 +2826,7 @@ def main():
                     "tala_t_min": int(tala_stats.get("tala_t_min", 0)),
                     "tala_t_max": int(tala_stats.get("tala_t_max", 0)),
                     "tala_effective_eps_std": float(tala_stats.get("tala_effective_eps_std", 0.0)),
+                    "adapter_dropped": int(adapter_dropped),
                 }
                 assert_finite_tensor("ip_tokens", tokens, guard_stats)
                 assert_finite_tensor("cond_map", cond_in["cond_map"], guard_stats)
@@ -2870,6 +2886,78 @@ def main():
                 else:
                     cond_delta_curr = float(last_cond_delta_curr)
                     text_cond_delta_curr = float(last_text_cond_delta_curr)
+
+                run_module_monitor = ((step % MODULE_MONITOR_EVERY) == 0)
+                if run_module_monitor and (not adapter_dropped):
+                    with torch.no_grad():
+                        cond_no_local = zero_cond_keys(cond_in, ["local_entry_tokens", "cond_map"])
+                        cond_no_lr = zero_cond_keys(cond_in, ["ip_tokens", "cond_tokens"])
+                        cond_no_sem = zero_cond_keys(cond_in, ["sem_tokens"])
+                        cond_no_all = mask_adapter_cond(cond_in, torch.zeros((zt_in.shape[0],), device=DEVICE))
+                        out_no_local = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_no_local,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                        out_no_lr = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_no_lr,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                        out_no_sem = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_no_sem,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                        out_no_all = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_no_all,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                    full_out = model_pred.detach()
+                    effect_local = float((full_out - out_no_local).abs().mean().item())
+                    effect_lr_tokens = float((full_out - out_no_lr).abs().mean().item())
+                    effect_semantic = float((full_out - out_no_sem).abs().mean().item())
+                    effect_all_adapter = float((full_out - out_no_all).abs().mean().item())
+                    model_pred_std = float(full_out.float().std().item())
+                    denom = max(1e-8, model_pred_std)
+                    guard_stats.update(
+                        {
+                            "effect_local": effect_local,
+                            "effect_lr_tokens": effect_lr_tokens,
+                            "effect_semantic": effect_semantic,
+                            "effect_all_adapter": effect_all_adapter,
+                            "model_pred_std": model_pred_std,
+                            "effect_local_ratio": effect_local / denom,
+                            "effect_lr_tokens_ratio": effect_lr_tokens / denom,
+                            "effect_semantic_ratio": effect_semantic / denom,
+                            "effect_all_adapter_ratio": effect_all_adapter / denom,
+                        }
+                    )
 
                 # [V8 Logic] Min-SNR-Gamma Weighting (per-sample, shape [B])
                 alpha_s = alpha_t[:, 0, 0, 0]
@@ -3001,6 +3089,10 @@ def main():
                 adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 adapter_delta_same_text = float(guard_stats.get("adapter_delta_same_text", float("nan")))
+                effect_local_ratio = float(guard_stats.get("effect_local_ratio", float("nan")))
+                effect_lr_tokens_ratio = float(guard_stats.get("effect_lr_tokens_ratio", float("nan")))
+                effect_semantic_ratio = float(guard_stats.get("effect_semantic_ratio", float("nan")))
+                effect_all_adapter_ratio = float(guard_stats.get("effect_all_adapter_ratio", float("nan")))
                 sem_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                 sem_tokens_std = float(sem_stats.get("sem_tokens_postproj_std", 0.0))
                 sem_out_scale = float(sem_stats.get("sem_out_scale", 0.0))
@@ -3056,6 +3148,11 @@ def main():
                     'cond_map_std': f"{cond_map_std:.4f}",
                     'sem_tok_std': f"{sem_tokens_std:.4f}",
                     'sem_scale': f"{sem_out_scale:.3f}",
+                    'eff_loc_r': f"{effect_local_ratio:.3f}" if math.isfinite(effect_local_ratio) else "nan",
+                    'eff_lr_r': f"{effect_lr_tokens_ratio:.3f}" if math.isfinite(effect_lr_tokens_ratio) else "nan",
+                    'eff_sem_r': f"{effect_semantic_ratio:.3f}" if math.isfinite(effect_semantic_ratio) else "nan",
+                    'eff_all_r': f"{effect_all_adapter_ratio:.3f}" if math.isfinite(effect_all_adapter_ratio) else "nan",
+                    'ad_drop': f"{int(adapter_dropped)}",
                     'cpu_rss_gb': f"{cpu_rss_gb:.3f}" if math.isfinite(cpu_rss_gb) else "nan",
                 }
                 log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
@@ -3084,6 +3181,16 @@ def main():
                     "sft_delta_std": sft_delta_std,
                     "sem_tokens_std": sem_tokens_std,
                     "sem_out_scale": sem_out_scale,
+                    "effect_local": float(guard_stats.get("effect_local", float("nan"))),
+                    "effect_lr_tokens": float(guard_stats.get("effect_lr_tokens", float("nan"))),
+                    "effect_semantic": float(guard_stats.get("effect_semantic", float("nan"))),
+                    "effect_all_adapter": float(guard_stats.get("effect_all_adapter", float("nan"))),
+                    "model_pred_std": float(guard_stats.get("model_pred_std", float("nan"))),
+                    "effect_local_ratio": effect_local_ratio,
+                    "effect_lr_tokens_ratio": effect_lr_tokens_ratio,
+                    "effect_semantic_ratio": effect_semantic_ratio,
+                    "effect_all_adapter_ratio": effect_all_adapter_ratio,
+                    "adapter_dropped": int(adapter_dropped),
                     "run_guard_forward": int(run_guard_forward),
                     "adaptive_prompt_hit_rate": float(prompt_cache_hit_rate),
                     "num_missing_prompt_packs": int(num_missing_prompt_packs),
