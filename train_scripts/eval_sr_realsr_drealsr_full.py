@@ -28,9 +28,17 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
+from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
+from diffusion.model.nets.adapter_cond import mask_adapter_cond
 
 USE_ADAPTIVE_TEXT_PROMPT = True
 ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
+STRICT_ADAPTIVE_PROMPT = bool(int(os.getenv("STRICT_ADAPTIVE_PROMPT", "0")))
+DEFAULT_SEMANTIC_ENCODER = os.getenv(
+    "SEMANTIC_ENCODER_NAME_OR_PATH",
+    "/workspace/models/openai/clip-vit-large-patch14",
+)
 
 
 
@@ -246,77 +254,6 @@ def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context
     if len(skipped) > 0:
         print(f"[{context}] skipped examples: {skipped[:5]}")
     return missing, unexpected, skipped
-
-
-def infer_lora_rank_from_state_dict(state_dict: dict):
-    """
-    Infer LoRA rank from saved lora_A / lora_B tensors.
-    Returns int or None.
-    """
-    if not isinstance(state_dict, dict):
-        return None
-
-    for k, v in state_dict.items():
-        if not torch.is_tensor(v):
-            continue
-        if "lora_A" in k and v.ndim == 2:
-            return int(v.shape[0])
-        if "lora_B" in k and v.ndim == 2:
-            return int(v.shape[1])
-    return None
-
-
-
-def _block_id_from_name(name: str):
-    m = re.search(r"blocks\.(\d+)\.", name)
-    return int(m.group(1)) if m else None
-
-
-def _lora_target_kind(module_name: str):
-    if ("attn.qkv" in module_name) or ("attn.proj" in module_name):
-        return "attn"
-    return None
-
-
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, r: int, alpha: float):
-        super().__init__()
-        self.base = base
-        self.scaling = alpha / r
-        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
-        self.lora_A.to(base.weight.device)
-        self.lora_B.to(base.weight.device)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-        self.base.weight.requires_grad = False
-        if self.base.bias is not None:
-            self.base.bias.requires_grad = False
-
-    def forward(self, x):
-        out = self.base(x)
-        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
-        return out + delta.to(out.dtype)
-
-
-def apply_lora(model, lora_rank: int = 4, lora_alpha: float = 4.0):
-    cnt = 0
-    for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear):
-            continue
-        block_id = _block_id_from_name(name)
-        if block_id is None:
-            continue
-        kind = _lora_target_kind(name)
-        if kind is None:
-            continue
-        if not (0 <= block_id <= 27):
-            continue
-        parent = model.get_submodule(name.rsplit('.', 1)[0])
-        child = name.rsplit('.', 1)[1]
-        setattr(parent, child, LoRALinear(module, int(lora_rank), alpha=float(lora_alpha)))
-        cnt += 1
-    print(f"✅ Attention LoRA applied to {cnt} layers (rank={int(lora_rank)}, alpha={float(lora_alpha)}).")
 
 
 class RealSRValPairedDataset(Dataset):
@@ -565,30 +502,36 @@ def build_model_and_assets(args, device, compute_dtype):
         pixart.load_pretrained_weights_with_zero_init(base)
     else:
         load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+    pixart.enable_sr_conditioning_layers(
+        pixel_layers=list(layer_cfg.get("pixel_layers", layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7]))),
+        lr_conv_layers=list(layer_cfg.get("lr_conv_layers", layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7]))),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
+        init_gate=-4.0,
+    )
+    sem0 = int(layer_cfg.get("semantic_layers", [24, 25, 26, 27])[0])
+    sem_std = float(pixart.blocks[sem0].cross_attn.out_proj.weight.detach().float().std().item())
+    print(f"[semantic-enable-check] layer={sem0} out_proj.weight.std={sem_std:.6e}")
+    if sem_std <= 1e-8:
+        raise RuntimeError("semantic layer out_proj.weight.std() is zero after enable; call order is wrong.")
 
-    has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in pixart_state.keys())
+    has_dual_lora = any(
+        ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
+        for k in pixart_state.keys()
+    )
+    dual_lora = bool(layer_cfg.get("dual_lora", False)) or has_dual_lora
+    lora_rank = int(layer_cfg.get("pixel_lora_rank", ckpt.get("lora_rank", cfg.get("lora_rank", 4))))
+    lora_alpha = float(layer_cfg.get("pixel_lora_alpha", ckpt.get("lora_alpha", cfg.get("lora_alpha", 4.0))))
 
-    lora_rank = ckpt.get("lora_rank", None)
-    if lora_rank is None:
-        lora_rank = cfg.get("lora_rank", None)
-    if lora_rank is None and has_lora:
-        lora_rank = infer_lora_rank_from_state_dict(pixart_state)
-    if lora_rank is None:
-        lora_rank = 4
-    lora_rank = int(lora_rank)
-
-    lora_alpha = ckpt.get("lora_alpha", None)
-    if lora_alpha is None:
-        lora_alpha = cfg.get("lora_alpha", None)
-    if lora_alpha is None and has_lora:
-        lora_alpha = float(lora_rank)
-    if lora_alpha is None:
-        lora_alpha = 4.0
-    lora_alpha = float(lora_alpha)
-
-    print(f"[Eval-Model] has_lora={has_lora} lora_rank={lora_rank} lora_alpha={lora_alpha}")
-    if has_lora:
-        apply_lora(pixart, lora_rank=lora_rank, lora_alpha=lora_alpha)
+    print(f"[Eval-Model] dual_lora={dual_lora} lora_rank={lora_rank} lora_alpha={lora_alpha}")
+    if dual_lora:
+        apply_dual_lora(
+            pixart,
+            pixel_rank=int(layer_cfg.get("pixel_lora_rank", lora_rank)),
+            semantic_rank=int(layer_cfg.get("semantic_lora_rank", lora_rank)),
+            pixel_alpha=float(layer_cfg.get("pixel_lora_alpha", lora_alpha)),
+            semantic_alpha=float(layer_cfg.get("semantic_lora_alpha", lora_alpha)),
+        )
+        set_dual_lora_scales(pixart, lambda_pix=float(args.lambda_pix), lambda_sem=float(args.lambda_sem))
 
     load_state_dict_shape_compatible(pixart, pixart_state, context="eval")
 
@@ -596,7 +539,7 @@ def build_model_and_assets(args, device, compute_dtype):
     skipped_lora_keys = []
 
     for k, v in pixart_state.items():
-        if ("lora_A" in k) or ("lora_B" in k):
+        if ("pixel_lora_" in k) or ("semantic_lora_" in k):
             curr = pixart.state_dict()
             if k in curr and tuple(curr[k].shape) == tuple(v.shape):
                 loaded_lora_keys.append(k)
@@ -605,11 +548,11 @@ def build_model_and_assets(args, device, compute_dtype):
 
     print(
         f"[LoRA Eval] requested rank={lora_rank}, alpha={lora_alpha}, "
-        f"saved_lora_tensors={len([k for k in pixart_state if ('lora_A' in k) or ('lora_B' in k)])}, "
+        f"saved_lora_tensors={len([k for k in pixart_state if ('pixel_lora_' in k) or ('semantic_lora_' in k)])}, "
         f"shape_compatible={len(loaded_lora_keys)}, skipped={len(skipped_lora_keys)}"
     )
 
-    if has_lora and len(loaded_lora_keys) == 0:
+    if dual_lora and len(loaded_lora_keys) == 0:
         raise RuntimeError(
             "Checkpoint contains LoRA weights, but none of them are shape-compatible with the eval model. "
             "This usually means the eval script rebuilt LoRA with the wrong rank/alpha."
@@ -620,6 +563,37 @@ def build_model_and_assets(args, device, compute_dtype):
         hidden_size=1152,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
+    semantic_encoder_path = (
+        args.semantic_encoder_name_or_path
+        or layer_cfg.get("semantic_encoder_name_or_path")
+        or cfg.get("semantic_encoder_name_or_path")
+        or os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH")
+        or "/workspace/models/openai/clip-vit-large-patch14"
+    )
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=semantic_encoder_path,
+        hidden_size=1152,
+        num_prompt_tokens=16,
+    ).to(device).eval()
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
+    if not bool(args.disable_semantic_branch):
+        if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
+            required_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+            missing_sem_keys = [k for k in required_sem_keys if k not in sem_adapter_sd]
+            if missing_sem_keys:
+                raise RuntimeError(f"Checkpoint sem_adapter missing required keys in eval: {missing_sem_keys}")
+            missing, unexpected, skipped = load_state_dict_shape_compatible(
+                sem_adapter,
+                sem_adapter_sd,
+                context="eval-sem-adapter",
+            )
+            loaded_count = len(sem_adapter_sd) - len(skipped)
+            if loaded_count <= 0:
+                raise RuntimeError(
+                    "No sem_adapter tensors were loaded; refusing to eval with random semantic adapter."
+                )
+        else:
+            raise RuntimeError("Checkpoint missing sem_adapter while semantic branch is enabled in eval.")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -642,11 +616,12 @@ def build_model_and_assets(args, device, compute_dtype):
 
     pixart.eval()
     adapter.eval()
-    return pixart, adapter, vae, null_pack, scheduler
+    sem_adapter.eval()
+    return pixart, adapter, sem_adapter, vae, null_pack, scheduler
 
 
 @torch.no_grad()
-def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem):
+def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem):
     hr = batch["hr"].to(device)
     lr = batch["lr"].to(device)
     lr_small = batch["lr_small"].to(device)
@@ -684,6 +659,8 @@ def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, de
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
+            if not bool(args.disable_semantic_branch):
+                cond["sem_tokens"] = sem_adapter(((adapter_in.clamp(-1, 1) + 1.0) * 0.5).float())
             if "ip_tokens" not in cond and "cond_tokens" not in cond:
                 raise KeyError("adapter output missing ip_tokens/cond_tokens")
             if "local_entry_tokens" not in cond and "cond_map" not in cond:
@@ -695,11 +672,12 @@ def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, de
                 prompt_packs, prompt_cache_hit_rate, avg_prompt_token_count, avg_prompt_nonpad_ratio = load_adaptive_prompt_batch(
                     sample_keys, ADAPTIVE_PROMPT_CACHE_ROOT, prompt_cache_mem
                 )
-                if not all(p is not None for p in prompt_packs):
+                if (not all(p is not None for p in prompt_packs)) and STRICT_ADAPTIVE_PROMPT:
                     num_missing = int(sum(1 for p in prompt_packs if p is None))
                     raise RuntimeError(f"Adaptive prompt cache miss during full-eval: missing={num_missing}/{len(prompt_packs)}")
-                y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(device)
-                mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(device)
+                merged_packs = [p if p is not None else null_pack for p in prompt_packs]
+                y_cond = torch.cat([p["y"] for p in merged_packs], dim=0).to(device)
+                mask_cond = torch.cat([p["mask"] for p in merged_packs], dim=0).to(device)
             y_uncond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_uncond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
@@ -762,8 +740,11 @@ def run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, de
         "cond_map_std": float(cond["cond_map"].detach().float().std().item()),
         "lr_cond_token_std": float(cond["cond_tokens"].detach().float().std().item()),
         "lr_cross_text_ctx_std": float(image_stats.get("lr_cross_text_ctx_std", 0.0)),
-        "lr_cross_img_delta_std": float(image_stats.get("lr_cross_img_delta_std", 0.0)),
-        "avg_image_alpha": float(image_stats.get("avg_image_alpha", 0.0)),
+        "lr_ip_attn_delta_std_mean": float(image_stats.get("lr_ip_attn_delta_std_mean", 0.0)),
+        "lr_stream_delta_std_mean": float(image_stats.get("lr_stream_delta_std_mean", 0.0)),
+        "lr_conv_delta_std_mean": float(image_stats.get("lr_conv_delta_std_mean", 0.0)),
+        "semantic_gate_mean": float(image_stats.get("semantic_gate_mean", 0.0)),
+        "semantic_img_delta_std_mean": float(image_stats.get("semantic_img_delta_std_mean", 0.0)),
         "local_entry_gate": float(sft_stats.get("local_entry_gate", 0.0)),
         "text_cond_delta": float(sum(text_cond_delta_vals) / max(1, len(text_cond_delta_vals))),
         "prompt_cache_hit_rate": float(prompt_cache_hit_rate),
@@ -812,7 +793,7 @@ def nanmean(xs):
     return float(sum(vals) / len(vals))
 
 
-def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype):
+def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype):
     base_out = Path(args.output_dir) / dataset_name
     preds_dir = base_out / "preds"
     trip_dir = base_out / "triptychs"
@@ -833,7 +814,7 @@ def evaluate_dataset(dataset_name: str, loader, args, metric_suite, pixart, adap
         if args.max_samples > 0 and idx >= args.max_samples:
             break
 
-        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem)
+        pred, hr, lr, debug_stats = run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, batch, args, device, compute_dtype, gen, prompt_cache_mem)
         m = metric_suite.compute(pred, hr)
         m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
         m_flat_c = metric_suite.compute_component(pred, hr, m_flat)
@@ -1044,6 +1025,10 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--sft_strength", type=float, default=1.0)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
+    parser.add_argument("--semantic-encoder-name-or-path", type=str, default=DEFAULT_SEMANTIC_ENCODER)
+    parser.add_argument("--lambda-pix", type=float, default=1.0)
+    parser.add_argument("--lambda-sem", type=float, default=1.0)
+    parser.add_argument("--disable-semantic-branch", action="store_true")
 
     parser.add_argument("--output_dir", type=str, default="/home/hello/HJT/SRConvnetAdapter/experiments_results")
     parser.add_argument("--save_preds", dest="save_preds", action="store_true")
@@ -1073,19 +1058,19 @@ def main():
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    pixart, adapter, vae, null_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
+    pixart, adapter, sem_adapter, vae, null_pack, scheduler = build_model_and_assets(args, device, compute_dtype)
     metric_suite = MetricSuite()
 
     paper_rows = []
     if args.dataset in ("realsr", "both"):
         realsr_ds = RealSRValPairedDataset(roots=args.realsr_roots, crop_size=args.crop_size)
         realsr_loader = DataLoader(realsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype))
+        paper_rows.append(evaluate_dataset("realsr", realsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype))
 
     if args.dataset in ("drealsr", "both"):
         drealsr_ds = DRealSRPairedDataset(args.drealsr_hr_dir, args.drealsr_lr_dir, crop_size=args.crop_size)
         drealsr_loader = DataLoader(drealsr_ds, batch_size=1, shuffle=False, num_workers=args.num_workers)
-        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, vae, null_pack, scheduler, device, compute_dtype))
+        paper_rows.append(evaluate_dataset("drealsr", drealsr_loader, args, metric_suite, pixart, adapter, sem_adapter, vae, null_pack, scheduler, device, compute_dtype))
 
     if args.dataset == "both" and len(paper_rows) > 0:
         ckpt_name = Path(args.ckpt_path).stem

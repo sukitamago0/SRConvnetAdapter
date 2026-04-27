@@ -100,10 +100,18 @@ class CLIPSemanticAdapter(nn.Module):
         self.register_buffer("clip_std", torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1), persistent=False)
         self._last_sem_adapter_stats = None
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.image_encoder.eval()
+        for p in self.image_encoder.parameters():
+            p.requires_grad_(False)
+        return self
+
     def forward(self, lr_img_01: torch.Tensor):
         x = F.interpolate(lr_img_01, size=(self.clip_input_res, self.clip_input_res), mode="bicubic", align_corners=False)
         x = (x - self.clip_mean.to(device=x.device, dtype=x.dtype)) / self.clip_std.to(device=x.device, dtype=x.dtype)
-        vision_out = self.image_encoder(pixel_values=x, output_hidden_states=True)
+        with torch.no_grad():
+            vision_out = self.image_encoder(pixel_values=x, output_hidden_states=True)
         patch_tokens = vision_out.hidden_states[-1][:, 1:, :]
         sem_tokens = self.resampler(patch_tokens)
         preproj_std = float(sem_tokens.detach().float().std().item())

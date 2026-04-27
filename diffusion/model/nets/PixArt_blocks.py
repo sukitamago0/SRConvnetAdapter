@@ -112,6 +112,29 @@ def zero_module(module: nn.Module):
     return module
 
 
+class TokenCrossStreamConv(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.x_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.lr_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.dw = zero_module(nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1, groups=hidden_size, bias=True))
+        self.pw = nn.Conv2d(hidden_size, hidden_size, kernel_size=1, padding=0, bias=True)
+        nn.init.xavier_uniform_(self.pw.weight)
+        nn.init.zeros_(self.pw.bias)
+
+    def forward(self, x: torch.Tensor, lr_tokens: torch.Tensor, HW):
+        b, n, c = x.shape
+        h, w = int(HW[0]), int(HW[1])
+        if n != h * w:
+            raise RuntimeError(f"TokenCrossStreamConv got N={n}, but H*W={h*w}")
+        base = self.x_norm(x)
+        lr = self.lr_norm(lr_tokens)
+        delta = (lr - base).transpose(1, 2).reshape(b, c, h, w)
+        delta = self.dw(delta)
+        delta = self.pw(delta)
+        return delta.flatten(2).transpose(1, 2).contiguous()
+
+
 class DecoupledImageTextCrossAttention(nn.Module):
     def __init__(self, d_model, num_heads, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -132,7 +155,14 @@ class DecoupledImageTextCrossAttention(nn.Module):
 
     @classmethod
     def from_text_cross_attn(cls, old_attn: MultiHeadCrossAttention):
-        new = cls(old_attn.q_linear.in_features, old_attn.num_heads, attn_drop=old_attn.attn_drop.p, proj_drop=old_attn.proj_drop.p)
+        device = old_attn.q_linear.weight.device
+        dtype = old_attn.q_linear.weight.dtype
+        new = cls(
+            old_attn.q_linear.in_features,
+            old_attn.num_heads,
+            attn_drop=old_attn.attn_drop.p,
+            proj_drop=old_attn.proj_drop.p,
+        ).to(device=device, dtype=dtype)
         new.q_linear.load_state_dict(old_attn.q_linear.state_dict())
         new.out_proj.load_state_dict(old_attn.proj.state_dict())
         with torch.no_grad():

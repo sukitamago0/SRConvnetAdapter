@@ -1,6 +1,5 @@
 import os
 import sys
-import math
 import argparse
 from pathlib import Path
 
@@ -17,6 +16,14 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
+from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
+from diffusion.model.nets.adapter_cond import mask_adapter_cond
+
+DEFAULT_SEMANTIC_ENCODER = os.getenv(
+    "SEMANTIC_ENCODER_NAME_OR_PATH",
+    "/workspace/models/openai/clip-vit-large-patch14",
+)
 
 
 def randn_like_with_generator(tensor, generator):
@@ -42,89 +49,6 @@ def get_lq_init_latents(z_lr, scheduler, steps, generator, strength, dtype):
 
 def build_adapter_struct_input(lr_small_m11: torch.Tensor) -> torch.Tensor:
     return lr_small_m11.float().clamp(-1.0, 1.0)
-
-def mask_adapter_cond(cond, keep_mask: torch.Tensor):
-    if cond is None:
-        return None
-    if not torch.is_tensor(keep_mask):
-        keep_mask = torch.tensor(keep_mask)
-
-    def _find_device_dtype(x):
-        if torch.is_tensor(x):
-            return x.device, x.dtype
-        if isinstance(x, (list, tuple)):
-            for item in x:
-                found = _find_device_dtype(item)
-                if found is not None:
-                    return found
-        return None
-
-    found = _find_device_dtype(cond)
-    if found is None:
-        return cond
-    dev, _ = found
-    keep_mask = keep_mask.to(device=dev, dtype=torch.float32)
-
-    def _mask(x: torch.Tensor):
-        m = keep_mask
-        while m.ndim < x.ndim:
-            m = m.unsqueeze(-1)
-        return x * m.to(dtype=x.dtype)
-
-    if torch.is_tensor(cond):
-        return _mask(cond)
-    if isinstance(cond, dict):
-        return {k: (_mask(v) if torch.is_tensor(v) else v) for k, v in cond.items()}
-    if isinstance(cond, (list, tuple)):
-        if len(cond) == 2 and isinstance(cond[0], list) and torch.is_tensor(cond[1]):
-            spatial = [_mask(c) for c in cond[0]]
-            style = _mask(cond[1])
-            return (spatial, style)
-        masked = []
-        for c in cond:
-            if torch.is_tensor(c):
-                masked.append(_mask(c))
-            elif isinstance(c, list):
-                masked.append([_mask(ci) if torch.is_tensor(ci) else ci for ci in c])
-            else:
-                masked.append(c)
-        return masked if isinstance(cond, list) else tuple(masked)
-    return cond
-
-
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, r: int, alpha: float):
-        super().__init__()
-        self.base = base
-        self.scaling = alpha / r
-        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
-        self.lora_A.to(base.weight.device)
-        self.lora_B.to(base.weight.device)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-        self.base.weight.requires_grad = False
-        if self.base.bias is not None:
-            self.base.bias.requires_grad = False
-
-    def forward(self, x):
-        out = self.base(x)
-        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
-        return out + delta.to(out.dtype)
-
-
-def apply_lora(model, rank=16, alpha=16):
-    cnt = 0
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and any(
-            key in name for key in ("qkv", "proj", "to_q", "to_k", "to_v", "q_linear", "kv_linear")
-        ):
-            parent = model.get_submodule(name.rsplit('.', 1)[0])
-            child = name.rsplit('.', 1)[1]
-            setattr(parent, child, LoRALinear(module, rank, alpha))
-            cnt += 1
-    print(f"✅ LoRA applied to {cnt} layers.")
-
 
 def _load_pixart_subset_compatible(pixart: nn.Module, saved_trainable: dict, context: str):
     saved = set(saved_trainable.keys())
@@ -152,6 +76,7 @@ def run(args):
 
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
     layer_cfg = ckpt.get("layer_config", {}) if isinstance(ckpt, dict) else {}
+    cfg = ckpt.get("config_snapshot", {}) if isinstance(ckpt, dict) else {}
     anchor_layers = list(layer_cfg.get("anchor_layers", [2, 4, 6, 8]))
 
     pixart = PixArtSigmaSR_XL_2(
@@ -167,32 +92,65 @@ def run(args):
         base = base["state_dict"]
     if "pos_embed" in base:
         del base["pos_embed"]
-    if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
-        pixart.load_pretrained_weights_with_zero_init(base)
-    else:
-        pixart.load_state_dict(base, strict=False)
+    load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+    pixart.enable_sr_conditioning_layers(
+        pixel_layers=list(layer_cfg.get("pixel_layers", anchor_layers)),
+        lr_conv_layers=list(layer_cfg.get("lr_conv_layers", anchor_layers)),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
+        init_gate=-4.0,
+    )
+    sem0 = int(layer_cfg.get("semantic_layers", [24, 25, 26, 27])[0])
+    sem_std = float(pixart.blocks[sem0].cross_attn.out_proj.weight.detach().float().std().item())
+    print(f"[semantic-enable-check] layer={sem0} out_proj.weight.std={sem_std:.6e}")
+    if sem_std <= 1e-8:
+        raise RuntimeError("semantic layer out_proj.weight.std() is zero after enable; call order is wrong.")
 
     adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
     ).to(device).float()
+    semantic_encoder_path = (
+        args.semantic_encoder_name_or_path
+        or layer_cfg.get("semantic_encoder_name_or_path")
+        or cfg.get("semantic_encoder_name_or_path")
+        or os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH")
+        or "/workspace/models/openai/clip-vit-large-patch14"
+    )
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=semantic_encoder_path,
+        hidden_size=1152,
+        num_prompt_tokens=16,
+    ).to(device).eval()
 
     saved_trainable = ckpt.get("pixart_trainable", {})
 
-    has_lora = any(("lora_A" in k) or ("lora_B" in k) for k in saved_trainable.keys())
-    if "lora_rank" in ckpt:
-        ckpt_lora_rank = int(ckpt["lora_rank"])
-    else:
-        ckpt_lora_rank = int(args.lora_rank)
-    if "lora_alpha" in ckpt:
-        ckpt_lora_alpha = int(ckpt["lora_alpha"])
-    else:
-        ckpt_lora_alpha = int(args.lora_alpha)
-    if has_lora:
-        apply_lora(pixart, rank=ckpt_lora_rank, alpha=ckpt_lora_alpha)
+    has_dual_lora = any(
+        ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
+        for k in saved_trainable.keys()
+    )
+    dual_lora = bool(layer_cfg.get("dual_lora", False))
+    if dual_lora or has_dual_lora:
+        apply_dual_lora(
+            pixart,
+            pixel_rank=int(layer_cfg.get("pixel_lora_rank", args.lora_rank)),
+            semantic_rank=int(layer_cfg.get("semantic_lora_rank", args.lora_rank)),
+            pixel_alpha=float(layer_cfg.get("pixel_lora_alpha", args.lora_alpha)),
+            semantic_alpha=float(layer_cfg.get("semantic_lora_alpha", args.lora_alpha)),
+        )
+        set_dual_lora_scales(pixart, lambda_pix=float(args.lambda_pix), lambda_sem=float(args.lambda_sem))
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
+    if not bool(args.disable_semantic_branch):
+        if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
+            required_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+            missing_sem_keys = [k for k in required_sem_keys if k not in sem_adapter_sd]
+            if missing_sem_keys:
+                raise RuntimeError(f"Checkpoint sem_adapter missing required keys in infer: {missing_sem_keys}")
+            sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
+        else:
+            raise RuntimeError("Checkpoint missing sem_adapter while semantic branch is enabled in infer.")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -206,6 +164,7 @@ def run(args):
 
     pixart.eval()
     adapter.eval()
+    sem_adapter.eval()
 
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
@@ -249,6 +208,8 @@ def run(args):
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         cond = adapter(adapter_in, t_embed=t_embed.float())
+        if not bool(args.disable_semantic_branch):
+            cond["sem_tokens"] = sem_adapter(((adapter_in.clamp(-1, 1) + 1.0) * 0.5).float())
         if "ip_tokens" not in cond and "cond_tokens" not in cond:
             raise KeyError("adapter output missing ip_tokens/cond_tokens")
         if "local_entry_tokens" not in cond and "cond_map" not in cond:
@@ -322,7 +283,7 @@ def parse_args():
     parser.add_argument("--vae-path", type=str, required=True)
     parser.add_argument("--null-t5-embed-path", type=str, required=True)
     parser.add_argument("--hard-prompt-embed-path", type=str, required=True)
-    parser.add_argument("--semantic-encoder-name-or-path", type=str, default="openai/clip-vit-large-patch14")
+    parser.add_argument("--semantic-encoder-name-or-path", type=str, default=DEFAULT_SEMANTIC_ENCODER)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--crop-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=3407)
@@ -334,6 +295,9 @@ def parse_args():
     parser.add_argument("--sft_strength", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--lora-alpha", type=int, default=4)
+    parser.add_argument("--lambda-pix", type=float, default=1.0)
+    parser.add_argument("--lambda-sem", type=float, default=1.0)
+    parser.add_argument("--disable-semantic-branch", action="store_true")
     parser.add_argument("--input_is_lr_small", type=lambda x: str(x).lower() in ("1","true","yes","y"), default=True)
     return parser.parse_args()
 

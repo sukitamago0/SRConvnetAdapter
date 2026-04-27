@@ -48,6 +48,9 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 # [Import V8 Model]
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
+from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
+from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
+from diffusion.model.nets.adapter_cond import mask_adapter_cond
 from diffusion.model.utils import set_grad_checkpoint
 from diffusion import IDDPM
 from diffusion.model.gaussian_diffusion import _extract_into_tensor
@@ -61,10 +64,21 @@ ACTIVE_PIXART_KEY_FRAGMENTS = (
     "lr_ip_proj",
     "lr_ip_attn",
     "lr_ip_gate",
+    "lr_stream_attn",
+    "lr_stream_gate",
+    "lr_cross_conv",
+    "lr_cross_conv_gate",
+    "sem_ip_proj",
+    "semantic_gate",
+    "cross_attn.k_img_linear",
+    "cross_attn.v_img_linear",
+    "cross_attn.img_residual_linear",
     "local_entry_proj",
     "local_entry_gate",
-    "lora_A",
-    "lora_B",
+    "pixel_lora_A",
+    "pixel_lora_B",
+    "semantic_lora_A",
+    "semantic_lora_B",
 )
 FP32_SAVE_KEY_FRAGMENTS = ACTIVE_PIXART_KEY_FRAGMENTS
 FINAL_LAYER_KEYWORD = "final_layer"
@@ -136,16 +150,17 @@ VAL_NUM_WORKERS = 0
 TRAIN_PROMPT_CACHE_MAX_ITEMS = 0
 VAL_PROMPT_CACHE_MAX_ITEMS = 128
 GUARD_FORWARD_EVERY = 50
+MODULE_MONITOR_EVERY = int(os.getenv("MODULE_MONITOR_EVERY", "200"))
 
 LR_BASE = 1e-5 
 LORA_RANK = 16
 LORA_ALPHA = 16
-SEMANTIC_ENCODER_NAME_OR_PATH = os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "openai/clip-vit-large-patch14")
+SEMANTIC_ENCODER_NAME_OR_PATH = os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH", "/workspace/models/openai/clip-vit-large-patch14")
 USE_SEMANTIC_BRANCH = True
 ALLOW_SEM_ADAPTER_NONSTRICT_RESUME = False
 USE_FIXED_HARD_PROMPT = False
-USE_ADAPTIVE_TEXT_PROMPT = True
-STRICT_ADAPTIVE_PROMPT = True
+USE_ADAPTIVE_TEXT_PROMPT = False
+STRICT_ADAPTIVE_PROMPT = False
 ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
@@ -156,9 +171,11 @@ INJECT_S_MIN = 0.1
 INJECT_S_MAX = 1.0
 INJECT_INIT_P = 2.0
 # anchor_layers = early structure-only band
-ANCHOR_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7]
+ANCHOR_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7, 10, 13, 16, 19, 22, 25, 27]
+PIXEL_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7, 10, 13, 16, 19, 22, 25, 27]
+LR_CONV_LAYERS = [2, 4, 6, 10, 13, 16, 19, 22, 25]
 # semantic_layers = late semantic-only band
-SEMANTIC_LAYERS = [24, 25, 26, 27]
+SEMANTIC_LAYERS = [20, 23, 26, 27]
 
 L1_BASE_WEIGHT = 0.25
 GW_ALPHA = 4.0
@@ -212,20 +229,20 @@ LATENT_L1_T_MIN = 200
 
 # LPIPS perceptual curriculum (single-script, no separate stage script)
 USE_LPIPS_PERCEP = True
-LPIPS_START_EPOCH = 8
-LPIPS_RAMP_END_EPOCH = 25
+LPIPS_START_EPOCH = 3
+LPIPS_RAMP_END_EPOCH = 10
 LPIPS_WEIGHT_MAX = 0.25
 LPIPS_T_MAX = 800
 
 # As LPIPS ramps in, old structure losses ramp down
 LATENT_L1_WEIGHT_START = 0.08
-LATENT_L1_WEIGHT_END = 0.0
+LATENT_L1_WEIGHT_END = 0.02
 
 LR_CONS_WEIGHT_START = 0.0
-LR_CONS_WEIGHT_END = 0.0
+LR_CONS_WEIGHT_END = 0.01
 
 GW_WEIGHT_START = 0.0
-GW_WEIGHT_END = 0.0
+GW_WEIGHT_END = 0.01
 
 # For this experiment, require sufficient structure quality before switching to LPIPS-first checkpointing
 CKPT_SELECT_MODE = "psnr_gate_then_lpips"
@@ -252,7 +269,10 @@ EMA_DECAY = 0.999
 EMA_VALIDATE = False  # S2D main experiment: disable EMA/EMA-validate for clean comparison
 EMA_VALIDATE_EVERY = 5  # run EMA validation every N validation triggers
 
-T_SAMPLE_MODE = "power"   # uniform | power | two_stage
+T_SAMPLE_MODE = "mixture"   # uniform | power | two_stage | mixture
+T_MIX_HIGH_PROB = 0.65
+T_MIX_HIGH_MIN = 700
+T_MIX_LOW_POWER = 2.0
 T_SAMPLE_POWER = 2.5
 T_SAMPLE_MIN = 0
 T_SAMPLE_MAX = 999
@@ -384,6 +404,14 @@ def sample_t(batch: int, device: str, step: int) -> torch.Tensor:
             t = torch.floor((u ** float(T_SAMPLE_POWER)) * span + tmin)
             return t.clamp(tmin, tmax).long()
         return torch.randint(tmin, tmax + 1, (batch,), device=device).long()
+    if mode == "mixture":
+        u = torch.rand((batch,), device=device)
+        high = u < float(T_MIX_HIGH_PROB)
+        hi_min = int(max(tmin, min(tmax, int(T_MIX_HIGH_MIN))))
+        t_hi = torch.randint(hi_min, tmax + 1, (batch,), device=device)
+        p = torch.rand((batch,), device=device).pow(float(T_MIX_LOW_POWER))
+        t_lo = torch.floor(p * float(max(1, hi_min - tmin)) + tmin).long().clamp(tmin, tmax)
+        return torch.where(high, t_hi, t_lo).long()
     raise ValueError(f"Unknown T_SAMPLE_MODE: {T_SAMPLE_MODE}")
 
 def rgb01_to_y01(rgb01):
@@ -696,55 +724,6 @@ def assert_strict_tala_configuration():
     if bad:
         raise RuntimeError(f"Strict TALA violation: banned legacy tokens still present: {bad}")
 
-def mask_adapter_cond(cond, keep_mask: torch.Tensor):
-    if cond is None:
-        return None
-    if not torch.is_tensor(keep_mask):
-        keep_mask = torch.tensor(keep_mask)
-
-    def _find_device_dtype(x):
-        if torch.is_tensor(x):
-            return x.device, x.dtype
-        if isinstance(x, dict):
-            for v in x.values():
-                found = _find_device_dtype(v)
-                if found is not None:
-                    return found
-        if isinstance(x, (list, tuple)):
-            for item in x:
-                found = _find_device_dtype(item)
-                if found is not None:
-                    return found
-        return None
-
-    found = _find_device_dtype(cond)
-    if found is None:
-        return cond
-
-    dev, _ = found
-    keep_mask = keep_mask.to(device=dev, dtype=torch.float32)
-
-    def _mask_tensor(x: torch.Tensor):
-        m = keep_mask
-        while m.ndim < x.ndim:
-            m = m.unsqueeze(-1)
-        return x * m.to(dtype=x.dtype)
-
-    def _mask_obj(x):
-        if torch.is_tensor(x):
-            return _mask_tensor(x)
-        if isinstance(x, dict):
-            return {k: _mask_obj(v) for k, v in x.items()}
-        if isinstance(x, list):
-            return [_mask_obj(v) for v in x]
-        if isinstance(x, tuple):
-            return tuple(_mask_obj(v) for v in x)
-        return x
-
-    return _mask_obj(cond)
-
-
-
 def file_sha256(path):
     sha = hashlib.sha256()
     with open(path, "rb") as f:
@@ -834,7 +813,7 @@ class ParamEMA:
         self.backup = {}
 
 
-def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module):
+def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module):
     out = []
     for n, p in adapter.named_parameters():
         if p.requires_grad:
@@ -842,6 +821,9 @@ def collect_ema_named_params(pixart: nn.Module, adapter: nn.Module):
     for n, p in pixart.named_parameters():
         if p.requires_grad:
             out.append((f"pixart.{n}", p))
+    for n, p in sem_adapter.named_parameters():
+        if p.requires_grad:
+            out.append((f"sem_adapter.{n}", p))
     return out
 
 
@@ -867,14 +849,15 @@ def get_config_snapshot():
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV12",
-        "control_type": "structure_early_band + adaptive_text + image_semantic + tala_train_consistency",
+        "control_type": "dualcondsr_pixel+semantic+tala",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
         "adapter_token_head": "structure-only cond_map head",
         "internal_control_type": "disabled",
         "internal_control_layers": [],
-        "semantic_prompt_branch": "enabled",
-        "semantic_prompt_source": "CLIP + IP-Adapter Resampler + decoupled cross-attn",
+        "semantic_prompt_branch": ("enabled" if USE_SEMANTIC_BRANCH else "disabled"),
+        "semantic_prompt_source": ("CLIPSemanticAdapter + decoupled cross-attn" if USE_SEMANTIC_BRANCH else "disabled"),
         "semantic_prompt_tokens": 16,
+        "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
         "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
         "use_native_text_path": True,
         "native_text_is_null": True,
@@ -893,7 +876,7 @@ def get_config_snapshot():
         "percep_decode_max_samples": int(PERCEP_DECODE_MAX_SAMPLES),
         "lpips_late_weight": float(LPIPS_LATE_WEIGHT),
         "use_legacy_patch_lpips": bool(USE_LEGACY_PATCH_LPIPS),
-        "semantic_fusion": "parallel_decoupled",
+        "semantic_fusion": ("parallel_decoupled" if USE_SEMANTIC_BRANCH else "disabled"),
         "lr_control_role": "structure_only",
         "anchor_layers": list(ANCHOR_LAYERS),
         "tala_lite": False,
@@ -1010,14 +993,26 @@ class DegradationPipeline:
             "jpeg_quality": jpeg_quality,
         }
 
-    def __call__(self, hr_tensor, return_meta: bool = False, meta=None, generator=None):
+    def __call__(self, hr_tensor, mode: str = "realesrgan", return_meta: bool = False, meta=None, generator=None, return_small: bool = False):
         img = (hr_tensor + 1.0) * 0.5
+        mode = str(mode).lower()
         if meta is None:
-            use_two_stage = bool(self._sample_uniform(0.0, 1.0, generator) < P_TWO_STAGE)
-            ops_stage1 = self._shuffle_ops(generator)
-            ops_stage2 = self._shuffle_ops(generator) if use_two_stage else []
+            if mode == "bsrgan":
+                use_two_stage = bool(self._sample_uniform(0.0, 1.0, generator) < 0.85)
+                ops_stage1 = self._shuffle_ops(generator)
+                ops_stage2 = self._shuffle_ops(generator) if use_two_stage else []
+            else:
+                use_two_stage = bool(self._sample_uniform(0.0, 1.0, generator) < P_TWO_STAGE)
+                ops_stage1 = ["blur", "resize", "noise", "jpeg"]
+                ops_stage2 = ["blur", "resize", "noise", "jpeg"] if use_two_stage else []
             stage1 = self._sample_stage_params(generator)
             stage2 = self._sample_stage_params(generator) if use_two_stage else None
+            if mode == "bsrgan":
+                stage1["jpeg_quality"] = int(max(25, min(95, stage1["jpeg_quality"] - 8)))
+                stage1["noise_std"] = float(stage1["noise_std"] * 1.2)
+                if stage2 is not None:
+                    stage2["jpeg_quality"] = int(max(20, min(90, stage2["jpeg_quality"] - 10)))
+                    stage2["noise_std"] = float(stage2["noise_std"] * 1.2)
         else:
             use_two_stage = bool(int(meta.get("use_two_stage", torch.tensor(0)).item()))
             ops_stage1 = [op for op in str(meta.get("ops_stage1", ",".join(DEG_OPS))).split(",") if op]
@@ -1089,7 +1084,8 @@ class DegradationPipeline:
         down_w = int(self.crop_size * self.downscale_factor)
         lr_small = TF.resize(lr_small, [down_h, down_w], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         lr_out = TF.resize(lr_small, [self.crop_size, self.crop_size], interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-        lr_out = (lr_out * 2.0 - 1.0).clamp(-1.0, 1.0)
+        lr_small_m11 = (lr_small * 2.0 - 1.0).clamp(-1.0, 1.0)
+        lr_out_m11 = (lr_out * 2.0 - 1.0).clamp(-1.0, 1.0)
 
         # FIXED: Strictly return 2 values
         if return_meta:
@@ -1122,8 +1118,12 @@ class DegradationPipeline:
                 "down_h": torch.tensor(int(down_h), dtype=torch.int64),
                 "down_w": torch.tensor(int(down_w), dtype=torch.int64),
             }
-            return lr_out, meta_out
-        return lr_out
+            if return_small:
+                return lr_out_m11, lr_small_m11, meta_out
+            return lr_out_m11, meta_out
+        if return_small:
+            return lr_out_m11, lr_small_m11
+        return lr_out_m11
 
 # ================= 6. Datasets (Correctly Placed BEFORE Main) =================
 def _scan_images(root):
@@ -1185,6 +1185,124 @@ def center_crop_aligned_pair(lr_pil: Image.Image, hr_pil: Image.Image, scale: in
     hr_aligned = TF.crop(hr_pil, hr_top, hr_left, h2, w2)
     lr_aligned = TF.crop(lr_pil, lr_top, lr_left, lr_h2, lr_w2)
     return lr_aligned, hr_aligned
+
+
+def random_crop_pil(img: Image.Image, crop_h: int, crop_w: int):
+    w, h = img.size
+    if h < crop_h or w < crop_w:
+        scale = max(crop_h / max(1, h), crop_w / max(1, w))
+        new_w = int(math.ceil(w * scale))
+        new_h = int(math.ceil(h * scale))
+        img = img.resize((new_w, new_h), Image.BICUBIC)
+        w, h = img.size
+    top = random.randint(0, h - crop_h)
+    left = random.randint(0, w - crop_w)
+    return TF.crop(img, top, left, crop_h, crop_w)
+
+
+class MixedRealISRDataset(Dataset):
+    def __init__(self, crop_size=512, scale=4):
+        self.crop_size = int(crop_size)
+        self.scale = int(scale)
+        self.pipeline = DegradationPipeline(crop_size)
+        self.norm = transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
+        self.to_tensor = transforms.ToTensor()
+        self.epoch = 0
+        self.df2k_pairs = []
+        self.realsr_pairs = []
+        self.synthetic_hr_paths = []
+
+        for lr_path, hr_path in build_paired_file_list(TRAIN_DF2K_HR_DIR, TRAIN_DF2K_LR_DIR, []):
+            self.df2k_pairs.append((lr_path, hr_path))
+            self.synthetic_hr_paths.append(hr_path)
+
+        for root in TRAIN_REALSR_DIRS:
+            for hr_path in sorted(glob.glob(os.path.join(root, "*_HR.*"))):
+                lr_path = hr_path.replace("_HR", "_LR4")
+                if os.path.exists(lr_path):
+                    self.realsr_pairs.append((lr_path, hr_path))
+                    self.synthetic_hr_paths.append(hr_path)
+
+        if len(self.df2k_pairs) == 0:
+            raise RuntimeError("MixedRealISRDataset: no DF2K pairs found.")
+        if len(self.synthetic_hr_paths) == 0:
+            self.synthetic_hr_paths = [p[1] for p in self.df2k_pairs]
+
+        self.source_probs = {
+            "paired_df2k": 0.45,
+            "paired_realsr": 0.20 if len(self.realsr_pairs) > 0 else 0.0,
+            "syn_realesrgan": 0.20,
+            "syn_bsrgan": 0.15,
+        }
+        s = sum(self.source_probs.values())
+        for k in self.source_probs:
+            self.source_probs[k] /= max(1e-6, s)
+
+    def __len__(self):
+        return max(len(self.df2k_pairs), len(self.synthetic_hr_paths))
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def _rng(self, idx: int):
+        r = random.Random(SEED + self.epoch * 1000003 + int(idx))
+        return r
+
+    def _sample_source(self, idx: int):
+        r = self._rng(idx).random()
+        acc = 0.0
+        for k, p in self.source_probs.items():
+            acc += float(p)
+            if r <= acc:
+                return k
+        return "paired_df2k"
+
+    def _sample_syn(self, mode: str, hr_path: str):
+        hr_pil = Image.open(hr_path).convert("RGB")
+        hr_crop = random_crop_pil(hr_pil, self.crop_size, self.crop_size)
+        hr = self.norm(self.to_tensor(hr_crop))
+        lr, lr_small, _meta = self.pipeline(hr, mode=mode, return_meta=True, return_small=True)
+        return {"hr": hr, "lr": lr, "lr_small": lr_small, "path": hr_path, "sample_key": make_sample_key(hr_path), "source_type": f"syn_{mode}", "pixel_loss_weight": 1.0}
+
+    def __getitem__(self, idx):
+        src = self._sample_source(idx)
+        if src == "paired_df2k":
+            lr_path, hr_path = self.df2k_pairs[idx % len(self.df2k_pairs)]
+            lr_pil = Image.open(lr_path).convert("RGB")
+            hr_pil = Image.open(hr_path).convert("RGB")
+            lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=self.scale)
+            lr_crop = TF.center_crop(lr_aligned, (self.crop_size // self.scale, self.crop_size // self.scale))
+            hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
+            lr_up = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+            return {
+                "hr": self.norm(self.to_tensor(hr_crop)),
+                "lr": self.norm(self.to_tensor(lr_up)),
+                "lr_small": self.norm(self.to_tensor(lr_crop)),
+                "path": hr_path,
+                "sample_key": make_sample_key(lr_path),
+                "source_type": src,
+                "pixel_loss_weight": 1.0,
+            }
+        if src == "paired_realsr":
+            if len(self.realsr_pairs) > 0:
+                lr_path, hr_path = self.realsr_pairs[idx % len(self.realsr_pairs)]
+                hr_pil = Image.open(hr_path).convert("RGB")
+                lr_pil = Image.open(lr_path).convert("RGB")
+                lr_aligned, hr_aligned = center_crop_aligned_pair(lr_pil, hr_pil, scale=self.scale)
+                lr_crop = TF.center_crop(lr_aligned, (self.crop_size // self.scale, self.crop_size // self.scale))
+                hr_crop = TF.center_crop(hr_aligned, (self.crop_size, self.crop_size))
+                lr_up = TF.resize(lr_crop, (self.crop_size, self.crop_size), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+                return {
+                    "hr": self.norm(self.to_tensor(hr_crop)),
+                    "lr": self.norm(self.to_tensor(lr_up)),
+                    "lr_small": self.norm(self.to_tensor(lr_crop)),
+                    "path": hr_path,
+                    "sample_key": make_sample_key(lr_path),
+                    "source_type": src,
+                    "pixel_loss_weight": 0.5,
+                }
+        hr_path = self.synthetic_hr_paths[idx % len(self.synthetic_hr_paths)]
+        return self._sample_syn("realesrgan" if src == "syn_realesrgan" else "bsrgan", hr_path)
 
 class DF2K_Online_Dataset(Dataset):
     def __init__(self, crop_size=512, is_train=True, scale=4):
@@ -1291,9 +1409,7 @@ class DF2K_Val_Degraded_Dataset(Dataset):
             lr_small_tensor = (lr_small01 * 2.0 - 1.0).clamp(-1.0, 1.0)
         else:
             gen = torch.Generator(); gen.manual_seed(self.seed + idx)
-            lr_tensor, _ = self.pipeline(hr_tensor, return_meta=True, generator=gen)
-            # fallback when pipeline only outputs lr_up
-            lr_small_tensor = F.interpolate(lr_tensor.unsqueeze(0), size=(self.crop_size // 4, self.crop_size // 4), mode="bicubic", align_corners=False, antialias=True).squeeze(0).clamp(-1.0, 1.0)
+            lr_tensor, lr_small_tensor, _ = self.pipeline(hr_tensor, mode="realesrgan", return_meta=True, return_small=True, generator=gen)
         return {"hr": hr_tensor, "lr": lr_tensor, "lr_small": lr_small_tensor, "path": hr_path, "sample_key": make_sample_key(hr_path)}
 
 class ValPackDataset(Dataset):
@@ -1361,51 +1477,20 @@ class RealSR_Val_Paired_Dataset(Dataset):
 
 
 # ================= 7. LoRA =================
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, r: int, alpha: float):
-        super().__init__()
-        self.base = base; self.scaling = alpha / r
-        self.lora_A = nn.Linear(base.in_features, r, bias=False, dtype=torch.float32)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False, dtype=torch.float32)
-        self.lora_A.to(base.weight.device); self.lora_B.to(base.weight.device)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5)); nn.init.zeros_(self.lora_B.weight)
-        self.base.weight.requires_grad = False
-        if self.base.bias is not None: self.base.bias.requires_grad = False
-    def forward(self, x):
-        out = self.base(x)
-        delta = self.lora_B(self.lora_A(x.float())) * self.scaling
-        return out + delta.to(out.dtype)
-
 def _block_id_from_name(name: str):
     m = re.search(r"blocks\.(\d+)\.", name)
     return int(m.group(1)) if m else None
 
 
-def _lora_target_kind(module_name: str):
-    if ("attn.qkv" in module_name) or ("attn.proj" in module_name):
-        return "attn"
-    return None
-
-
 def apply_lora(model):
-    cnt = 0
-    for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear):
-            continue
-        block_id = _block_id_from_name(name)
-        if block_id is None:
-            continue
-        kind = _lora_target_kind(name)
-        if kind is None:
-            continue
-        if not (0 <= block_id <= 27):
-            continue
-        rank = int(LORA_RANK)
-        parent = model.get_submodule(name.rsplit('.', 1)[0])
-        child = name.rsplit('.', 1)[1]
-        setattr(parent, child, LoRALinear(module, rank, alpha=float(LORA_ALPHA)))
-        cnt += 1
-    print(f"✅ Attention LoRA applied to {cnt} layers (rank={LORA_RANK}, alpha={LORA_ALPHA}).")
+    cnt = apply_dual_lora(
+        model,
+        pixel_rank=int(LORA_RANK),
+        semantic_rank=int(LORA_RANK),
+        pixel_alpha=float(LORA_ALPHA),
+        semantic_alpha=float(LORA_ALPHA),
+    )
+    print(f"✅ Dual LoRA applied to {cnt} layers (pixel_rank={LORA_RANK}, semantic_rank={LORA_RANK}).")
 
 
 def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool = False):
@@ -1416,11 +1501,13 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
     for name, p in pixart.named_parameters():
         if (
             "final_layer" in name
-            or "lora_A" in name
-            or "lora_B" in name
+            or "pixel_lora_A" in name
+            or "pixel_lora_B" in name
+            or "semantic_lora_A" in name
+            or "semantic_lora_B" in name
             or "lr_ip_proj" in name
+            or "sem_ip_proj" in name
             or "lr_ip_attn" in name
-            or "lr_ip_gate" in name
             or "local_entry_proj" in name
             or "local_entry_gate" in name
         ):
@@ -1431,20 +1518,48 @@ def configure_pixart_trainable_params(pixart: nn.Module, train_x_embedder: bool 
             if "x_embedder" in n and p.requires_grad:
                 p.requires_grad_(False)
 
+    pixel_layer_ids = {int(i) for i in PIXEL_LAYERS}
+    semantic_layer_ids = {int(i) for i in SEMANTIC_LAYERS}
+    lr_conv_layer_ids = {int(i) for i in LR_CONV_LAYERS}
+
     if ENABLE_LORA:
         for n, p in pixart.named_parameters():
             if ".base.weight" in n or ".base.bias" in n:
                 p.requires_grad_(False)
                 continue
-            if ("lora_A" in n) or ("lora_B" in n):
-                bid = _block_id_from_name(n)
-                kind = _lora_target_kind(n)
-                p.requires_grad_(bool(bid is not None and 0 <= bid <= 27 and kind == "attn"))
+            bid = _block_id_from_name(n)
+            if ("pixel_lora_" in n):
+                p.requires_grad_(bid in pixel_layer_ids)
+            if ("semantic_lora_" in n):
+                p.requires_grad_(bid in semantic_layer_ids)
+
+    for n, p in pixart.named_parameters():
+        bid = _block_id_from_name(n)
+        if bid is None:
+            continue
+        if ("lr_ip_attn" in n) or ("lr_stream_attn" in n):
+            p.requires_grad_(bid in pixel_layer_ids)
+        if ("lr_ip_gate" in n) or ("lr_stream_gate" in n) or ("lr_memory_gate" in n):
+            p.requires_grad_(bid in pixel_layer_ids)
+        if ("lr_cross_conv" in n):
+            p.requires_grad_(bid in lr_conv_layer_ids)
+        if ("lr_cross_conv_gate" in n):
+            p.requires_grad_(bid in lr_conv_layer_ids)
+        if ("cross_attn.k_img_linear" in n) or ("cross_attn.v_img_linear" in n) or ("cross_attn.img_residual_linear" in n) or ("semantic_gate" in n):
+            p.requires_grad_(bid in semantic_layer_ids)
+        if ("cross_attn.k_text_linear" in n) or ("cross_attn.v_text_linear" in n) or ("cross_attn.q_linear" in n) or ("cross_attn.out_proj" in n):
+            p.requires_grad_(False)
 
     total_trainable_after = sum(1 for _, p in pixart.named_parameters() if p.requires_grad)
     if total_trainable_after == 0:
         raise RuntimeError("No PixArt trainable parameters selected after configuration.")
     print(f"✅ PixArt trainable configured(IP-control): before={total_trainable_before}, after={total_trainable_after}")
+    trainable_names = [n for n, p in pixart.named_parameters() if p.requires_grad]
+    must_have = ["lr_stream_attn", "lr_memory_gate", "lr_cross_conv", "sem_ip_proj", "cross_attn.k_img_linear", "cross_attn.img_residual_linear", "pixel_lora", "semantic_lora"]
+    missing = [m for m in must_have if not any(m in n for n in trainable_names)]
+    if missing:
+        raise RuntimeError(f"Trainable paths missing required fragments: {missing}")
+    print("[Trainable-Check] includes:", ", ".join(must_have))
 
 
 def compute_save_keys_for_stages(pixart: nn.Module, train_x_embedder: bool = True):
@@ -1455,6 +1570,15 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
     state = model.state_dict()
     return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
 
+def collect_sem_adapter_trainable_state_dict(sem_adapter: nn.Module):
+    sem_sd = sem_adapter.state_dict()
+    keep_prefixes = ("resampler.", "proj.", "proj_norm.")
+    out = {}
+    for k, v in sem_sd.items():
+        if k == "out_scale" or any(k.startswith(p) for p in keep_prefixes):
+            out[k] = v.detach().float().cpu()
+    return out
+
 
 def should_run_proxy_validation(epoch_1based: int) -> bool:
     if epoch_1based < 15:
@@ -1464,60 +1588,86 @@ def should_run_proxy_validation(epoch_1based: int) -> bool:
     return True
 
 
-def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module):
+def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module):
     adapter_params = [p for p in adapter.parameters() if p.requires_grad]
-    lora_params = []
-    ip_control_params = []
+    sem_adapter_params = [p for p in sem_adapter.parameters() if p.requires_grad]
+    lora_params, cond_params, final_layer_params = [], [], []
 
     for n, p in pixart.named_parameters():
         if not p.requires_grad:
             continue
-        if ("lora_A" in n) or ("lora_B" in n):
+        if ("pixel_lora_" in n) or ("semantic_lora_" in n):
             lora_params.append(p)
+        elif "final_layer" in n:
+            final_layer_params.append(p)
         else:
-            ip_control_params.append(p)
+            cond_params.append(p)
 
     optim_groups = []
-    if adapter_params or ip_control_params:
-        optim_groups.append({"params": adapter_params + ip_control_params, "lr": 3e-4, "weight_decay": 0.01})
+    if adapter_params:
+        optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
+    if sem_adapter_params:
+        optim_groups.append({"params": sem_adapter_params, "lr": 1e-4, "weight_decay": 0.01})
+    if cond_params:
+        optim_groups.append({"params": cond_params, "lr": 1e-4, "weight_decay": 0.01})
+    if final_layer_params:
+        optim_groups.append({"params": final_layer_params, "lr": 5e-5, "weight_decay": 0.01})
     if lora_params:
         optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check trainable settings.")
 
     optimizer = torch.optim.AdamW(optim_groups)
-    params_to_clip = adapter_params + ip_control_params + lora_params
+    params_to_clip = adapter_params + sem_adapter_params + cond_params + final_layer_params + lora_params
 
-    pixart_trainable = [p for p in pixart.parameters() if p.requires_grad]
-    grouped_pixart = ip_control_params + lora_params
-    if len({id(p) for p in grouped_pixart}) != len(grouped_pixart):
-        raise RuntimeError("Optimizer grouping has duplicate PixArt params across groups.")
-    if {id(p) for p in grouped_pixart} != {id(p) for p in pixart_trainable}:
-        raise RuntimeError("Optimizer grouping does not exactly cover PixArt trainable params.")
+    all_trainable = [p for p in list(pixart.parameters()) + list(adapter.parameters()) + list(sem_adapter.parameters()) if p.requires_grad]
+    grouped = adapter_params + sem_adapter_params + cond_params + final_layer_params + lora_params
+    if len({id(p) for p in grouped}) != len(grouped):
+        raise RuntimeError("Optimizer grouping has duplicate parameters across groups.")
+    if {id(p) for p in grouped} != {id(p) for p in all_trainable}:
+        raise RuntimeError("Optimizer grouping does not exactly cover all trainable parameters.")
 
     group_counts = {
         "adapter": len(adapter_params),
-        "ip_control_pixart": len(ip_control_params),
+        "sem_adapter": len(sem_adapter_params),
+        "cond_pixart": len(cond_params),
+        "final_layer": len(final_layer_params),
         "lora": len(lora_params),
     }
     return optimizer, params_to_clip, group_counts
 
 
-def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module):
-    if step > 200 or (step % 50 != 0):
+def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module, sem_adapter: nn.Module = None):
+    if step > 300 or (step % 50 != 0):
         return
     pix_named = dict(pixart.named_parameters())
     ad_named = dict(adapter.named_parameters())
+    sem_named = dict(sem_adapter.named_parameters()) if sem_adapter is not None else {}
+    first_pixel = int(PIXEL_LAYERS[0])
+    first_lrconv = int(LR_CONV_LAYERS[0])
+    first_sem = int(SEMANTIC_LAYERS[0])
+    first_pixel_lora_B = next((p for n, p in pixart.named_parameters() if "pixel_lora_B.weight" in n), None)
+    first_sem_lora_B = next((p for n, p in pixart.named_parameters() if "semantic_lora_B.weight" in n), None)
     watched = [
-        ("pixart.final_layer.linear.weight", pix_named.get("final_layer.linear.weight", None)),
         ("pixart.lr_ip_proj.weight", pix_named.get("lr_ip_proj.weight", None)),
-        ("pixart.lr_ip_gate", pix_named.get("lr_ip_gate", None)),
-        ("adapter.stage1.0.smfa.linear_0.weight", ad_named.get("stage1.0.smfa.linear_0.weight", None)),
-        ("adapter.stage3.0.pcfn.conv_0.weight", ad_named.get("stage3.0.pcfn.conv_0.weight", None)),
-        ("adapter.to32.1.weight", ad_named.get("to32.1.weight", None)),
+        ("pixart.sem_ip_proj.weight", pix_named.get("sem_ip_proj.weight", None)),
+        (f"pixart.blocks.{first_pixel}.lr_ip_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_ip_attn.proj.weight", None)),
+        (f"pixart.blocks.{first_pixel}.lr_stream_attn.proj.weight", pix_named.get(f"blocks.{first_pixel}.lr_stream_attn.proj.weight", None)),
+        (f"pixart.blocks.{first_pixel}.lr_memory_gate", pix_named.get(f"blocks.{first_pixel}.lr_memory_gate", None)),
+        (f"pixart.blocks.{first_lrconv}.lr_cross_conv.dw.weight", pix_named.get(f"blocks.{first_lrconv}.lr_cross_conv.dw.weight", None)),
+        (f"pixart.blocks.{first_sem}.cross_attn.img_residual_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.img_residual_linear.weight", None)),
+        ("pixart.first_pixel_lora_B.weight", first_pixel_lora_B),
+        ("pixart.first_semantic_lora_B.weight", first_sem_lora_B),
+        ("sem_adapter.proj.weight", sem_named.get("proj.weight", None)),
+        ("sem_adapter.resampler.latents", sem_named.get("resampler.latents", None)),
+    ]
+    soft_watched = [
+        (f"pixart.blocks.{first_sem}.cross_attn.k_img_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.k_img_linear.weight", None)),
+        (f"pixart.blocks.{first_sem}.cross_attn.v_img_linear.weight", pix_named.get(f"blocks.{first_sem}.cross_attn.v_img_linear.weight", None)),
     ]
     msg = [f"[GradSanity][step={step}]"]
-    warnings = []
+    hard_warnings = []
+    soft_warnings = []
     for name, p in watched:
         if p is None:
             msg.append(f"{name}=N/A")
@@ -1525,11 +1675,24 @@ def log_critical_path_gradients(step: int, pixart: nn.Module, adapter: nn.Module
         w_norm = float(p.detach().float().norm().item())
         g_norm = 0.0 if p.grad is None else float(p.grad.detach().float().norm().item())
         msg.append(f"{name}: g={g_norm:.3e}, w={w_norm:.3e}")
-        if g_norm < 1e-12:
-            warnings.append(name)
+        if p.requires_grad and g_norm < 1e-12:
+            hard_warnings.append(name)
+    for name, p in soft_watched:
+        if p is None:
+            msg.append(f"{name}=N/A")
+            continue
+        w_norm = float(p.detach().float().norm().item())
+        g_norm = 0.0 if p.grad is None else float(p.grad.detach().float().norm().item())
+        msg.append(f"{name}: g={g_norm:.3e}, w={w_norm:.3e}")
+        if p.requires_grad and g_norm < 1e-12:
+            soft_warnings.append(name)
     print(" | ".join(msg))
-    if warnings:
-        print(f"⚠️ [GradSanity] near-zero grad on critical paths: {warnings}")
+    if hard_warnings:
+        if step > 100:
+            raise RuntimeError(f"[GradSanity] near-zero grad on critical paths (hard): {hard_warnings}")
+        print(f"⚠️ [GradSanity] near-zero grad on critical paths (hard): {hard_warnings}")
+    if soft_warnings:
+        print(f"⚠️ [GradSanity] near-zero grad on soft-check paths: {soft_warnings}")
 
 
 # ================= 8. Checkpointing =================
@@ -1542,14 +1705,16 @@ def should_keep_ckpt(psnr_v, lpips_v):
     p = float(psnr_v)
     mode = str(CKPT_SELECT_MODE).lower()
     gate = float(CKPT_SELECT_PSNR_GATE)
+    gate_passed = p >= gate
     if mode == "psnr_gate_then_lpips":
-        gate_passed = p >= gate
         if gate_passed:
-            return (0, lp, -p, 1)
-        return (0, -p, lp, 0)
+            return (0, lp, -p)
+        return (1, -p, lp)
     if mode == "lpips_first":
-        return (0, lp, -p, int(p >= gate))
-    return (0, -p, lp, int(p >= gate))
+        if gate_passed:
+            return (0, lp, -p)
+        return (1, -p, lp)
+    return (0, -p, lp)
 
 def atomic_torch_save(state, path):
     tmp = path + ".tmp"
@@ -1572,6 +1737,7 @@ def save_smart(
     global_step,
     pixart,
     adapter,
+    sem_adapter,
     optimizer,
     best_records,
     metrics,
@@ -1650,7 +1816,10 @@ def save_smart(
         pixart_sd = collect_trainable_state_dict(pixart)
         required_frags = get_required_active_key_fragments_for_model(pixart)
         active_key_counts = validate_active_trainable_state_keys(pixart_sd, required_frags)
-        lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
+        lora_key_count = sum(
+            ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
+            for k in pixart_sd.keys()
+        )
         if ENABLE_LORA and lora_key_count == 0:
             raise RuntimeError("LoRA is enabled but no LoRA keys found in pixart_trainable.")
         if lora_key_count == 0:
@@ -1662,14 +1831,22 @@ def save_smart(
         adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
         adapter_token_head_counts = {
             "adapter.to32": int(sum(1 for k in adapter_sd.keys() if k.startswith("to32."))),
+            "adapter.cond_proj": int(sum(1 for k in adapter_sd.keys() if "cond" in k)),
+            "adapter.local_entry": int(sum(1 for k in adapter_sd.keys() if "local" in k)),
         }
         print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
+        sem_adapter_sd = collect_sem_adapter_trainable_state_dict(sem_adapter)
+        req_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+        miss_sem_keys = [k for k in req_sem_keys if k not in sem_adapter_sd]
+        if miss_sem_keys:
+            raise RuntimeError(f"sem_adapter save missing required keys: {miss_sem_keys}")
         state = {
             "epoch": epoch,
             "step": global_step,
             "lora_rank": int(LORA_RANK),
             "lora_alpha": float(LORA_ALPHA),
             "adapter": adapter_sd,
+            "sem_adapter": sem_adapter_sd,
             "adapter_token_head_counts": adapter_token_head_counts,
             "optimizer": optimizer.state_dict(),
             "rng_state": {
@@ -1694,6 +1871,11 @@ def save_smart(
             "train_runtime_log": dict(LAST_TRAIN_LOG),
             "layer_config": {
                 "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
+                "pixel_layers": list(PIXEL_LAYERS),
+                "lr_conv_layers": list(LR_CONV_LAYERS),
+                "semantic_layers": list(SEMANTIC_LAYERS),
+                "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
+                "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
                 "use_tala_train": bool(USE_TALA_TRAIN),
                 "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
                 "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -1701,6 +1883,11 @@ def save_smart(
                 "tala_max_ratio": float(TALA_TRAIN_MAX_RATIO),
                 "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
                 "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
+                "dual_lora": bool(ENABLE_LORA),
+                "pixel_lora_rank": int(LORA_RANK),
+                "semantic_lora_rank": int(LORA_RANK),
+                "pixel_lora_alpha": float(LORA_ALPHA),
+                "semantic_lora_alpha": float(LORA_ALPHA),
                 "ckpt_select_mode": str(CKPT_SELECT_MODE),
                 "ckpt_select_psnr_gate": float(CKPT_SELECT_PSNR_GATE),
                 "gate_passed_when_saved": bool(gate_passed),
@@ -1712,7 +1899,10 @@ def save_smart(
         pixart_sd = collect_trainable_state_dict(pixart)
         required_frags = get_required_active_key_fragments_for_model(pixart)
         active_key_counts = validate_active_trainable_state_keys(pixart_sd, required_frags)
-        lora_key_count = sum(("lora_A" in k or "lora_B" in k) for k in pixart_sd.keys())
+        lora_key_count = sum(
+            ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
+            for k in pixart_sd.keys()
+        )
         if ENABLE_LORA and lora_key_count == 0:
             raise RuntimeError("LoRA is enabled but no LoRA keys found in pixart_trainable.")
         if lora_key_count == 0:
@@ -1724,14 +1914,22 @@ def save_smart(
         adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
         adapter_token_head_counts = {
             "adapter.to32": int(sum(1 for k in adapter_sd.keys() if k.startswith("to32."))),
+            "adapter.cond_proj": int(sum(1 for k in adapter_sd.keys() if "cond" in k)),
+            "adapter.local_entry": int(sum(1 for k in adapter_sd.keys() if "local" in k)),
         }
         print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
+        sem_adapter_sd = collect_sem_adapter_trainable_state_dict(sem_adapter)
+        req_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+        miss_sem_keys = [k for k in req_sem_keys if k not in sem_adapter_sd]
+        if miss_sem_keys:
+            raise RuntimeError(f"sem_adapter save missing required keys: {miss_sem_keys}")
         state = {
             "epoch": epoch,
             "step": global_step,
             "lora_rank": int(LORA_RANK),
             "lora_alpha": float(LORA_ALPHA),
             "adapter": adapter_sd,
+            "sem_adapter": sem_adapter_sd,
             "adapter_token_head_counts": adapter_token_head_counts,
             "pixart_trainable": pixart_sd,
             "best_records": None,
@@ -1747,6 +1945,11 @@ def save_smart(
             "train_runtime_log": dict(LAST_TRAIN_LOG),
             "layer_config": {
                 "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
+                "pixel_layers": list(PIXEL_LAYERS),
+                "lr_conv_layers": list(LR_CONV_LAYERS),
+                "semantic_layers": list(SEMANTIC_LAYERS),
+                "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
+                "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
                 "use_tala_train": bool(USE_TALA_TRAIN),
                 "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
                 "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -1754,6 +1957,11 @@ def save_smart(
                 "tala_max_ratio": float(TALA_TRAIN_MAX_RATIO),
                 "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
                 "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
+                "dual_lora": bool(ENABLE_LORA),
+                "pixel_lora_rank": int(LORA_RANK),
+                "semantic_lora_rank": int(LORA_RANK),
+                "pixel_lora_alpha": float(LORA_ALPHA),
+                "semantic_lora_alpha": float(LORA_ALPHA),
                 "ckpt_select_mode": str(CKPT_SELECT_MODE),
                 "ckpt_select_psnr_gate": float(CKPT_SELECT_PSNR_GATE),
                 "gate_passed_when_saved": bool(gate_passed),
@@ -1825,6 +2033,7 @@ def save_last_resume_only(
     global_step,
     pixart,
     adapter,
+    sem_adapter,
     optimizer,
     best_records,
     dl_gen,
@@ -1833,6 +2042,11 @@ def save_last_resume_only(
     last_val_psnr: float = -1.0,
 ):
     adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
+    sem_adapter_sd = collect_sem_adapter_trainable_state_dict(sem_adapter)
+    req_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+    miss_sem_keys = [k for k in req_sem_keys if k not in sem_adapter_sd]
+    if miss_sem_keys:
+        raise RuntimeError(f"sem_adapter save missing required keys: {miss_sem_keys}")
     pixart_sd = collect_trainable_state_dict(pixart)
     state_last = {
         "epoch": epoch,
@@ -1840,8 +2054,11 @@ def save_last_resume_only(
         "lora_rank": int(LORA_RANK),
         "lora_alpha": float(LORA_ALPHA),
         "adapter": adapter_sd,
+        "sem_adapter": sem_adapter_sd,
         "adapter_token_head_counts": {
             "adapter.to32": int(sum(1 for k in adapter_sd.keys() if k.startswith("to32."))),
+            "adapter.cond_proj": int(sum(1 for k in adapter_sd.keys() if "cond" in k)),
+            "adapter.local_entry": int(sum(1 for k in adapter_sd.keys() if "local" in k)),
         },
         "optimizer": optimizer.state_dict(),
         "rng_state": {
@@ -1866,6 +2083,11 @@ def save_last_resume_only(
         "train_runtime_log": dict(LAST_TRAIN_LOG),
         "layer_config": {
             "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
+            "pixel_layers": list(PIXEL_LAYERS),
+            "lr_conv_layers": list(LR_CONV_LAYERS),
+            "semantic_layers": list(SEMANTIC_LAYERS),
+            "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
+            "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
             "use_tala_train": bool(USE_TALA_TRAIN),
             "tala_active_mode": str(TALA_TRAIN_ACTIVE_MODE),
             "tala_active_t_min": int(TALA_TRAIN_ACTIVE_T_MIN),
@@ -1873,6 +2095,11 @@ def save_last_resume_only(
             "tala_max_ratio": float(TALA_TRAIN_MAX_RATIO),
             "tala_train_detach_lr_latent": bool(TALA_TRAIN_DETACH_LR_LATENT),
             "use_adaptive_text_prompt": bool(USE_ADAPTIVE_TEXT_PROMPT),
+            "dual_lora": bool(ENABLE_LORA),
+            "pixel_lora_rank": int(LORA_RANK),
+            "semantic_lora_rank": int(LORA_RANK),
+            "pixel_lora_alpha": float(LORA_ALPHA),
+            "semantic_lora_alpha": float(LORA_ALPHA),
             "ckpt_select_mode": str(CKPT_SELECT_MODE),
             "ckpt_select_psnr_gate": float(CKPT_SELECT_PSNR_GATE),
             "gate_passed_when_saved": False,
@@ -1928,7 +2155,7 @@ def _build_limited_val_loader(val_loader, num_samples: int):
     return DataLoader(subset, batch_size=1, shuffle=False)
 
 
-def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
+def init_from_ckpt_weights_only(pixart, adapter, sem_adapter, ckpt_path: str):
     if not ckpt_path:
         return False
     if not os.path.exists(ckpt_path):
@@ -1947,10 +2174,16 @@ def init_from_ckpt_weights_only(pixart, adapter, ckpt_path: str):
             print("✅ Adapter bootstrap load succeeded.")
         except Exception as e:
             print(f"⚠️ Adapter bootstrap load skipped due to mismatch: {e}")
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
+    if isinstance(sem_adapter_sd, dict):
+        missing, unexpected, skipped = load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="init-sem-adapter")
+        print(f"✅ sem_adapter bootstrap load: missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
+    elif USE_SEMANTIC_BRANCH:
+        raise RuntimeError("Bootstrap checkpoint missing sem_adapter while USE_SEMANTIC_BRANCH=True")
     return True
 
 
-def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
+def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     if not os.path.exists(LAST_CKPT_PATH):
         return 0, 0, [], None, -1.0
     print(f"📥 Resuming from {LAST_CKPT_PATH}...")
@@ -1974,6 +2207,12 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
         adapter.load_state_dict(adapter_sd, strict=True)
     except RuntimeError as e:
         raise RuntimeError(f"Adapter strict load failed during resume: {e}") from e
+    sem_adapter_sd = ckpt.get("sem_adapter", None)
+    if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
+        missing, unexpected, skipped = load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="resume-sem-adapter")
+        print(f"✅ sem_adapter resume load: missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
+    elif USE_SEMANTIC_BRANCH:
+        raise RuntimeError("Checkpoint missing sem_adapter while USE_SEMANTIC_BRANCH=True")
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="resume")
     try:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -2009,9 +2248,22 @@ def resume(pixart, adapter, optimizer, dl_gen, ema=None, ema_named_params=None):
     last_val_psnr = float(ckpt.get("last_val_psnr", -1.0))
     return ckpt["epoch"]+1, ckpt["step"], ckpt.get("best_records", []), None, last_val_psnr
 
+def clone_adapter_cond(cond):
+    out = {}
+    for k, v in cond.items():
+        out[k] = v.clone() if torch.is_tensor(v) else v
+    return out
+
+def zero_cond_keys(cond, keys):
+    out = clone_adapter_cond(cond)
+    for k in keys:
+        if k in out and torch.is_tensor(out[k]):
+            out[k] = torch.zeros_like(out[k])
+    return out
+
 # ================= 9. Validation =================
 @torch.no_grad()
-def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
+def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, data_info, lpips_fn_val_cpu, val_tag: str = "raw"):
     tag = str(val_tag).lower()
     print(f"🔎 Validating Epoch {epoch+1} [{tag}]...")
     print(
@@ -2022,7 +2274,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
         f"tala_train_blend_pow={float(TALA_TRAIN_BLEND_POW):.3f} "
         f"tala_train_detach_lr_latent={bool(TALA_TRAIN_DETACH_LR_LATENT)}"
     )
-    pixart.eval(); adapter.eval()
+    pixart.eval(); adapter.eval(); sem_adapter.eval()
     results = {}
     val_gen = torch.Generator(device=DEVICE); val_gen.manual_seed(SEED)
     
@@ -2053,7 +2305,7 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
         cond_map_stds = []
         ip_tok_stds, ip_out_stds, ip_alphas = [], [], []
         ip_pre_stds, ip_post_stds, ip_out_scales = [], [], []
-        tasr_gate_means, sft_alpha_means = [], []
+        
         prompt_hit_rates, prompt_tok_counts, prompt_nonpad_ratios = [], [], []
         prompt_cache_mem = OrderedDict()
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
@@ -2079,6 +2331,8 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
                     t_embed = pixart.t_embedder(t_b.to(dtype=COMPUTE_DTYPE))
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     cond = adapter(lr_small, t_embed=t_embed)
+                sem_tokens = sem_adapter(((lr_small.clamp(-1, 1) + 1.0) * 0.5).float())
+                cond["sem_tokens"] = sem_tokens.to(dtype=cond["cond_tokens"].dtype if "cond_tokens" in cond else sem_tokens.dtype)
                 with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                     drop_uncond = torch.ones(latents.shape[0], device=DEVICE, dtype=torch.long)
                     drop_cond = torch.zeros(latents.shape[0], device=DEVICE, dtype=torch.long)
@@ -2096,12 +2350,12 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
                         prompt_hit_rates.append(hit_rate)
                         prompt_tok_counts.append(tok_cnt)
                         prompt_nonpad_ratios.append(nonpad_ratio)
-                        if not all(p is not None for p in prompt_packs):
-                            if STRICT_ADAPTIVE_PROMPT:
-                                missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
-                                raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
-                        y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(DEVICE)
-                        y_mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
+                        if not all(p is not None for p in prompt_packs) and STRICT_ADAPTIVE_PROMPT:
+                            missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
+                            raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
+                        merged_packs = [p if p is not None else null_pack for p in prompt_packs]
+                        y_cond = torch.cat([p["y"] for p in merged_packs], dim=0).to(DEVICE)
+                        y_mask_cond = torch.cat([p["mask"] for p in merged_packs], dim=0).to(DEVICE)
                     y_uncond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_uncond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     out_uncond = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
@@ -2117,13 +2371,11 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
                     ip_pre_stds.append(0.0)
                     ip_post_stds.append(0.0)
                     ip_out_scales.append(0.0)
-                    ip_stats = getattr(pixart, "_last_image_cond_stats", {}) or {}
-                    ip_out_stds.append(float(ip_stats.get("lr_cross_img_delta_std", 0.0)))
-                    ip_alphas.append(float(ip_stats.get("avg_image_alpha", 0.0)))
+                    ip_stats = getattr(pixart, "_last_image_stats", {}) or {}
+                    ip_out_stds.append(float(ip_stats.get("lr_ip_attn_delta_std_mean", 0.0)))
+                    ip_alphas.append(float(ip_stats.get("semantic_gate_mean", 0.0)))
 
-                    sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
-                    tasr_gate_means.append(float(sft_stats.get("tasr_gate_mean", 0.0)))
-                    sft_alpha_means.append(float(sft_stats.get("alpha_mean", 0.0)))
+                    
 
                     if CFG_SCALE == 1.0:
                         out = out_cond
@@ -2178,17 +2430,14 @@ def validate(epoch, pixart, adapter, vae, val_loader, null_pack, data_info, lpip
         ip_out_scale = float(np.mean(ip_out_scales)) if len(ip_out_scales) > 0 else 1.0
         ip_out_std = float(np.mean(ip_out_stds)) if len(ip_out_stds) > 0 else 0.0
         ip_alpha = float(np.mean(ip_alphas)) if len(ip_alphas) > 0 else 0.0
-        tasr_gate_mean_val = float(np.mean(tasr_gate_means)) if len(tasr_gate_means) > 0 else 0.0
-        sft_alpha_mean = float(np.mean(sft_alpha_means)) if len(sft_alpha_means) > 0 else 0.0
         msg = (
             f"[VAL-PROXY@{steps}][{tag}] Ep{epoch+1}: proxy_psnr={res[0]:.2f} | proxy_ssim={res[1]:.4f} | proxy_lpips={res[2]:.4f} | "
             f"CONDΔ={cdelta:.5f} | text_cond_delta={text_cdelta:.5f} | prompt_cache_hit_rate={prompt_hit_rate:.3f} | avg_prompt_token_count={avg_prompt_token_count:.2f} | avg_prompt_nonpad_ratio={avg_prompt_nonpad_ratio:.3f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | ip_tok_std={ip_tok_std:.4f} | ip_pre_std={ip_pre_std:.4f} | ip_post_std={ip_post_std:.4f} | ip_out_scale={ip_out_scale:.4f} | ip_out_std={ip_out_std:.4f} | ip_alpha={ip_alpha:.4f} | ip_K={16} | "
-            f"tasr_gate_mean={tasr_gate_mean_val:.4f} | sft_alpha_mean={sft_alpha_mean:.4f} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
         print(msg)
-    pixart.train(); adapter.train()
+    pixart.train(); adapter.train(); sem_adapter.train()
     return results
 
 # ================= 10. Main =================
@@ -2203,7 +2452,7 @@ def main():
         if not os.path.exists(pth):
             raise FileNotFoundError(f"Required pretrained path missing: {pth}")
 
-    train_ds = DF2K_Online_Dataset(crop_size=512, is_train=True, scale=4)
+    train_ds = MixedRealISRDataset(crop_size=512, scale=4)
     if VAL_MODE == "realsr":
         val_ds = RealSR_Val_Paired_Dataset(REALSR_VAL_ROOTS, crop_size=512)
         print(f"[VAL] mode=realsr roots={REALSR_VAL_ROOTS} pairs={len(val_ds)}")
@@ -2270,6 +2519,8 @@ def main():
         input_size=64, in_channels=4, out_channels=4,
         force_null_caption=False,
         anchor_layers=list(ANCHOR_LAYERS),
+        pixel_layers=list(PIXEL_LAYERS),
+        lr_conv_layers=list(LR_CONV_LAYERS),
         semantic_layers=list(SEMANTIC_LAYERS),
         kv_compress_config=kv_cfg,
     ).to(DEVICE)
@@ -2281,13 +2532,22 @@ def main():
     base = torch.load(PIXART_PATH, map_location="cpu")
     if "state_dict" in base: base = base["state_dict"]
     if "pos_embed" in base: del base["pos_embed"]
-    if hasattr(pixart, "load_pretrained_weights_with_zero_init"):
-        pixart.load_pretrained_weights_with_zero_init(base)
-    else:
-        missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
-        print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
+    missing, unexpected, skipped = load_state_dict_shape_compatible(pixart, base, context="base-pretrain")
+    print(f"[Load] missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
+    pixart.enable_sr_conditioning_layers(
+        pixel_layers=list(PIXEL_LAYERS),
+        lr_conv_layers=list(LR_CONV_LAYERS),
+        semantic_layers=list(SEMANTIC_LAYERS),
+        init_gate=-4.0,
+    )
+    sem0 = int(SEMANTIC_LAYERS[0])
+    sem_std = float(pixart.blocks[sem0].cross_attn.out_proj.weight.detach().float().std().item())
+    print(f"[semantic-enable-check] layer={sem0} out_proj.weight.std={sem_std:.6e}")
+    if sem_std <= 1e-8:
+        raise RuntimeError("semantic layer out_proj.weight.std() is zero after enable; call order is wrong.")
     if ENABLE_LORA:
         apply_lora(pixart)
+        set_dual_lora_scales(pixart, lambda_pix=1.0, lambda_sem=1.0)
     else:
         print("ℹ️ LoRA disabled.")
     pixart.train()
@@ -2295,6 +2555,11 @@ def main():
     adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
+    ).to(DEVICE).train()
+    sem_adapter = CLIPSemanticAdapter(
+        encoder_name_or_path=SEMANTIC_ENCODER_NAME_OR_PATH,
+        hidden_size=1152,
+        num_prompt_tokens=16,
     ).to(DEVICE).train()
     save_plan_keys = compute_save_keys_for_stages(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     ever_keys = set(save_plan_keys)
@@ -2339,7 +2604,7 @@ def main():
     ema_named_params = []
     if USE_EMA:
         ema = ParamEMA(decay=EMA_DECAY)
-        ema_named_params = collect_ema_named_params(pixart, adapter)
+        ema_named_params = collect_ema_named_params(pixart, adapter, sem_adapter)
         ema.register(ema_named_params)
         print(f"✅ EMA tracking enabled: decay={EMA_DECAY}, tensors={len(ema_named_params)}")
 
@@ -2350,10 +2615,7 @@ def main():
         f"USE_TALA_TRAIN={bool(USE_TALA_TRAIN)} USE_LQ_INIT={bool(USE_LQ_INIT)} "
         f"LORA_RANK={int(LORA_RANK)} LORA_ALPHA={int(LORA_ALPHA)}"
     )
-    print('[GATE-MODE] gate_mode = "pure_tasr_learned" | no_handcrafted_time_prior = True')
-    print('[GATE-SOURCE] gate_time_source = "pure_timestep_only"')
-    print('[SEMANTIC-SCHEDULE] semantic_time_schedule = "disabled"')
-    print('[HPA-MODE] hpa_mode = "head_space_residual_injection"')
+    print('[GATE-MODE] gate_mode = "dualcondsr_dynamic"')
     print('[PACKED-FALLBACK] packed_text_fallback = "per_sample_safe"')
     print(f"[LPIPS-PATH] use_legacy_patch_lpips = {bool(USE_LEGACY_PATCH_LPIPS)}")
     print(
@@ -2365,7 +2627,7 @@ def main():
         f"TALA_TRAIN_HIGH_T_MODE={bool(TALA_TRAIN_HIGH_T_MODE)} TALA_TRAIN_ACTIVE_T_MIN={int(TALA_TRAIN_ACTIVE_T_MIN)} "
         f"TALA_TRAIN_MAX_RATIO={float(TALA_TRAIN_MAX_RATIO):.3f}"
     )
-    print(f"[RUN-MODE] anchor_layers={list(ANCHOR_LAYERS)} use_tala_train={bool(USE_TALA_TRAIN)} use_hpa={bool(USE_SEMANTIC_BRANCH)} lora_rank={int(LORA_RANK)} lora_alpha={int(LORA_ALPHA)}")
+    print(f"[RUN-MODE] anchor_layers={list(ANCHOR_LAYERS)} use_tala_train={bool(USE_TALA_TRAIN)} use_semantic_branch={bool(USE_SEMANTIC_BRANCH)} lora_rank={int(LORA_RANK)} lora_alpha={int(LORA_ALPHA)}")
     print(
         f"[PERCEP-CONFIG] USE_TIMESTEP_AWARE_PERCEPTUAL={bool(USE_TIMESTEP_AWARE_PERCEPTUAL)} "
         f"PERCEP_T_MAX={int(PERCEP_T_MAX)} PERCEP_DECODE_MAX_SAMPLES={int(PERCEP_DECODE_MAX_SAMPLES)} "
@@ -2388,14 +2650,14 @@ def main():
     if START_FROM_BASE_ONLY:
         print("✅ START_FROM_BASE_ONLY=True: skip bootstrap/resume checkpoints; train from PixArt base.")
     elif not os.path.exists(LAST_CKPT_PATH) and INIT_CKPT_PATH:
-        init_from_ckpt_weights_only(pixart, adapter, INIT_CKPT_PATH)
+        init_from_ckpt_weights_only(pixart, adapter, sem_adapter, INIT_CKPT_PATH)
 
     configure_pixart_trainable_params(pixart, train_x_embedder=TRAIN_PIXART_X_EMBEDDER)
     for p in adapter.parameters():
         p.requires_grad_(True)
     ever_keys.update({n for n, p in pixart.named_parameters() if p.requires_grad})
     validation_count = 0
-    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter)
+    optimizer, params_to_clip, group_counts = build_optimizer_and_clippables(pixart, adapter, sem_adapter)
     print(f"✅ Optim groups(single-stage): {group_counts}")
     _maybe_empty_cuda_cache()
 
@@ -2403,10 +2665,10 @@ def main():
         ep_start, step, best, last_val_psnr = 0, 0, [], -1.0
     else:
         ep_start, step, best, _, last_val_psnr = resume(
-            pixart, adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params
+            pixart, adapter, sem_adapter, optimizer, dl_gen, ema=ema, ema_named_params=ema_named_params
         )
     if ema is not None:
-        ema_named_params = collect_ema_named_params(pixart, adapter)
+        ema_named_params = collect_ema_named_params(pixart, adapter, sem_adapter)
         ema.register(ema_named_params)
 
     print("🚀 DiT-SR V8 Training Started (V-Pred, Aug, Copy-Init).")
@@ -2474,6 +2736,9 @@ def main():
                 t_embed = pixart.t_embedder(t.to(dtype=COMPUTE_DTYPE))
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 cond = adapter(adapter_in, t_embed=t_embed) # time-aware adapter conditioning
+            lr_small_01 = ((adapter_in.clamp(-1, 1) + 1.0) * 0.5).float()
+            sem_tokens = sem_adapter(lr_small_01)
+            cond["sem_tokens"] = sem_tokens.to(dtype=cond["cond_tokens"].dtype if "cond_tokens" in cond else sem_tokens.dtype)
             if "ip_tokens" not in cond and "cond_tokens" not in cond:
                 raise KeyError("adapter output missing ip_tokens/cond_tokens")
             if "local_entry_tokens" not in cond and "cond_map" not in cond:
@@ -2485,17 +2750,11 @@ def main():
                     f"ip_tokens length mismatch: got {tokens.shape[1]}, expected {expected_tokens}"
                 )
             cond_in = cond
+            adapter_dropped = False
             cond_drop_prob = float(COND_DROP_PROB)
             if USE_ADAPTER_CFDROPOUT and torch.rand(1, device=DEVICE).item() < cond_drop_prob:
-                cond_in = dict(cond)
-                if "ip_tokens" in cond_in:
-                    cond_in["ip_tokens"] = torch.zeros_like(cond_in["ip_tokens"])
-                if "cond_tokens" in cond_in:
-                    cond_in["cond_tokens"] = torch.zeros_like(cond_in["cond_tokens"])
-                if "local_entry_tokens" in cond_in:
-                    cond_in["local_entry_tokens"] = torch.zeros_like(cond_in["local_entry_tokens"])
-                if "cond_map" in cond_in:
-                    cond_in["cond_map"] = torch.zeros_like(cond_in["cond_map"])
+                adapter_dropped = True
+                cond_in = mask_adapter_cond(cond, torch.zeros((zt_in.shape[0],), device=DEVICE))
 
             with torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
                 # conditional prompt source = adaptive cache (if enabled); unconditional prompt source = null prompt.
@@ -2512,13 +2771,12 @@ def main():
                         prompt_cache_mem,
                         max_cache_items=TRAIN_PROMPT_CACHE_MAX_ITEMS,
                     )
-                    if not all(p is not None for p in prompt_packs):
-                        if STRICT_ADAPTIVE_PROMPT:
-                            missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
-                            raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
-                    else:
-                        y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(DEVICE)
-                        y_mask = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
+                    if not all(p is not None for p in prompt_packs) and STRICT_ADAPTIVE_PROMPT:
+                        missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
+                        raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
+                    merged_packs = [p if p is not None else null_pack for p in prompt_packs]
+                    y_cond = torch.cat([p["y"] for p in merged_packs], dim=0).to(DEVICE)
+                    y_mask = torch.cat([p["mask"] for p in merged_packs], dim=0).to(DEVICE)
                 drop_cond = torch.zeros(zt_in.shape[0], device=DEVICE, dtype=torch.long)
                 sft_strength = get_sft_strength(epoch + 1)
                 kwargs = dict(
@@ -2547,7 +2805,11 @@ def main():
                     "lr_ip_gate_mean": float(image_cond_stats.get("lr_ip_gate_mean", 0.0)),
                     "lr_ip_gate_std": float(image_cond_stats.get("lr_ip_gate_std", 0.0)),
                     "local_entry_gate": float((getattr(pixart, "_last_sft_stats", {}) or {}).get("local_entry_gate", 0.0)),
-                    "lr_ip_attn_delta_std": float((getattr(pixart.blocks[0], "_last_image_stats", {}) or {}).get("img_delta_std", 0.0)),
+                    "lr_ip_attn_delta_std_mean": float(image_cond_stats.get("lr_ip_attn_delta_std_mean", 0.0)),
+                    "lr_stream_delta_std_mean": float(image_cond_stats.get("lr_stream_delta_std_mean", 0.0)),
+                    "lr_conv_delta_std_mean": float(image_cond_stats.get("lr_conv_delta_std_mean", 0.0)),
+                    "semantic_gate_mean": float(image_cond_stats.get("semantic_gate_mean", 0.0)),
+                    "semantic_img_delta_std_mean": float(image_cond_stats.get("semantic_img_delta_std_mean", 0.0)),
                     "ad_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "cond_map_std": float(cond_in["cond_map"].detach().float().std().item()),
                     "sft_strength": float(sft_strength),
@@ -2564,6 +2826,7 @@ def main():
                     "tala_t_min": int(tala_stats.get("tala_t_min", 0)),
                     "tala_t_max": int(tala_stats.get("tala_t_max", 0)),
                     "tala_effective_eps_std": float(tala_stats.get("tala_effective_eps_std", 0.0)),
+                    "adapter_dropped": int(adapter_dropped),
                 }
                 assert_finite_tensor("ip_tokens", tokens, guard_stats)
                 assert_finite_tensor("cond_map", cond_in["cond_map"], guard_stats)
@@ -2597,14 +2860,104 @@ def main():
                             force_drop_ids=drop_cond,
                             sft_strength=sft_strength,
                         ).float()
+                        out_same_text_no_adapter = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_zero_guard,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
                     assert_finite_tensor("out_uncond", out_uncond_guard, guard_stats)
                     cond_delta_curr = float((model_pred.detach() - out_uncond_guard).abs().mean().item())
                     text_cond_delta_curr = float((model_pred.detach() - out_text_null_guard).abs().mean().item())
+                    adapter_delta_same_text = float((model_pred.detach() - out_same_text_no_adapter).abs().mean().item())
                     last_cond_delta_curr = cond_delta_curr
                     last_text_cond_delta_curr = text_cond_delta_curr
+                    guard_stats["adapter_delta_same_text"] = adapter_delta_same_text
+                    if step > 100 and (not adapter_dropped):
+                        if adapter_delta_same_text <= 1e-6:
+                            raise RuntimeError("adapter_delta_same_text is zero; adapter path is likely dead.")
+                        if float(image_cond_stats.get("lr_ip_attn_delta_std_mean", 0.0)) <= 1e-8:
+                            raise RuntimeError("lr_ip_attn_delta_std_mean is zero; LR attention path is likely dead.")
                 else:
                     cond_delta_curr = float(last_cond_delta_curr)
                     text_cond_delta_curr = float(last_text_cond_delta_curr)
+
+                run_module_monitor = ((step % MODULE_MONITOR_EVERY) == 0)
+                if run_module_monitor and (not adapter_dropped):
+                    with torch.no_grad():
+                        cond_no_local = zero_cond_keys(cond_in, ["local_entry_tokens", "cond_map"])
+                        cond_no_lr = zero_cond_keys(cond_in, ["ip_tokens", "cond_tokens"])
+                        cond_no_sem = zero_cond_keys(cond_in, ["sem_tokens"])
+                        cond_no_all = mask_adapter_cond(cond_in, torch.zeros((zt_in.shape[0],), device=DEVICE))
+                        out_no_local = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_no_local,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                        out_no_lr = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_no_lr,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                        out_no_sem = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_no_sem,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                        out_no_all = pixart(
+                            x=zt_in.detach(),
+                            timestep=t,
+                            y=y_cond,
+                            aug_level=aug_level_emb,
+                            mask=y_mask,
+                            data_info=d_info,
+                            adapter_cond=cond_no_all,
+                            force_drop_ids=drop_cond,
+                            sft_strength=sft_strength,
+                        ).float()
+                    full_out = model_pred.detach()
+                    effect_local = float((full_out - out_no_local).abs().mean().item())
+                    effect_lr_tokens = float((full_out - out_no_lr).abs().mean().item())
+                    effect_semantic = float((full_out - out_no_sem).abs().mean().item())
+                    effect_all_adapter = float((full_out - out_no_all).abs().mean().item())
+                    model_pred_std = float(full_out.float().std().item())
+                    denom = max(1e-8, model_pred_std)
+                    guard_stats.update(
+                        {
+                            "effect_local": effect_local,
+                            "effect_lr_tokens": effect_lr_tokens,
+                            "effect_semantic": effect_semantic,
+                            "effect_all_adapter": effect_all_adapter,
+                            "model_pred_std": model_pred_std,
+                            "effect_local_ratio": effect_local / denom,
+                            "effect_lr_tokens_ratio": effect_lr_tokens / denom,
+                            "effect_semantic_ratio": effect_semantic / denom,
+                            "effect_all_adapter_ratio": effect_all_adapter / denom,
+                        }
+                    )
 
                 # [V8 Logic] Min-SNR-Gamma Weighting (per-sample, shape [B])
                 alpha_s = alpha_t[:, 0, 0, 0]
@@ -2613,15 +2966,22 @@ def main():
                 gamma = 5.0
                 min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
                 loss_weights = min_snr_gamma / snr
-                loss_v = (F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1, 2, 3]) * loss_weights).mean()
+                pixel_loss_weight = batch.get("pixel_loss_weight", None)
+                if pixel_loss_weight is None:
+                    pixel_loss_weight = torch.ones((zh.shape[0],), device=DEVICE, dtype=torch.float32)
+                else:
+                    pixel_loss_weight = pixel_loss_weight.to(DEVICE, dtype=torch.float32).view(-1)
+                mse_per = F.mse_loss(model_pred, target_v, reduction='none').mean(dim=[1, 2, 3])
+                loss_v = (mse_per * loss_weights * pixel_loss_weight).sum() / pixel_loss_weight.sum().clamp_min(1.0)
 
                 # Reconstruct x0 for other losses (x0 = alpha * zt_in - sigma * v)
                 z0 = alpha_t * zt_in.float() - sigma_t * model_pred
 
                 latent_l1_per = torch.mean(torch.abs(z0 - zh.float()), dim=[1, 2, 3])
                 latent_l1_mask = (t >= int(LATENT_L1_T_MIN)).float()
-                if float(latent_l1_mask.sum().item()) > 0:
-                    loss_latent_l1 = (latent_l1_per * latent_l1_mask).sum() / latent_l1_mask.sum().clamp_min(1.0)
+                latent_w = latent_l1_mask * pixel_loss_weight
+                if float(latent_w.sum().item()) > 0:
+                    loss_latent_l1 = (latent_l1_per * latent_w).sum() / latent_w.sum().clamp_min(1.0)
                 else:
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
@@ -2702,7 +3062,7 @@ def main():
             accum_micro_steps += 1
 
             if accum_micro_steps == GRAD_ACCUM_STEPS:
-                log_critical_path_gradients(step + 1, pixart, adapter)
+                log_critical_path_gradients(step + 1, pixart, adapter, sem_adapter)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -2715,17 +3075,27 @@ def main():
                 sft_stats = getattr(pixart, "_last_sft_stats", {}) or {}
                 sft_delta_std = float(sft_stats.get("sft_delta_std", 0.0))
                 sft_strength_logged = float(sft_stats.get("sft_strength", sft_strength))
-                image_stats = getattr(pixart, "_last_image_stats", {}) or {}
+                image_stats = dict(image_cond_stats)
                 ip_tokens_std = float(tokens.detach().float().std().item())
                 local_entry_tokens_std = float(cond_in.get("local_entry_tokens", cond_in["cond_map"].flatten(2).transpose(1, 2)).detach().float().std().item())
                 lr_ip_gate_mean = float(image_stats.get("lr_ip_gate_mean", 0.0))
                 lr_ip_gate_std = float(image_stats.get("lr_ip_gate_std", 0.0))
                 local_entry_gate = float(sft_stats.get("local_entry_gate", 0.0))
-                lr_ip_attn_delta_std = float((getattr(pixart.blocks[0], "_last_image_stats", {}) or {}).get("img_delta_std", 0.0))
+                lr_ip_attn_delta_std_mean = float(image_stats.get("lr_ip_attn_delta_std_mean", 0.0))
+                lr_stream_delta_std_mean = float(image_stats.get("lr_stream_delta_std_mean", 0.0))
+                lr_conv_delta_std_mean = float(image_stats.get("lr_conv_delta_std_mean", 0.0))
+                semantic_gate_mean = float(image_stats.get("semantic_gate_mean", 0.0))
+                semantic_img_delta_std_mean = float(image_stats.get("semantic_img_delta_std_mean", 0.0))
                 adapter_map_std = float(cond_in["cond_map"].detach().float().std().item())
                 cond_map_std = float(cond_in["cond_map"].detach().float().std().item())
-                cond_delta = float(cond_delta_curr)
-                text_cond_delta = float(text_cond_delta_curr)
+                adapter_delta_same_text = float(guard_stats.get("adapter_delta_same_text", float("nan")))
+                effect_local_ratio = float(guard_stats.get("effect_local_ratio", float("nan")))
+                effect_lr_tokens_ratio = float(guard_stats.get("effect_lr_tokens_ratio", float("nan")))
+                effect_semantic_ratio = float(guard_stats.get("effect_semantic_ratio", float("nan")))
+                effect_all_adapter_ratio = float(guard_stats.get("effect_all_adapter_ratio", float("nan")))
+                sem_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
+                sem_tokens_std = float(sem_stats.get("sem_tokens_postproj_std", 0.0))
+                sem_out_scale = float(sem_stats.get("sem_out_scale", 0.0))
                 tala_on = int(USE_TALA_TRAIN)
                 cpu_rss_gb = float(get_rss_gb()) if (step % 100 == 0) else float("nan")
                 if step % 100 == 0:
@@ -2757,9 +3127,12 @@ def main():
                     'ip_gate_m': f"{lr_ip_gate_mean:.4f}",
                     'ip_gate_s': f"{lr_ip_gate_std:.4f}",
                     'entry_gate': f"{local_entry_gate:.4f}",
-                    'ip_dstd': f"{lr_ip_attn_delta_std:.4f}",
-                    'cond_delta': f"{cond_delta:.5f}",
-                    'text_cond_delta': f"{text_cond_delta:.5f}",
+                    'adapter_dt': f"{adapter_delta_same_text:.5f}" if math.isfinite(adapter_delta_same_text) else "nan",
+                    'ip_dstd': f"{lr_ip_attn_delta_std_mean:.4f}",
+                    'str_dstd': f"{lr_stream_delta_std_mean:.4f}",
+                    'cnv_dstd': f"{lr_conv_delta_std_mean:.4f}",
+                    'sem_gate': f"{semantic_gate_mean:.4f}",
+                    'sem_dstd': f"{semantic_img_delta_std_mean:.4f}",
                     'guard_fwd': f"{int(run_guard_forward)}",
                     'a_hit': f"{prompt_cache_hit_rate:.3f}",
                     'p_miss': f"{int(num_missing_prompt_packs)}",
@@ -2773,6 +3146,13 @@ def main():
                     'ip_K': f"{16}",
                     'ad_map_std': f"{adapter_map_std:.4f}",
                     'cond_map_std': f"{cond_map_std:.4f}",
+                    'sem_tok_std': f"{sem_tokens_std:.4f}",
+                    'sem_scale': f"{sem_out_scale:.3f}",
+                    'eff_loc_r': f"{effect_local_ratio:.3f}" if math.isfinite(effect_local_ratio) else "nan",
+                    'eff_lr_r': f"{effect_lr_tokens_ratio:.3f}" if math.isfinite(effect_lr_tokens_ratio) else "nan",
+                    'eff_sem_r': f"{effect_semantic_ratio:.3f}" if math.isfinite(effect_semantic_ratio) else "nan",
+                    'eff_all_r': f"{effect_all_adapter_ratio:.3f}" if math.isfinite(effect_all_adapter_ratio) else "nan",
+                    'ad_drop': f"{int(adapter_dropped)}",
                     'cpu_rss_gb': f"{cpu_rss_gb:.3f}" if math.isfinite(cpu_rss_gb) else "nan",
                 }
                 log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
@@ -2792,10 +3172,25 @@ def main():
                     "lr_ip_gate_mean": lr_ip_gate_mean,
                     "lr_ip_gate_std": lr_ip_gate_std,
                     "local_entry_gate": local_entry_gate,
-                    "lr_ip_attn_delta_std": lr_ip_attn_delta_std,
+                    "adapter_delta_same_text": adapter_delta_same_text,
+                    "lr_ip_attn_delta_std_mean": lr_ip_attn_delta_std_mean,
+                    "lr_stream_delta_std_mean": lr_stream_delta_std_mean,
+                    "lr_conv_delta_std_mean": lr_conv_delta_std_mean,
+                    "semantic_gate_mean": semantic_gate_mean,
+                    "semantic_img_delta_std_mean": semantic_img_delta_std_mean,
                     "sft_delta_std": sft_delta_std,
-                    "cond_delta": cond_delta,
-                    "text_cond_delta": text_cond_delta,
+                    "sem_tokens_std": sem_tokens_std,
+                    "sem_out_scale": sem_out_scale,
+                    "effect_local": float(guard_stats.get("effect_local", float("nan"))),
+                    "effect_lr_tokens": float(guard_stats.get("effect_lr_tokens", float("nan"))),
+                    "effect_semantic": float(guard_stats.get("effect_semantic", float("nan"))),
+                    "effect_all_adapter": float(guard_stats.get("effect_all_adapter", float("nan"))),
+                    "model_pred_std": float(guard_stats.get("model_pred_std", float("nan"))),
+                    "effect_local_ratio": effect_local_ratio,
+                    "effect_lr_tokens_ratio": effect_lr_tokens_ratio,
+                    "effect_semantic_ratio": effect_semantic_ratio,
+                    "effect_all_adapter_ratio": effect_all_adapter_ratio,
+                    "adapter_dropped": int(adapter_dropped),
                     "run_guard_forward": int(run_guard_forward),
                     "adaptive_prompt_hit_rate": float(prompt_cache_hit_rate),
                     "num_missing_prompt_packs": int(num_missing_prompt_packs),
@@ -2811,13 +3206,15 @@ def main():
                     "ip_K": 16,
                     "adapter_map_std": adapter_map_std,
                     "cond_map_std": cond_map_std,
+                    "sem_tokens_std": float((getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}).get("sem_tokens_postproj_std", 0.0)),
+                    "sem_out_scale": float((getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}).get("sem_out_scale", 0.0)),
                     "cpu_rss_gb": (float(cpu_rss_gb) if math.isfinite(cpu_rss_gb) else float("nan")),
                     "train_prompt_cache_max_items": int(TRAIN_PROMPT_CACHE_MAX_ITEMS),
                     "val_prompt_cache_max_items": int(VAL_PROMPT_CACHE_MAX_ITEMS),
                 }
 
         if accum_micro_steps > 0 and not reached_max_steps:
-            log_critical_path_gradients(step + 1, pixart, adapter)
+            log_critical_path_gradients(step + 1, pixart, adapter, sem_adapter)
             torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
             optimizer.step()
             optimizer.zero_grad()
@@ -2834,7 +3231,7 @@ def main():
         if run_proxy_val:
             validation_count += 1
             print(f"🔎 [VAL] Raw weights (validation #{validation_count})")
-            val_raw = validate(epoch, pixart, adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="raw")
+            val_raw = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="raw")
 
             run_ema_val = (
                 (ema is not None)
@@ -2846,7 +3243,7 @@ def main():
             if run_ema_val:
                 print(f"🔎 [VAL] EMA weights (validation #{validation_count})")
                 ema.apply(ema_named_params)
-                val_ema = validate(epoch, pixart, adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="ema")
+                val_ema = validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, d_info, lpips_fn_val_cpu, val_tag="ema")
                 ema.restore(ema_named_params)
 
             raw_metrics = val_raw[int(BEST_VAL_STEPS)] if int(BEST_VAL_STEPS) in val_raw else next(iter(val_raw.values()))
@@ -2878,6 +3275,7 @@ def main():
                 step,
                 pixart,
                 adapter,
+                sem_adapter,
                 optimizer,
                 best,
                 best_eval_metrics_this_round,
@@ -2898,6 +3296,7 @@ def main():
                 global_step=step,
                 pixart=pixart,
                 adapter=adapter,
+                sem_adapter=sem_adapter,
                 optimizer=optimizer,
                 best_records=best,
                 dl_gen=dl_gen,
