@@ -571,7 +571,16 @@ def build_model_and_assets(args, device, compute_dtype):
             missing_sem_keys = [k for k in required_sem_keys if k not in sem_adapter_sd]
             if missing_sem_keys:
                 raise RuntimeError(f"Checkpoint sem_adapter missing required keys in eval: {missing_sem_keys}")
-            load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="eval-sem-adapter")
+            missing, unexpected, skipped = load_state_dict_shape_compatible(
+                sem_adapter,
+                sem_adapter_sd,
+                context="eval-sem-adapter",
+            )
+            loaded_count = len(sem_adapter_sd) - len(skipped)
+            if loaded_count <= 0:
+                raise RuntimeError(
+                    "No sem_adapter tensors were loaded; refusing to eval with random semantic adapter."
+                )
         else:
             raise RuntimeError("Checkpoint missing sem_adapter while semantic branch is enabled in eval.")
 

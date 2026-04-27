@@ -1568,6 +1568,15 @@ def collect_state_dict_by_keys(model: nn.Module, keys):
     state = model.state_dict()
     return {k: state[k].detach().float().cpu() for k in sorted(keys) if k in state}
 
+def collect_sem_adapter_trainable_state_dict(sem_adapter: nn.Module):
+    sem_sd = sem_adapter.state_dict()
+    keep_prefixes = ("resampler.", "proj.", "proj_norm.")
+    out = {}
+    for k, v in sem_sd.items():
+        if k == "out_scale" or any(k.startswith(p) for p in keep_prefixes):
+            out[k] = v.detach().float().cpu()
+    return out
+
 
 def should_run_proxy_validation(epoch_1based: int) -> bool:
     if epoch_1based < 15:
@@ -1821,7 +1830,11 @@ def save_smart(
             "adapter.local_entry": int(sum(1 for k in adapter_sd.keys() if "local" in k)),
         }
         print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
-        sem_adapter_sd = {k: v.detach().float().cpu() for k, v in sem_adapter.state_dict().items()}
+        sem_adapter_sd = collect_sem_adapter_trainable_state_dict(sem_adapter)
+        req_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+        miss_sem_keys = [k for k in req_sem_keys if k not in sem_adapter_sd]
+        if miss_sem_keys:
+            raise RuntimeError(f"sem_adapter save missing required keys: {miss_sem_keys}")
         state = {
             "epoch": epoch,
             "step": global_step,
@@ -1899,7 +1912,11 @@ def save_smart(
             "adapter.local_entry": int(sum(1 for k in adapter_sd.keys() if "local" in k)),
         }
         print("✅ adapter token head save check:", ", ".join([f"{k}={v}" for k, v in adapter_token_head_counts.items()]))
-        sem_adapter_sd = {k: v.detach().float().cpu() for k, v in sem_adapter.state_dict().items()}
+        sem_adapter_sd = collect_sem_adapter_trainable_state_dict(sem_adapter)
+        req_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+        miss_sem_keys = [k for k in req_sem_keys if k not in sem_adapter_sd]
+        if miss_sem_keys:
+            raise RuntimeError(f"sem_adapter save missing required keys: {miss_sem_keys}")
         state = {
             "epoch": epoch,
             "step": global_step,
@@ -2018,7 +2035,11 @@ def save_last_resume_only(
     last_val_psnr: float = -1.0,
 ):
     adapter_sd = {k: v.detach().float().cpu() for k, v in adapter.state_dict().items()}
-    sem_adapter_sd = {k: v.detach().float().cpu() for k, v in sem_adapter.state_dict().items()}
+    sem_adapter_sd = collect_sem_adapter_trainable_state_dict(sem_adapter)
+    req_sem_keys = ("proj.weight", "proj.bias", "out_scale")
+    miss_sem_keys = [k for k in req_sem_keys if k not in sem_adapter_sd]
+    if miss_sem_keys:
+        raise RuntimeError(f"sem_adapter save missing required keys: {miss_sem_keys}")
     pixart_sd = collect_trainable_state_dict(pixart)
     state_last = {
         "epoch": epoch,
