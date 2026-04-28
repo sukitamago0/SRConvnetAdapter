@@ -331,6 +331,23 @@ class SRConvNetLSAAdapterV12(nn.Module):
             nn.PixelUnshuffle(2),
             nn.Conv2d(1152, self.hidden_size, 1),
         )
+        self.detail_refine = nn.Sequential(
+            LayerNorm2d(288),
+            nn.Conv2d(288, 288, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(288, 288, 3, 1, 1),
+        )
+        self.detail_token_head = nn.Sequential(
+            nn.PixelUnshuffle(2),
+            nn.Conv2d(1152, self.hidden_size, 1),
+            nn.GELU(),
+            nn.Conv2d(self.hidden_size, self.hidden_size, 1),
+        )
+        self.detail_latent_head = nn.Sequential(
+            nn.Conv2d(288, 128, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(128, 4, 3, 1, 1),
+        )
 
         for m in [
             self.proj2_hi,
@@ -347,6 +364,19 @@ class SRConvNetLSAAdapterV12(nn.Module):
         nn.init.zeros_(self.ip_token_head[3].bias)
         nn.init.normal_(self.local_entry_head[1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.local_entry_head[1].bias)
+        nn.init.normal_(self.detail_token_head[1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.detail_token_head[1].bias)
+        nn.init.normal_(self.detail_token_head[3].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.detail_token_head[3].bias)
+        for m in [
+            self.detail_refine[1],
+            self.detail_refine[3],
+            self.detail_latent_head[0],
+        ]:
+            nn.init.normal_(m.weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.detail_latent_head[2].weight)
+        nn.init.zeros_(self.detail_latent_head[2].bias)
 
     @staticmethod
     def _film(feat: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -376,18 +406,27 @@ class SRConvNetLSAAdapterV12(nn.Module):
 
         fused_64 = torch.cat([c2_64, c3_64, c4_64], dim=1)
         fused_64 = self.fuse64(fused_64)
+        detail_feat = fused_64 + self.detail_refine(fused_64)
         ip_map = self.ip_token_head(fused_64)
         local_map = self.local_entry_head(fused_64)
+        detail_token_map = self.detail_token_head(detail_feat)
+        detail_latent_residual = self.detail_latent_head(detail_feat)
 
         ip_tokens = ip_map.flatten(2).transpose(1, 2).contiguous()
         local_tokens = local_map.flatten(2).transpose(1, 2).contiguous()
+        detail_tokens = detail_token_map.flatten(2).transpose(1, 2).contiguous()
 
         return {
+            "struct_tokens": ip_tokens,
             "ip_tokens": ip_tokens,
             "local_entry_tokens": local_tokens,
             "ip_tokens_hw": (ip_map.shape[-2], ip_map.shape[-1]),
             "cond_tokens": ip_tokens,
             "cond_map": local_map,
+            "struct_tokens_hw": (ip_map.shape[-2], ip_map.shape[-1]),
+            "detail_tokens": detail_tokens,
+            "detail_tokens_hw": (detail_token_map.shape[-2], detail_token_map.shape[-1]),
+            "detail_latent_residual": detail_latent_residual,
         }
 
 

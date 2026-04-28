@@ -29,10 +29,17 @@ class SFTLayer(nn.Module):
 @MODELS.register_module()
 class PixArtSigmaSR(PixArtMS):
     def __init__(self, force_null_caption: bool = True, **kwargs):
-        self.pixel_layers = list(kwargs.pop("pixel_layers", kwargs.get("anchor_layers", [2, 4, 6, 8])))
-        self.lr_conv_layers = list(kwargs.pop("lr_conv_layers", self.pixel_layers))
-        self.semantic_layers = list(kwargs.pop("semantic_layers", [24, 25, 26, 27]))
+        self.pixel_layers = list(kwargs.pop("pixel_layers", kwargs.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7, 10, 13, 16])))
+        self.lr_conv_layers = list(kwargs.pop("lr_conv_layers", [2, 4, 6, 10, 13, 16]))
+        self.semantic_layers = list(kwargs.pop("semantic_layers", []))
         self.anchor_layers = list(kwargs.pop("anchor_layers", self.pixel_layers))
+        pending_lr_evolve_layers = kwargs.pop("lr_evolve_layers", None)
+        pending_lr_memory_layers = kwargs.pop("lr_memory_layers", [0, 1, 2, 3, 4, 5, 6, 7, 10, 13])
+        pending_detail_evolve_layers = kwargs.pop("detail_evolve_layers", [8, 10, 13, 16, 19, 22, 25, 27])
+        pending_detail_layers = kwargs.pop("detail_layers", [13, 16, 19, 22, 25, 27])
+        pending_detail_conv_layers = kwargs.pop("detail_conv_layers", [16, 19, 22, 25, 27])
+        self.detail_t_max = float(kwargs.pop("detail_t_max", 650.0))
+        self.detail_t_power = float(kwargs.pop("detail_t_power", 1.5))
         kwargs.setdefault("model_max_length", 300)
         kwargs.setdefault("pred_sigma", False)
         kwargs.setdefault("learn_sigma", False)
@@ -48,6 +55,13 @@ class PixArtSigmaSR(PixArtMS):
 
         self.depth = len(self.blocks)
         self.hidden_size = self.x_embedder.proj.out_channels
+        if pending_lr_evolve_layers is None:
+            pending_lr_evolve_layers = list(range(self.depth))
+        self.lr_evolve_layers = sorted([int(i) for i in pending_lr_evolve_layers])
+        self.lr_memory_layers = sorted([int(i) for i in pending_lr_memory_layers])
+        self.detail_evolve_layers = sorted([int(i) for i in pending_detail_evolve_layers])
+        self.detail_layers = sorted([int(i) for i in pending_detail_layers])
+        self.detail_conv_layers = sorted([int(i) for i in pending_detail_conv_layers])
         self.force_null_caption = bool(force_null_caption)
         self.aug_embedder = TimestepEmbedder(self.hidden_size)
 
@@ -65,21 +79,54 @@ class PixArtSigmaSR(PixArtMS):
         self.sem_ip_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         nn.init.normal_(self.sem_ip_proj.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.sem_ip_proj.bias)
+        self.detail_ip_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6)
+        self.detail_ip_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        nn.init.normal_(self.detail_ip_proj.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.detail_ip_proj.bias)
+        self.cond_pos_scale = nn.Parameter(torch.tensor(0.05))
+        self.detail_pos_scale = nn.Parameter(torch.tensor(0.05))
 
         self._last_sft_stats = None
         self._last_image_stats = None
 
-    def enable_sr_conditioning_layers(self, pixel_layers, lr_conv_layers, semantic_layers, init_gate: float = -4.0):
+    def enable_sr_conditioning_layers(
+        self,
+        pixel_layers,
+        lr_conv_layers,
+        semantic_layers=None,
+        lr_evolve_layers=None,
+        lr_memory_layers=None,
+        detail_evolve_layers=None,
+        detail_layers=None,
+        detail_conv_layers=None,
+        init_gate: float = -4.0,
+    ):
+        semantic_layers = [] if semantic_layers is None else semantic_layers
         pset = {int(i) for i in pixel_layers}
         cset = {int(i) for i in lr_conv_layers}
         sset = {int(i) for i in semantic_layers}
+        leset = {int(i) for i in (list(range(len(self.blocks))) if lr_evolve_layers is None else lr_evolve_layers)}
+        lmset = {int(i) for i in ([] if lr_memory_layers is None else lr_memory_layers)}
+        deset = {int(i) for i in ([] if detail_evolve_layers is None else detail_evolve_layers)}
+        dlset = {int(i) for i in ([] if detail_layers is None else detail_layers)}
+        dcset = {int(i) for i in ([] if detail_conv_layers is None else detail_conv_layers)}
         self.pixel_layers = sorted(list(pset))
         self.lr_conv_layers = sorted(list(cset))
         self.semantic_layers = sorted(list(sset))
+        self.lr_evolve_layers = sorted(list(leset))
+        self.lr_memory_layers = sorted(list(lmset))
+        self.detail_evolve_layers = sorted(list(deset))
+        self.detail_layers = sorted(list(dlset))
+        self.detail_conv_layers = sorted(list(dcset))
         self.anchor_layers = list(self.pixel_layers)
         for i, block in enumerate(self.blocks):
             block.is_pixel_layer = i in pset
             block.is_lr_conv_layer = i in cset
+            block.is_lr_evolve_layer = i in leset
+            block.is_lr_memory_layer = i in lmset
+            block.is_detail_evolve_layer = i in deset
+            block.is_detail_layer = i in dlset
+            block.is_detail_conv_layer = i in dcset
             block.is_semantic_layer = i in sset
             nn.init.constant_(block.lr_ip_gate, float(init_gate))
             if hasattr(block, "lr_stream_gate"):
@@ -90,6 +137,12 @@ class PixArtSigmaSR(PixArtMS):
                 nn.init.constant_(block.lr_cross_conv_gate, float(init_gate))
             if hasattr(block, "semantic_gate"):
                 nn.init.constant_(block.semantic_gate, float(init_gate))
+            if hasattr(block, "detail_ip_gate"):
+                nn.init.constant_(block.detail_ip_gate, float(init_gate) - 1.0)
+            if hasattr(block, "detail_stream_gate"):
+                nn.init.constant_(block.detail_stream_gate, float(init_gate) - 1.0)
+            if hasattr(block, "detail_cross_conv_gate"):
+                nn.init.constant_(block.detail_cross_conv_gate, float(init_gate) - 1.0)
             if (i in sset) and (not isinstance(block.cross_attn, DecoupledImageTextCrossAttention)):
                 block.cross_attn = DecoupledImageTextCrossAttention.from_text_cross_attn(block.cross_attn)
             if (i in sset) and isinstance(block.cross_attn, DecoupledImageTextCrossAttention):
@@ -108,6 +161,12 @@ class PixArtSigmaSR(PixArtMS):
                     )
         nn.init.constant_(self.local_entry_gate, float(init_gate))
 
+    def _make_detail_scale(self, timestep: torch.Tensor, dtype, device):
+        t = timestep.detach().float().to(device)
+        s = (1.0 - t / max(1.0, float(self.detail_t_max))).clamp(0.0, 1.0)
+        s = s.pow(float(self.detail_t_power))
+        return s.to(dtype=dtype)
+
     def forward(self, x, timestep, y, mask=None, data_info=None, adapter_cond=None, force_drop_ids=None, **kwargs):
         aug_level = kwargs.pop("aug_level", None)
         bs = x.shape[0]
@@ -123,12 +182,16 @@ class PixArtSigmaSR(PixArtMS):
         x = self.x_embedder(x) + pos_embed
 
         ip_tokens = None
+        detail_tokens = None
         sem_tokens = None
         local_entry_tokens = None
         if isinstance(adapter_cond, dict):
-            ip_tokens = adapter_cond.get("ip_tokens", None)
+            ip_tokens = adapter_cond.get("struct_tokens", None)
+            if ip_tokens is None:
+                ip_tokens = adapter_cond.get("ip_tokens", None)
             if ip_tokens is None:
                 ip_tokens = adapter_cond.get("cond_tokens", None)
+            detail_tokens = adapter_cond.get("detail_tokens", None)
             sem_tokens = adapter_cond.get("sem_tokens", None)
 
             local_entry_tokens = adapter_cond.get("local_entry_tokens", None)
@@ -140,13 +203,25 @@ class PixArtSigmaSR(PixArtMS):
         lr_ip_tokens = None
         lr_stream_tokens = None
         lr_base_tokens = None
+        detail_ip_tokens = None
+        detail_stream_tokens = None
         sem_ip_tokens = None
         if ip_tokens is not None:
             lr_ip_tokens = self.lr_ip_proj(self.lr_ip_norm(ip_tokens.to(dtype=x.dtype)))
             lr_stream_tokens = lr_ip_tokens
             lr_base_tokens = lr_ip_tokens
+        if detail_tokens is not None:
+            detail_ip_tokens = self.detail_ip_proj(self.detail_ip_norm(detail_tokens.to(dtype=x.dtype)))
+            detail_stream_tokens = detail_ip_tokens
         if sem_tokens is not None:
             sem_ip_tokens = self.sem_ip_proj(self.sem_ip_norm(sem_tokens.to(dtype=x.dtype)))
+        if (lr_ip_tokens is not None) and (lr_ip_tokens.shape[1] == x.shape[1]):
+            lr_ip_tokens = lr_ip_tokens + self.cond_pos_scale.to(dtype=x.dtype).view(1, 1, 1) * pos_embed.to(dtype=x.dtype)
+            lr_base_tokens = lr_ip_tokens
+            lr_stream_tokens = lr_ip_tokens
+        if (detail_ip_tokens is not None) and (detail_ip_tokens.shape[1] == x.shape[1]):
+            detail_ip_tokens = detail_ip_tokens + self.detail_pos_scale.to(dtype=x.dtype).view(1, 1, 1) * pos_embed.to(dtype=x.dtype)
+            detail_stream_tokens = detail_ip_tokens
 
         if local_entry_tokens is not None:
             if local_entry_tokens.shape[1] != x.shape[1]:
@@ -180,7 +255,9 @@ class PixArtSigmaSR(PixArtMS):
             y = y.squeeze(1).view(1, -1, x.shape[-1])
 
         ip_gate_vals = []
+        detail_scale = self._make_detail_scale(timestep, dtype=x.dtype, device=x.device)
         lr_ip_stds, lr_stream_stds, lr_conv_stds, sem_gate_vals, sem_img_stds, lr_memory_gates = [], [], [], [], [], []
+        detail_attn_stds, detail_stream_stds, detail_conv_stds, detail_gate_vals = [], [], [], []
         for block in self.blocks:
             x_out = auto_grad_checkpoint(
                 block,
@@ -195,13 +272,21 @@ class PixArtSigmaSR(PixArtMS):
                 sem_tokens=sem_ip_tokens,
                 sem_scale=None,
                 lr_ip_scale=None,
+                detail_ip_tokens=detail_ip_tokens,
+                detail_stream_tokens=detail_stream_tokens,
+                detail_scale=detail_scale,
                 return_lr_stream=True,
                 base_size=self.base_size,
                 pe_interpolation=self.pe_interpolation,
                 **kwargs,
             )
             if isinstance(x_out, tuple):
-                x, lr_stream_tokens = x_out
+                if len(x_out) == 3:
+                    x, lr_stream_tokens, detail_stream_tokens = x_out
+                elif len(x_out) == 2:
+                    x, lr_stream_tokens = x_out
+                else:
+                    raise RuntimeError(f"Unexpected block return tuple length: {len(x_out)}")
             else:
                 x = x_out
             ip_gate_vals.append(float(torch.sigmoid(block.lr_ip_gate.detach()).item()))
@@ -215,6 +300,13 @@ class PixArtSigmaSR(PixArtMS):
             if getattr(block, "is_semantic_layer", False):
                 sem_gate_vals.append(float(bstats.get("semantic_gate", 0.0)))
                 sem_img_stds.append(float(bstats.get("semantic_img_delta_std", 0.0)))
+            if getattr(block, "is_detail_layer", False):
+                detail_attn_stds.append(float(bstats.get("detail_delta_std", 0.0)))
+                detail_gate_vals.append(float(bstats.get("detail_ip_gate", 0.0)))
+            if getattr(block, "is_detail_evolve_layer", False):
+                detail_stream_stds.append(float(bstats.get("detail_stream_delta_std", 0.0)))
+            if getattr(block, "is_detail_conv_layer", False):
+                detail_conv_stds.append(float(bstats.get("detail_conv_delta_std", 0.0)))
 
         self._last_sft_stats = {
             "local_entry_gate": float(torch.sigmoid(self.local_entry_gate.detach()).item()),
@@ -232,6 +324,12 @@ class PixArtSigmaSR(PixArtMS):
             "semantic_img_delta_std_mean": float(sum(sem_img_stds) / max(1, len(sem_img_stds))),
             "semantic_img_delta_std_max": float(max(sem_img_stds)) if len(sem_img_stds) > 0 else 0.0,
             "lr_memory_gate_mean": float(sum(lr_memory_gates) / max(1, len(lr_memory_gates))),
+            "detail_delta_std_mean": float(sum(detail_attn_stds) / max(1, len(detail_attn_stds))),
+            "detail_delta_std_max": float(max(detail_attn_stds)) if len(detail_attn_stds) > 0 else 0.0,
+            "detail_stream_delta_std_mean": float(sum(detail_stream_stds) / max(1, len(detail_stream_stds))),
+            "detail_conv_delta_std_mean": float(sum(detail_conv_stds) / max(1, len(detail_conv_stds))),
+            "detail_gate_mean": float(sum(detail_gate_vals) / max(1, len(detail_gate_vals))) if len(detail_gate_vals) > 0 else 0.0,
+            "detail_scale_mean": float(detail_scale.detach().float().mean().item()),
         }
         self._last_image_cond_stats = self._last_image_stats
 
