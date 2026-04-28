@@ -640,6 +640,10 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
                 raise KeyError("adapter output missing ip_tokens/cond_tokens")
             if "local_entry_tokens" not in cond and "cond_map" not in cond:
                 raise KeyError("adapter output missing local_entry_tokens/cond_map")
+            if "detail_tokens" not in cond:
+                raise KeyError("adapter output missing detail_tokens")
+            if "detail_latent_residual" not in cond:
+                raise KeyError("adapter output missing detail_latent_residual")
             # conditional prompt source = adaptive cache (if enabled); unconditional prompt source = null prompt.
             y_cond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_cond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)

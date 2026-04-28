@@ -936,9 +936,9 @@ def get_config_snapshot():
         "lr_latent_noise_std": INIT_NOISE_STD,
         "loss_weights_mode": "fixed_v_latent_l1_lr_cons_gw",
         "adapter_type": "SRConvNetLSAAdapterV12",
-        "control_type": "dualcondsr_pixel+semantic+tala",
+        "control_type": "evolved_lr_stream+supervised_detail_stream",
         "adapter_backbone": "V12_with_official_SMFANet_FMB",
-        "adapter_token_head": "structure-only cond_map head",
+        "adapter_token_head": "struct_tokens+local_entry+detail_tokens+detail_latent_residual",
         "internal_control_type": "disabled",
         "internal_control_layers": [],
         "semantic_prompt_branch": ("enabled" if USE_SEMANTIC_BRANCH else "disabled"),
@@ -964,7 +964,8 @@ def get_config_snapshot():
         "lpips_late_weight": float(LPIPS_LATE_WEIGHT),
         "use_legacy_patch_lpips": bool(USE_LEGACY_PATCH_LPIPS),
         "semantic_fusion": ("parallel_decoupled" if USE_SEMANTIC_BRANCH else "disabled"),
-        "lr_control_role": "structure_only",
+        "lr_control_role": "structure_evolution",
+        "detail_control_role": "latent_residual_supervised_late_control",
         "anchor_layers": list(ANCHOR_LAYERS),
         "tala_lite": False,
         "control_integration": "disabled",
@@ -978,6 +979,9 @@ def get_config_snapshot():
         "gw_end": GW_WEIGHT_END,
         "ckpt_select_mode": CKPT_SELECT_MODE,
         "ckpt_select_psnr_gate": CKPT_SELECT_PSNR_GATE,
+        "use_lq_match_train": bool(USE_LQ_MATCH_TRAIN),
+        "lq_match_prob": float(LQ_MATCH_PROB),
+        "lq_match_t_max": int(LQ_MATCH_T_MAX),
     }
 
 
@@ -2222,6 +2226,13 @@ def save_last_resume_only(
             "anchor_layers": sorted(list(getattr(pixart, "anchor_layers", ANCHOR_LAYERS))),
             "pixel_layers": list(PIXEL_LAYERS),
             "lr_conv_layers": list(LR_CONV_LAYERS),
+            "lr_evolve_layers": list(LR_EVOLVE_LAYERS),
+            "lr_memory_layers": list(LR_MEMORY_LAYERS),
+            "detail_evolve_layers": list(DETAIL_EVOLVE_LAYERS),
+            "detail_layers": list(DETAIL_LAYERS),
+            "detail_conv_layers": list(DETAIL_CONV_LAYERS),
+            "detail_t_max": float(DETAIL_T_MAX),
+            "detail_t_power": float(DETAIL_T_POWER),
             "semantic_layers": list(SEMANTIC_LAYERS),
             "use_semantic_branch": bool(USE_SEMANTIC_BRANCH),
             "semantic_encoder_name_or_path": SEMANTIC_ENCODER_NAME_OR_PATH,
@@ -2237,6 +2248,7 @@ def save_last_resume_only(
             "semantic_lora_rank": int(LORA_RANK),
             "pixel_lora_alpha": float(LORA_ALPHA),
             "semantic_lora_alpha": float(LORA_ALPHA),
+            "semantic_lora_role": "detail_lora",
             "ckpt_select_mode": str(CKPT_SELECT_MODE),
             "ckpt_select_psnr_gate": float(CKPT_SELECT_PSNR_GATE),
             "gate_passed_when_saved": False,
@@ -2312,11 +2324,13 @@ def init_from_ckpt_weights_only(pixart, adapter, sem_adapter, ckpt_path: str):
         except Exception as e:
             print(f"⚠️ Adapter bootstrap load skipped due to mismatch: {e}")
     sem_adapter_sd = ckpt.get("sem_adapter", None)
-    if isinstance(sem_adapter_sd, dict):
+    if sem_adapter is not None and isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
         missing, unexpected, skipped = load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="init-sem-adapter")
         print(f"✅ sem_adapter bootstrap load: missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
     elif USE_SEMANTIC_BRANCH:
         raise RuntimeError("Bootstrap checkpoint missing sem_adapter while USE_SEMANTIC_BRANCH=True")
+    else:
+        print("ℹ️ sem_adapter bootstrap skipped: semantic branch disabled.")
     return True
 
 
@@ -2345,11 +2359,13 @@ def resume(pixart, adapter, sem_adapter, optimizer, dl_gen, ema=None, ema_named_
     except RuntimeError as e:
         raise RuntimeError(f"Adapter strict load failed during resume: {e}") from e
     sem_adapter_sd = ckpt.get("sem_adapter", None)
-    if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
+    if sem_adapter is not None and isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
         missing, unexpected, skipped = load_state_dict_shape_compatible(sem_adapter, sem_adapter_sd, context="resume-sem-adapter")
         print(f"✅ sem_adapter resume load: missing={len(missing)} unexpected={len(unexpected)} skipped={len(skipped)}")
     elif USE_SEMANTIC_BRANCH:
         raise RuntimeError("Checkpoint missing sem_adapter while USE_SEMANTIC_BRANCH=True")
+    else:
+        print("ℹ️ sem_adapter resume skipped: semantic branch disabled.")
     _load_pixart_trainable_subset_compatible(pixart, saved_trainable, context="resume")
     try:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -2404,12 +2420,11 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
     tag = str(val_tag).lower()
     print(f"🔎 Validating Epoch {epoch+1} [{tag}]...")
     print(
-        f"[VAL-CONFIG] use_tala_train={int(USE_TALA_TRAIN)} "
-        f"tala_active_mode={TALA_TRAIN_ACTIVE_MODE} "
-        f"tala_active_t_min={int(TALA_TRAIN_ACTIVE_T_MIN)} "
-        f"tala_max_ratio={float(TALA_TRAIN_MAX_RATIO):.3f} "
-        f"tala_train_blend_pow={float(TALA_TRAIN_BLEND_POW):.3f} "
-        f"tala_train_detach_lr_latent={bool(TALA_TRAIN_DETACH_LR_LATENT)}"
+        f"[VAL-CONFIG] use_lq_match_train={int(USE_LQ_MATCH_TRAIN)} "
+        f"lq_match_prob={float(LQ_MATCH_PROB):.3f} "
+        f"lq_match_t_max={int(LQ_MATCH_T_MAX)} "
+        f"use_lq_init={int(USE_LQ_INIT)} "
+        f"lq_init_strength={float(LQ_INIT_STRENGTH):.3f}"
     )
     pixart.eval(); adapter.eval()
     if sem_adapter is not None:
@@ -3048,8 +3063,8 @@ def main():
                 if run_module_monitor and (not adapter_dropped):
                     with torch.no_grad():
                         cond_no_local = zero_cond_keys(cond_in, ["local_entry_tokens", "cond_map"])
-                        cond_no_lr = zero_cond_keys(cond_in, ["ip_tokens", "cond_tokens"])
-                        cond_no_sem = zero_cond_keys(cond_in, ["sem_tokens"])
+                        cond_no_lr = zero_cond_keys(cond_in, ["struct_tokens", "ip_tokens", "cond_tokens"])
+                        cond_no_detail = zero_cond_keys(cond_in, ["detail_tokens", "detail_latent_residual"])
                         cond_no_all = mask_adapter_cond(cond_in, torch.zeros((zt_in.shape[0],), device=DEVICE))
                         out_no_local = pixart(
                             x=zt_in.detach(),
@@ -3073,14 +3088,14 @@ def main():
                             force_drop_ids=drop_cond,
                             sft_strength=sft_strength,
                         ).float()
-                        out_no_sem = pixart(
+                        out_no_detail = pixart(
                             x=zt_in.detach(),
                             timestep=t,
                             y=y_cond,
                             aug_level=aug_level_emb,
                             mask=y_mask,
                             data_info=d_info,
-                            adapter_cond=cond_no_sem,
+                            adapter_cond=cond_no_detail,
                             force_drop_ids=drop_cond,
                             sft_strength=sft_strength,
                         ).float()
@@ -3098,7 +3113,7 @@ def main():
                     full_out = model_pred.detach()
                     effect_local = float((full_out - out_no_local).abs().mean().item())
                     effect_lr_tokens = float((full_out - out_no_lr).abs().mean().item())
-                    effect_semantic = float((full_out - out_no_sem).abs().mean().item())
+                    effect_detail = float((full_out - out_no_detail).abs().mean().item())
                     effect_all_adapter = float((full_out - out_no_all).abs().mean().item())
                     model_pred_std = float(full_out.float().std().item())
                     denom = max(1e-8, model_pred_std)
@@ -3106,12 +3121,12 @@ def main():
                         {
                             "effect_local": effect_local,
                             "effect_lr_tokens": effect_lr_tokens,
-                            "effect_semantic": effect_semantic,
+                            "effect_detail": effect_detail,
                             "effect_all_adapter": effect_all_adapter,
                             "model_pred_std": model_pred_std,
                             "effect_local_ratio": effect_local / denom,
                             "effect_lr_tokens_ratio": effect_lr_tokens / denom,
-                            "effect_semantic_ratio": effect_semantic / denom,
+                            "effect_detail_ratio": effect_detail / denom,
                             "effect_all_adapter_ratio": effect_all_adapter / denom,
                         }
                     )
@@ -3288,7 +3303,7 @@ def main():
                 adapter_delta_same_text = float(guard_stats.get("adapter_delta_same_text", float("nan")))
                 effect_local_ratio = float(guard_stats.get("effect_local_ratio", float("nan")))
                 effect_lr_tokens_ratio = float(guard_stats.get("effect_lr_tokens_ratio", float("nan")))
-                effect_semantic_ratio = float(guard_stats.get("effect_semantic_ratio", float("nan")))
+                effect_detail_ratio = float(guard_stats.get("effect_detail_ratio", float("nan")))
                 effect_all_adapter_ratio = float(guard_stats.get("effect_all_adapter_ratio", float("nan")))
                 sem_stats = getattr(sem_adapter, "_last_sem_adapter_stats", {}) or {}
                 sem_tokens_std = float(sem_stats.get("sem_tokens_postproj_std", 0.0))
@@ -3356,7 +3371,7 @@ def main():
                     'sem_scale': f"{sem_out_scale:.3f}",
                     'eff_loc_r': f"{effect_local_ratio:.3f}" if math.isfinite(effect_local_ratio) else "nan",
                     'eff_lr_r': f"{effect_lr_tokens_ratio:.3f}" if math.isfinite(effect_lr_tokens_ratio) else "nan",
-                    'eff_sem_r': f"{effect_semantic_ratio:.3f}" if math.isfinite(effect_semantic_ratio) else "nan",
+                    'eff_det_r': f"{effect_detail_ratio:.3f}" if math.isfinite(effect_detail_ratio) else "nan",
                     'eff_all_r': f"{effect_all_adapter_ratio:.3f}" if math.isfinite(effect_all_adapter_ratio) else "nan",
                     'ad_drop': f"{int(adapter_dropped)}",
                     'cpu_rss_gb': f"{cpu_rss_gb:.3f}" if math.isfinite(cpu_rss_gb) else "nan",
@@ -3395,12 +3410,12 @@ def main():
                     "sem_out_scale": sem_out_scale,
                     "effect_local": float(guard_stats.get("effect_local", float("nan"))),
                     "effect_lr_tokens": float(guard_stats.get("effect_lr_tokens", float("nan"))),
-                    "effect_semantic": float(guard_stats.get("effect_semantic", float("nan"))),
+                    "effect_detail": float(guard_stats.get("effect_detail", float("nan"))),
                     "effect_all_adapter": float(guard_stats.get("effect_all_adapter", float("nan"))),
                     "model_pred_std": float(guard_stats.get("model_pred_std", float("nan"))),
                     "effect_local_ratio": effect_local_ratio,
                     "effect_lr_tokens_ratio": effect_lr_tokens_ratio,
-                    "effect_semantic_ratio": effect_semantic_ratio,
+                    "effect_detail_ratio": effect_detail_ratio,
                     "effect_all_adapter_ratio": effect_all_adapter_ratio,
                     "adapter_dropped": int(adapter_dropped),
                     "run_guard_forward": int(run_guard_forward),

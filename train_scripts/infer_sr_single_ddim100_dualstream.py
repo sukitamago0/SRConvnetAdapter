@@ -196,6 +196,10 @@ def run(args):
             raise KeyError("adapter output missing ip_tokens/cond_tokens")
         if "local_entry_tokens" not in cond and "cond_map" not in cond:
             raise KeyError("adapter output missing local_entry_tokens/cond_map")
+        if "detail_tokens" not in cond:
+            raise KeyError("adapter output missing detail_tokens")
+        if "detail_latent_residual" not in cond:
+            raise KeyError("adapter output missing detail_latent_residual")
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
             drop_uncond = torch.ones(latents.shape[0], device=device, dtype=torch.long)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
