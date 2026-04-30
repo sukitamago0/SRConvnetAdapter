@@ -32,6 +32,7 @@ import torch.nn.functional as F
 import io
 import hashlib
 import shutil
+import json
 from collections import OrderedDict
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -41,6 +42,10 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 import lpips
+try:
+    import piq
+except Exception:
+    piq = None
 from diffusers import AutoencoderKL, DDIMScheduler
 from torchmetrics.functional import peak_signal_noise_ratio as psnr
 from torchmetrics.functional import structural_similarity_index_measure as ssim
@@ -161,7 +166,7 @@ USE_SEMANTIC_BRANCH = False
 ALLOW_SEM_ADAPTER_NONSTRICT_RESUME = False
 USE_FIXED_HARD_PROMPT = False
 USE_ADAPTIVE_TEXT_PROMPT = False
-STRICT_ADAPTIVE_PROMPT = False
+STRICT_ADAPTIVE_PROMPT = True
 ADAPTIVE_PROMPT_CACHE_ROOT = os.getenv("ADAPTIVE_PROMPT_CACHE_ROOT", "")
 TRAIN_PIXART_X_EMBEDDER = False  # S2D: keep backbone patch embedder frozen for clean attribution
 SPARSE_INJECT_RATIO = 1.0
@@ -182,6 +187,11 @@ LR_MEMORY_LAYERS = [0, 1, 2, 3, 4, 5, 6, 7, 10, 13]
 DETAIL_EVOLVE_LAYERS = [8, 10, 13, 16, 19, 22, 25, 27]
 DETAIL_LAYERS = [13, 16, 19, 22, 25, 27]
 DETAIL_CONV_LAYERS = [16, 19, 22, 25, 27]
+DISABLE_DETAIL_BRANCH = os.getenv("DISABLE_DETAIL_BRANCH", "0") == "1"
+if DISABLE_DETAIL_BRANCH:
+    DETAIL_EVOLVE_LAYERS = []
+    DETAIL_LAYERS = []
+    DETAIL_CONV_LAYERS = []
 DETAIL_T_MAX = 650.0
 DETAIL_T_POWER = 1.5
 
@@ -201,10 +211,10 @@ CFG_SCALE = 1.0
 
 # [V8 Change] Default to LQ-Init for validation
 USE_LQ_INIT = True 
-LQ_INIT_STRENGTH = 0.3
+LQ_INIT_STRENGTH = float(os.getenv("LQ_INIT_STRENGTH", "0.3"))
 USE_TALA_TRAIN = True
 USE_LQ_MATCH_TRAIN = True
-LQ_MATCH_PROB = 0.35
+LQ_MATCH_PROB = float(os.getenv("LQ_MATCH_PROB", "0.35"))
 LQ_MATCH_T_MAX = 650
 TALA_TRAIN_ACTIVE_MODE = "high_t"
 TALA_TRAIN_ACTIVE_T_MIN = 600
@@ -254,6 +264,9 @@ LR_CONS_WEIGHT_START = 0.01
 LR_CONS_WEIGHT_END = 0.005
 DETAIL_LATENT_WEIGHT = 0.05
 DETAIL_LATENT_HF_WEIGHT = 0.03
+if DISABLE_DETAIL_BRANCH:
+    DETAIL_LATENT_WEIGHT = 0.0
+    DETAIL_LATENT_HF_WEIGHT = 0.0
 RGB_HF_WEIGHT = 0.03
 
 GW_WEIGHT_START = 0.0
@@ -263,6 +276,8 @@ GW_WEIGHT_END = 0.01
 CKPT_SELECT_MODE = "psnr_gate_then_lpips"
 CKPT_SELECT_PSNR_GATE = 25.5
 BEST_PSNR_PATH = os.path.join(CKPT_DIR, "best_psnr.pth")
+BEST_LPIPS_GATE24_5_PATH = os.path.join(CKPT_DIR, "best_lpips_gate24_5.pth")
+BEST_DISTS_GATE24_5_PATH = os.path.join(CKPT_DIR, "best_dists_gate24_5.pth")
 START_FROM_BASE_ONLY = True
 
 USE_LR_CONSISTENCY = True 
@@ -981,8 +996,32 @@ def get_config_snapshot():
         "ckpt_select_psnr_gate": CKPT_SELECT_PSNR_GATE,
         "use_lq_match_train": bool(USE_LQ_MATCH_TRAIN),
         "lq_match_prob": float(LQ_MATCH_PROB),
+        "disable_detail_branch": bool(DISABLE_DETAIL_BRANCH),
         "lq_match_t_max": int(LQ_MATCH_T_MAX),
     }
+
+def write_experiment_contract():
+    contract = {
+        "prompt_enabled": bool(USE_ADAPTIVE_TEXT_PROMPT),
+        "detail_branch_enabled": bool(not DISABLE_DETAIL_BRANCH),
+        "lq_init_strength": float(LQ_INIT_STRENGTH),
+        "lq_match_prob": float(LQ_MATCH_PROB),
+        "checkpoint_selection": {
+            "mode": str(CKPT_SELECT_MODE),
+            "psnr_gate": float(CKPT_SELECT_PSNR_GATE),
+            "best_psnr_path": "best_psnr.pth",
+            "best_lpips_gate24_5_path": "best_lpips_gate24_5.pth",
+            "best_dists_gate24_5_path": "best_dists_gate24_5.pth",
+        },
+        "loss_weights": {
+            "detail_latent_weight": float(DETAIL_LATENT_WEIGHT),
+            "detail_latent_hf_weight": float(DETAIL_LATENT_HF_WEIGHT),
+            "rgb_hf_weight": float(RGB_HF_WEIGHT),
+            "lpips_late_weight": float(LPIPS_LATE_WEIGHT),
+        },
+    }
+    with open(os.path.join(CKPT_DIR, "experiment_contract.json"), "w", encoding="utf-8") as f:
+        json.dump(contract, f, indent=2, ensure_ascii=False)
 
 
 def validate_schedule_alignment():
@@ -1875,7 +1914,8 @@ def save_smart(
 ):
     global BASE_PIXART_SHA256
     eval_source = str(eval_source).lower()
-    psnr_v, ssim_v, lpips_v = metrics
+    psnr_v, ssim_v, lpips_v = metrics[:3]
+    dists_v = float(metrics[3]) if len(metrics) > 3 else float("inf")
     rank = should_keep_ckpt(psnr_v, lpips_v)
     if not isinstance(rank, tuple) or len(rank) < 2:
         raise RuntimeError(f"should_keep_ckpt must return a tuple(rank>=2), got {rank}")
@@ -2118,14 +2158,34 @@ def save_smart(
     else:
         best_psnr_step = int(prev_aux.get("best_psnr_step", global_step if best_psnr > -float("inf") else -1))
 
+    best_lpips_gate = float(prev_aux.get("best_lpips_gate24_5", float("inf")))
+    should_save_lpips_gate = math.isfinite(psnr_v) and psnr_v >= 24.5 and math.isfinite(lpips_v) and lpips_v < best_lpips_gate
+    if should_save_lpips_gate:
+        best_lpips_gate = float(lpips_v)
+
+    best_dists_gate = float(prev_aux.get("best_dists_gate24_5", float("inf")))
+    should_save_dists_gate = math.isfinite(psnr_v) and psnr_v >= 24.5 and math.isfinite(dists_v) and dists_v < best_dists_gate
+    if should_save_dists_gate:
+        best_dists_gate = float(dists_v)
+
     new_aux_meta = {
         "best_psnr": float(best_psnr),
         "best_psnr_step": int(best_psnr_step),
+        "best_lpips_gate24_5": float(best_lpips_gate),
+        "best_dists_gate24_5": float(best_dists_gate),
     }
     next_best_records = [{
         "global_best_record": new_global_best,
         "best_aux_meta": new_aux_meta,
     }]
+    if should_save_lpips_gate:
+        state_lpips = _build_eval_state_snapshot(checkpoint_role="best_lpips_gate24_5")
+        state_lpips["best_records"] = next_best_records
+        atomic_torch_save(state_lpips, BEST_LPIPS_GATE24_5_PATH)
+    if should_save_dists_gate:
+        state_dists = _build_eval_state_snapshot(checkpoint_role="best_dists_gate24_5")
+        state_dists["best_records"] = next_best_records
+        atomic_torch_save(state_dists, BEST_DISTS_GATE24_5_PATH)
 
     # Always save full training-state checkpoint for resume
     state_last = _build_resume_state_snapshot()
@@ -2148,12 +2208,12 @@ def save_smart(
         else:
             print(f"❌ Failed to save best proxy checkpoint: {msg_train}")
 
-    # Disabled to reduce CPU memory pressure during checkpoint save.
-    # if math.isfinite(psnr_v) and psnr_v >= new_aux_meta["best_psnr"]:
-    #     state_psnr = _build_eval_state_snapshot(checkpoint_role="best_psnr")
-    #     state_psnr["best_records"] = next_best_records
-    #     atomic_torch_save(state_psnr, BEST_PSNR_PATH)
-    print("[CKPT-SAVE] last=resume_full best=eval_light best_psnr=disabled")
+    if math.isfinite(psnr_v) and psnr_v >= new_aux_meta["best_psnr"]:
+        state_psnr = _build_eval_state_snapshot(checkpoint_role="best_psnr")
+        state_psnr["best_records"] = next_best_records
+        atomic_torch_save(state_psnr, BEST_PSNR_PATH)
+    write_experiment_contract()
+    print("[CKPT-SAVE] last=resume_full best=eval_light best_psnr=enabled + lpips/dists gates")
 
     # remove legacy rolling-best artifacts from older runs to keep CKPT_DIR clean
     if best_saved:
@@ -2259,6 +2319,7 @@ def save_last_resume_only(
         print(f"💾 Saved last checkpoint to {LAST_CKPT_PATH} [{msg_last}] (resume-only)")
     else:
         print(f"❌ Failed to save last.pth (resume-only): {msg_last}")
+    write_experiment_contract()
 
 
 def load_state_dict_shape_compatible(model: nn.Module, state_dict: dict, context: str = "load"):
@@ -2449,7 +2510,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
     steps_list = [FAST_VAL_STEPS] if FAST_DEV_RUN else VAL_STEPS_LIST
     for steps in steps_list:
         scheduler.set_timesteps(steps, device=DEVICE)
-        psnrs, ssims, lpipss = [], [], []; vis_done = False
+        psnrs, ssims, lpipss, dists_scores = [], [], [], []; vis_done = False
         flat_psnrs, flat_ssims, flat_lpipss = [], [], []
         edge_psnrs, edge_ssims, edge_lpipss = [], [], []
         corner_psnrs, corner_ssims, corner_lpipss = [], [], []
@@ -2461,6 +2522,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         ip_pre_stds, ip_post_stds, ip_out_scales = [], [], []
         
         prompt_hit_rates, prompt_tok_counts, prompt_nonpad_ratios = [], [], []
+        detail_gate_means, detail_delta_stds, detail_stream_delta_stds, detail_conv_delta_stds = [], [], [], []
         prompt_cache_mem = OrderedDict()
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
@@ -2502,12 +2564,11 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                         prompt_hit_rates.append(hit_rate)
                         prompt_tok_counts.append(tok_cnt)
                         prompt_nonpad_ratios.append(nonpad_ratio)
-                        if not all(p is not None for p in prompt_packs) and STRICT_ADAPTIVE_PROMPT:
+                        if not all(p is not None for p in prompt_packs):
                             missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
                             raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
-                        merged_packs = [p if p is not None else null_pack for p in prompt_packs]
-                        y_cond = torch.cat([p["y"] for p in merged_packs], dim=0).to(DEVICE)
-                        y_mask_cond = torch.cat([p["mask"] for p in merged_packs], dim=0).to(DEVICE)
+                        y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(DEVICE)
+                        y_mask_cond = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
                     y_uncond = null_pack["y"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     y_mask_uncond = null_pack["mask"].to(DEVICE).repeat(latents.shape[0], 1, 1, 1)
                     out_uncond = pixart(x=model_in, timestep=t_b, y=y_uncond, aug_level=aug_level, mask=y_mask_uncond, data_info=data_info, adapter_cond=cond_zero, force_drop_ids=drop_uncond, sft_strength=get_sft_strength(epoch + 1))
@@ -2526,6 +2587,10 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                     ip_stats = getattr(pixart, "_last_image_stats", {}) or {}
                     ip_out_stds.append(float(ip_stats.get("lr_ip_attn_delta_std_mean", 0.0)))
                     ip_alphas.append(float(ip_stats.get("semantic_gate_mean", 0.0)))
+                    detail_gate_means.append(float(ip_stats.get("detail_gate_mean", 0.0)))
+                    detail_delta_stds.append(float(ip_stats.get("detail_delta_std_mean", 0.0)))
+                    detail_stream_delta_stds.append(float(ip_stats.get("detail_stream_delta_std_mean", 0.0)))
+                    detail_conv_delta_stds.append(float(ip_stats.get("detail_conv_delta_std_mean", 0.0)))
 
                     
 
@@ -2543,6 +2608,8 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
             pred_cpu = pred.detach().to("cpu", dtype=torch.float32)
             hr_cpu = hr.detach().to("cpu", dtype=torch.float32)
             lpipss.append(lpips_fn_val_cpu(pred_cpu, hr_cpu).mean().item())
+            if piq is not None:
+                dists_scores.append(float(piq.dists(pred_cpu, hr_cpu, data_range=2.0).mean().item()))
             del pred_cpu, hr_cpu
 
             m_flat, m_edge, m_corner = build_component_masks_from_hr(hr)
@@ -2567,7 +2634,8 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                 plt.subplot(2,3,6); plt.imshow(m_corner[0,0].detach().cpu(), cmap='gray'); plt.title("M_corner"); plt.axis("off")
                 plt.savefig(save_path, bbox_inches="tight"); plt.close(); vis_done = True
             if FAST_DEV_RUN and len(psnrs) >= FAST_VAL_BATCHES: break
-        res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)))
+        dists_mean = float(np.mean(dists_scores)) if len(dists_scores) > 0 else float("inf")
+        res = (float(np.mean(psnrs)), float(np.mean(ssims)), float(np.mean(lpipss)), dists_mean)
         results[int(steps)] = res
         cdelta = float(np.mean(cond_deltas)) if len(cond_deltas) > 0 else 0.0
         text_cdelta = float(np.mean(text_cond_deltas)) if len(text_cond_deltas) > 0 else 0.0
@@ -2582,9 +2650,13 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         ip_out_scale = float(np.mean(ip_out_scales)) if len(ip_out_scales) > 0 else 1.0
         ip_out_std = float(np.mean(ip_out_stds)) if len(ip_out_stds) > 0 else 0.0
         ip_alpha = float(np.mean(ip_alphas)) if len(ip_alphas) > 0 else 0.0
+        detail_gate_mean = float(np.mean(detail_gate_means)) if len(detail_gate_means) > 0 else 0.0
+        detail_delta_std_mean = float(np.mean(detail_delta_stds)) if len(detail_delta_stds) > 0 else 0.0
+        detail_stream_delta_std_mean = float(np.mean(detail_stream_delta_stds)) if len(detail_stream_delta_stds) > 0 else 0.0
+        detail_conv_delta_std_mean = float(np.mean(detail_conv_delta_stds)) if len(detail_conv_delta_stds) > 0 else 0.0
         msg = (
-            f"[VAL-PROXY@{steps}][{tag}] Ep{epoch+1}: proxy_psnr={res[0]:.2f} | proxy_ssim={res[1]:.4f} | proxy_lpips={res[2]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | text_cond_delta={text_cdelta:.5f} | prompt_cache_hit_rate={prompt_hit_rate:.3f} | avg_prompt_token_count={avg_prompt_token_count:.2f} | avg_prompt_nonpad_ratio={avg_prompt_nonpad_ratio:.3f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | ip_tok_std={ip_tok_std:.4f} | ip_pre_std={ip_pre_std:.4f} | ip_post_std={ip_post_std:.4f} | ip_out_scale={ip_out_scale:.4f} | ip_out_std={ip_out_std:.4f} | ip_alpha={ip_alpha:.4f} | ip_K={16} | "
+            f"[VAL-PROXY@{steps}][{tag}] Ep{epoch+1}: proxy_psnr={res[0]:.2f} | proxy_ssim={res[1]:.4f} | proxy_lpips={res[2]:.4f} | proxy_dists={res[3]:.4f} | "
+            f"CONDΔ={cdelta:.5f} | text_cond_delta={text_cdelta:.5f} | prompt_cache_hit_rate={prompt_hit_rate:.3f} | avg_prompt_token_count={avg_prompt_token_count:.2f} | avg_prompt_nonpad_ratio={avg_prompt_nonpad_ratio:.3f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | ip_tok_std={ip_tok_std:.4f} | ip_pre_std={ip_pre_std:.4f} | ip_post_std={ip_post_std:.4f} | ip_out_scale={ip_out_scale:.4f} | ip_out_std={ip_out_std:.4f} | ip_alpha={ip_alpha:.4f} | detail_gate_mean={detail_gate_mean:.4f} | detail_delta_std_mean={detail_delta_std_mean:.4f} | detail_stream_delta_std_mean={detail_stream_delta_std_mean:.4f} | detail_conv_delta_std_mean={detail_conv_delta_std_mean:.4f} | ip_K={16} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
@@ -2936,12 +3008,11 @@ def main():
                         prompt_cache_mem,
                         max_cache_items=TRAIN_PROMPT_CACHE_MAX_ITEMS,
                     )
-                    if not all(p is not None for p in prompt_packs) and STRICT_ADAPTIVE_PROMPT:
+                    if not all(p is not None for p in prompt_packs):
                         missing_keys = [str(k) for k, p in zip(sample_keys, prompt_packs) if p is None]
                         raise RuntimeError(f"missing adaptive prompt pack for {missing_keys}")
-                    merged_packs = [p if p is not None else null_pack for p in prompt_packs]
-                    y_cond = torch.cat([p["y"] for p in merged_packs], dim=0).to(DEVICE)
-                    y_mask = torch.cat([p["mask"] for p in merged_packs], dim=0).to(DEVICE)
+                    y_cond = torch.cat([p["y"] for p in prompt_packs], dim=0).to(DEVICE)
+                    y_mask = torch.cat([p["mask"] for p in prompt_packs], dim=0).to(DEVICE)
                 drop_cond = torch.zeros(zt_in.shape[0], device=DEVICE, dtype=torch.long)
                 sft_strength = get_sft_strength(epoch + 1)
                 kwargs = dict(
@@ -3310,6 +3381,7 @@ def main():
                 sem_out_scale = float(sem_stats.get("sem_out_scale", 0.0))
                 detail_gate_mean = float(image_stats.get("detail_gate_mean", 0.0))
                 detail_delta_std_mean = float(image_stats.get("detail_delta_std_mean", 0.0))
+                detail_stream_delta_std_mean = float(image_stats.get("detail_stream_delta_std_mean", 0.0))
                 detail_conv_delta_std_mean = float(image_stats.get("detail_conv_delta_std_mean", 0.0))
                 tala_on = int(USE_TALA_TRAIN)
                 cpu_rss_gb = float(get_rss_gb()) if (step % 100 == 0) else float("nan")
@@ -3350,6 +3422,7 @@ def main():
                     'sem_dstd': f"{semantic_img_delta_std_mean:.4f}",
                     'd_gate': f"{detail_gate_mean:.4f}",
                     'd_dstd': f"{detail_delta_std_mean:.4f}",
+                    'd_sstd': f"{detail_stream_delta_std_mean:.4f}",
                     'd_cstd': f"{detail_conv_delta_std_mean:.4f}",
                     'l_ad': f"{loss_detail_latent.item():.4f}",
                     'l_lhf': f"{loss_latent_hf.item():.4f}",
@@ -3401,6 +3474,7 @@ def main():
                     "semantic_img_delta_std_mean": semantic_img_delta_std_mean,
                     "detail_gate_mean": detail_gate_mean,
                     "detail_delta_std_mean": detail_delta_std_mean,
+                    "detail_stream_delta_std_mean": detail_stream_delta_std_mean,
                     "detail_conv_delta_std_mean": detail_conv_delta_std_mean,
                     "loss_adapter_detail": float(loss_detail_latent.item()),
                     "loss_latent_hf": float(loss_latent_hf.item()),
