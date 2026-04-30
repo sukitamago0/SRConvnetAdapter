@@ -16,7 +16,6 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
-from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
 from diffusion.model.nets.adapter_cond import mask_adapter_cond
 
@@ -84,7 +83,14 @@ def run(args):
         in_channels=4,
         out_channels=4,
         anchor_layers=anchor_layers,
-        semantic_layers=[24, 25, 26, 27],
+        semantic_layers=[],
+        lr_evolve_layers=list(layer_cfg.get("lr_evolve_layers", list(range(28)))),
+        lr_memory_layers=list(layer_cfg.get("lr_memory_layers", [0,1,2,3,4,5,6,7,10,13])),
+        detail_evolve_layers=list(layer_cfg.get("detail_evolve_layers", [8,10,13,16,19,22,25,27])),
+        detail_layers=list(layer_cfg.get("detail_layers", [13,16,19,22,25,27])),
+        detail_conv_layers=list(layer_cfg.get("detail_conv_layers", [16,19,22,25,27])),
+        detail_t_max=float(layer_cfg.get("detail_t_max", 650.0)),
+        detail_t_power=float(layer_cfg.get("detail_t_power", 1.5)),
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -96,31 +102,20 @@ def run(args):
     pixart.enable_sr_conditioning_layers(
         pixel_layers=list(layer_cfg.get("pixel_layers", anchor_layers)),
         lr_conv_layers=list(layer_cfg.get("lr_conv_layers", anchor_layers)),
-        semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [])),
+        lr_evolve_layers=list(layer_cfg.get("lr_evolve_layers", list(range(28)))),
+        lr_memory_layers=list(layer_cfg.get("lr_memory_layers", [0,1,2,3,4,5,6,7,10,13])),
+        detail_evolve_layers=list(layer_cfg.get("detail_evolve_layers", [8,10,13,16,19,22,25,27])),
+        detail_layers=list(layer_cfg.get("detail_layers", [13,16,19,22,25,27])),
+        detail_conv_layers=list(layer_cfg.get("detail_conv_layers", [16,19,22,25,27])),
         init_gate=-4.0,
     )
-    sem0 = int(layer_cfg.get("semantic_layers", [24, 25, 26, 27])[0])
-    sem_std = float(pixart.blocks[sem0].cross_attn.out_proj.weight.detach().float().std().item())
-    print(f"[semantic-enable-check] layer={sem0} out_proj.weight.std={sem_std:.6e}")
-    if sem_std <= 1e-8:
-        raise RuntimeError("semantic layer out_proj.weight.std() is zero after enable; call order is wrong.")
 
     adapter = build_adapter_v12(
         in_channels=3,
         hidden_size=1152,
     ).to(device).float()
-    semantic_encoder_path = (
-        args.semantic_encoder_name_or_path
-        or layer_cfg.get("semantic_encoder_name_or_path")
-        or cfg.get("semantic_encoder_name_or_path")
-        or os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH")
-        or "/workspace/models/openai/clip-vit-large-patch14"
-    )
-    sem_adapter = CLIPSemanticAdapter(
-        encoder_name_or_path=semantic_encoder_path,
-        hidden_size=1152,
-        num_prompt_tokens=16,
-    ).to(device).eval()
+    sem_adapter = None
 
     saved_trainable = ckpt.get("pixart_trainable", {})
 
@@ -141,22 +136,12 @@ def run(args):
 
     _load_pixart_subset_compatible(pixart, saved_trainable, context="infer")
     adapter.load_state_dict(ckpt["adapter"], strict=True)
-    sem_adapter_sd = ckpt.get("sem_adapter", None)
-    if not bool(args.disable_semantic_branch):
-        if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
-            required_sem_keys = ("proj.weight", "proj.bias", "out_scale")
-            missing_sem_keys = [k for k in required_sem_keys if k not in sem_adapter_sd]
-            if missing_sem_keys:
-                raise RuntimeError(f"Checkpoint sem_adapter missing required keys in infer: {missing_sem_keys}")
-            sem_adapter.load_state_dict(sem_adapter_sd, strict=False)
-        else:
-            raise RuntimeError("Checkpoint missing sem_adapter while semantic branch is enabled in infer.")
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
 
     null_pack = torch.load(args.null_t5_embed_path, map_location="cpu")
-    hard_prompt_pack = torch.load(args.hard_prompt_embed_path, map_location="cpu")
+    hard_prompt_pack = torch.load(args.hard_prompt_embed_path, map_location="cpu") if args.hard_prompt_embed_path else null_pack
     data_info = {
         "img_hw": torch.tensor([[512.0, 512.0]], device=device),
         "aspect_ratio": torch.tensor([1.0], device=device),
@@ -164,7 +149,6 @@ def run(args):
 
     pixart.eval()
     adapter.eval()
-    sem_adapter.eval()
 
     scheduler = DDIMScheduler(
         num_train_timesteps=1000,
@@ -208,12 +192,14 @@ def run(args):
         t_b = torch.tensor([t], device=device).expand(latents.shape[0])
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         cond = adapter(adapter_in, t_embed=t_embed.float())
-        if not bool(args.disable_semantic_branch):
-            cond["sem_tokens"] = sem_adapter(((adapter_in.clamp(-1, 1) + 1.0) * 0.5).float())
         if "ip_tokens" not in cond and "cond_tokens" not in cond:
             raise KeyError("adapter output missing ip_tokens/cond_tokens")
         if "local_entry_tokens" not in cond and "cond_map" not in cond:
             raise KeyError("adapter output missing local_entry_tokens/cond_map")
+        if "detail_tokens" not in cond:
+            raise KeyError("adapter output missing detail_tokens")
+        if "detail_latent_residual" not in cond:
+            raise KeyError("adapter output missing detail_latent_residual")
         with torch.autocast(device_type="cuda", dtype=compute_dtype) if device == "cuda" else torch.no_grad():
             drop_uncond = torch.ones(latents.shape[0], device=device, dtype=torch.long)
             drop_cond = torch.zeros(latents.shape[0], device=device, dtype=torch.long)
@@ -282,8 +268,7 @@ def parse_args():
     parser.add_argument("--pixart-path", type=str, required=True)
     parser.add_argument("--vae-path", type=str, required=True)
     parser.add_argument("--null-t5-embed-path", type=str, required=True)
-    parser.add_argument("--hard-prompt-embed-path", type=str, required=True)
-    parser.add_argument("--semantic-encoder-name-or-path", type=str, default=DEFAULT_SEMANTIC_ENCODER)
+    parser.add_argument("--hard-prompt-embed-path", type=str, default="")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--crop-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=3407)
@@ -297,7 +282,6 @@ def parse_args():
     parser.add_argument("--lora-alpha", type=int, default=4)
     parser.add_argument("--lambda-pix", type=float, default=1.0)
     parser.add_argument("--lambda-sem", type=float, default=1.0)
-    parser.add_argument("--disable-semantic-branch", action="store_true")
     parser.add_argument("--input_is_lr_small", type=lambda x: str(x).lower() in ("1","true","yes","y"), default=True)
     return parser.parse_args()
 

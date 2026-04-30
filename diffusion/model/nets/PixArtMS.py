@@ -57,6 +57,11 @@ class PixArtMSBlock(nn.Module):
         self.block_id = int(block_id)
         self.is_pixel_layer = False
         self.is_lr_conv_layer = False
+        self.is_lr_evolve_layer = False
+        self.is_lr_memory_layer = False
+        self.is_detail_evolve_layer = False
+        self.is_detail_layer = False
+        self.is_detail_conv_layer = False
         self.is_semantic_layer = False
         self.hidden_size = hidden_size
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -68,10 +73,16 @@ class PixArtMSBlock(nn.Module):
         self.lr_ip_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
         self.lr_stream_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
         self.lr_cross_conv = TokenCrossStreamConv(hidden_size)
+        self.detail_ip_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.detail_stream_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.detail_cross_conv = TokenCrossStreamConv(hidden_size)
         self.lr_ip_gate = nn.Parameter(torch.full((1,), -4.0))
         self.lr_stream_gate = nn.Parameter(torch.full((1,), -4.0))
         self.lr_memory_gate = nn.Parameter(torch.full((1,), -5.0))
         self.lr_cross_conv_gate = nn.Parameter(torch.full((1,), -4.0))
+        self.detail_ip_gate = nn.Parameter(torch.full((1,), -5.0))
+        self.detail_stream_gate = nn.Parameter(torch.full((1,), -5.0))
+        self.detail_cross_conv_gate = nn.Parameter(torch.full((1,), -5.0))
         self.semantic_gate = nn.Parameter(torch.full((1,), -4.0))
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # to be compatible with lower version pytorch
@@ -83,6 +94,10 @@ class PixArtMSBlock(nn.Module):
         nn.init.constant_(self.lr_ip_attn.proj.bias, 0)
         nn.init.constant_(self.lr_stream_attn.proj.weight, 0)
         nn.init.constant_(self.lr_stream_attn.proj.bias, 0)
+        nn.init.constant_(self.detail_ip_attn.proj.weight, 0)
+        nn.init.constant_(self.detail_ip_attn.proj.bias, 0)
+        nn.init.constant_(self.detail_stream_attn.proj.weight, 0)
+        nn.init.constant_(self.detail_stream_attn.proj.bias, 0)
         self._last_image_stats = None
 
     def forward(
@@ -98,6 +113,9 @@ class PixArtMSBlock(nn.Module):
         sem_tokens=None,
         sem_scale=None,
         lr_ip_scale=None,
+        detail_ip_tokens=None,
+        detail_stream_tokens=None,
+        detail_scale=None,
         return_lr_stream=False,
         **kwargs,
     ):
@@ -127,11 +145,11 @@ class PixArtMSBlock(nn.Module):
         gate_val = torch.sigmoid(self.lr_ip_gate).to(dtype=x.dtype)
         stream_delta = torch.zeros_like(x)
         conv_delta = torch.zeros_like(x)
-        if self.is_pixel_layer and (lr_stream_tokens is not None):
+        if self.is_lr_evolve_layer and (lr_stream_tokens is not None):
             g_stream = torch.sigmoid(self.lr_stream_gate).to(dtype=x.dtype).view(1, 1, 1)
             stream_delta = g_stream * self.lr_stream_attn(lr_stream_tokens, x, None)
             lr_stream_tokens = lr_stream_tokens + self.drop_path(stream_delta)
-        if self.is_pixel_layer and (lr_stream_tokens is not None) and (lr_base_tokens is not None):
+        if self.is_lr_memory_layer and (lr_stream_tokens is not None) and (lr_base_tokens is not None):
             g_mem = torch.sigmoid(self.lr_memory_gate).to(dtype=x.dtype).view(1, 1, 1)
             lr_stream_tokens = lr_stream_tokens + g_mem * lr_base_tokens.to(dtype=x.dtype)
         if lr_ip_tokens is not None and (lr_stream_tokens is None):
@@ -145,6 +163,31 @@ class PixArtMSBlock(nn.Module):
             g_conv = torch.sigmoid(self.lr_cross_conv_gate).to(dtype=x.dtype).view(1, 1, 1)
             conv_delta = g_conv * self.lr_cross_conv(x, lr_stream_tokens, HW)
             x = x + self.drop_path(conv_delta)
+        detail_delta = torch.zeros_like(x)
+        detail_stream_delta = torch.zeros_like(x)
+        detail_conv_delta = torch.zeros_like(x)
+        if detail_ip_tokens is not None and (detail_stream_tokens is None):
+            detail_stream_tokens = detail_ip_tokens
+        if detail_scale is None:
+            detail_scale_map = 1.0
+        else:
+            detail_scale_map = detail_scale.to(device=x.device, dtype=x.dtype)
+            if detail_scale_map.ndim == 1:
+                detail_scale_map = detail_scale_map.view(-1, 1, 1)
+            elif detail_scale_map.ndim == 2:
+                detail_scale_map = detail_scale_map.view(detail_scale_map.shape[0], 1, 1)
+        if self.is_detail_evolve_layer and (detail_stream_tokens is not None):
+            g_dstream = torch.sigmoid(self.detail_stream_gate).to(dtype=x.dtype).view(1, 1, 1)
+            detail_stream_delta = g_dstream * self.detail_stream_attn(detail_stream_tokens, x, None)
+            detail_stream_tokens = detail_stream_tokens + self.drop_path(detail_stream_delta)
+        if self.is_detail_layer and (detail_stream_tokens is not None):
+            g_detail = torch.sigmoid(self.detail_ip_gate).to(dtype=x.dtype).view(1, 1, 1)
+            detail_delta = detail_scale_map * g_detail * self.detail_ip_attn(x, detail_stream_tokens, None)
+            x = x + self.drop_path(detail_delta)
+        if self.is_detail_conv_layer and (detail_stream_tokens is not None):
+            g_dconv = torch.sigmoid(self.detail_cross_conv_gate).to(dtype=x.dtype).view(1, 1, 1)
+            detail_conv_delta = detail_scale_map * g_dconv * self.detail_cross_conv(x, detail_stream_tokens, HW)
+            x = x + self.drop_path(detail_conv_delta)
         self._last_image_stats = {
             "image_alpha_value": float(gate_val.detach().float().item()),
             "text_ctx_std": float(text_ctx_std),
@@ -154,10 +197,16 @@ class PixArtMSBlock(nn.Module):
             "lr_memory_gate": float(torch.sigmoid(self.lr_memory_gate.detach()).item()),
             "semantic_img_delta_std": float(sem_img_delta_std),
             "semantic_gate": float(torch.sigmoid(self.semantic_gate.detach()).item()),
+            "detail_stream_delta_std": float(detail_stream_delta.detach().float().std().item()),
+            "detail_delta_std": float(detail_delta.detach().float().std().item()),
+            "detail_conv_delta_std": float(detail_conv_delta.detach().float().std().item()),
+            "detail_ip_gate": float(torch.sigmoid(self.detail_ip_gate.detach()).item()),
+            "detail_stream_gate": float(torch.sigmoid(self.detail_stream_gate.detach()).item()),
+            "detail_cross_conv_gate": float(torch.sigmoid(self.detail_cross_conv_gate.detach()).item()),
         }
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
         if return_lr_stream:
-            return x, lr_stream_tokens
+            return x, lr_stream_tokens, detail_stream_tokens
         return x
 
 
@@ -374,6 +423,12 @@ class PixArtMS(PixArt):
                     nn.init.constant_(block.lr_cross_conv.dw.bias, 0)
                 if block.lr_cross_conv.pw.bias is not None:
                     nn.init.constant_(block.lr_cross_conv.pw.bias, 0)
+            if hasattr(block, "detail_cross_conv"):
+                nn.init.constant_(block.detail_cross_conv.dw.weight, 0)
+                if block.detail_cross_conv.dw.bias is not None:
+                    nn.init.constant_(block.detail_cross_conv.dw.bias, 0)
+                if block.detail_cross_conv.pw.bias is not None:
+                    nn.init.constant_(block.detail_cross_conv.pw.bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.linear.weight, 0)

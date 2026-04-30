@@ -28,7 +28,6 @@ from diffusers import AutoencoderKL, DDIMScheduler
 
 from diffusion.model.nets.PixArtSigma_SR import PixArtSigmaSR_XL_2
 from diffusion.model.nets.adapter import build_adapter_v12
-from diffusion.model.nets.semantic_adapter import CLIPSemanticAdapter
 from diffusion.model.nets.dual_lora import apply_dual_lora, set_dual_lora_scales
 from diffusion.model.nets.adapter_cond import mask_adapter_cond
 
@@ -489,8 +488,17 @@ def build_model_and_assets(args, device, compute_dtype):
         input_size=64,
         in_channels=4,
         out_channels=4,
-        anchor_layers=list(layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7])),
-        semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
+        anchor_layers=list(layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7, 10, 13, 16])),
+        pixel_layers=list(layer_cfg.get("pixel_layers", [0, 1, 2, 3, 4, 5, 6, 7, 10, 13, 16])),
+        lr_conv_layers=list(layer_cfg.get("lr_conv_layers", [2, 4, 6, 10, 13, 16])),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [])),
+        lr_evolve_layers=list(layer_cfg.get("lr_evolve_layers", list(range(28)))),
+        lr_memory_layers=list(layer_cfg.get("lr_memory_layers", [0, 1, 2, 3, 4, 5, 6, 7, 10, 13])),
+        detail_evolve_layers=list(layer_cfg.get("detail_evolve_layers", [8, 10, 13, 16, 19, 22, 25, 27])),
+        detail_layers=list(layer_cfg.get("detail_layers", [13, 16, 19, 22, 25, 27])),
+        detail_conv_layers=list(layer_cfg.get("detail_conv_layers", [16, 19, 22, 25, 27])),
+        detail_t_max=float(layer_cfg.get("detail_t_max", 650.0)),
+        detail_t_power=float(layer_cfg.get("detail_t_power", 1.5)),
     ).to(device)
 
     base = torch.load(args.pixart_path, map_location="cpu")
@@ -505,14 +513,14 @@ def build_model_and_assets(args, device, compute_dtype):
     pixart.enable_sr_conditioning_layers(
         pixel_layers=list(layer_cfg.get("pixel_layers", layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7]))),
         lr_conv_layers=list(layer_cfg.get("lr_conv_layers", layer_cfg.get("anchor_layers", [0, 1, 2, 3, 4, 5, 6, 7]))),
-        semantic_layers=list(layer_cfg.get("semantic_layers", [24, 25, 26, 27])),
+        semantic_layers=list(layer_cfg.get("semantic_layers", [])),
+        lr_evolve_layers=list(layer_cfg.get("lr_evolve_layers", list(range(28)))),
+        lr_memory_layers=list(layer_cfg.get("lr_memory_layers", [0,1,2,3,4,5,6,7,10,13])),
+        detail_evolve_layers=list(layer_cfg.get("detail_evolve_layers", [8,10,13,16,19,22,25,27])),
+        detail_layers=list(layer_cfg.get("detail_layers", [13,16,19,22,25,27])),
+        detail_conv_layers=list(layer_cfg.get("detail_conv_layers", [16,19,22,25,27])),
         init_gate=-4.0,
     )
-    sem0 = int(layer_cfg.get("semantic_layers", [24, 25, 26, 27])[0])
-    sem_std = float(pixart.blocks[sem0].cross_attn.out_proj.weight.detach().float().std().item())
-    print(f"[semantic-enable-check] layer={sem0} out_proj.weight.std={sem_std:.6e}")
-    if sem_std <= 1e-8:
-        raise RuntimeError("semantic layer out_proj.weight.std() is zero after enable; call order is wrong.")
 
     has_dual_lora = any(
         ("pixel_lora_A" in k) or ("pixel_lora_B" in k) or ("semantic_lora_A" in k) or ("semantic_lora_B" in k)
@@ -563,37 +571,7 @@ def build_model_and_assets(args, device, compute_dtype):
         hidden_size=1152,
     ).to(device).float()
     adapter.load_state_dict(ckpt["adapter"], strict=True)
-    semantic_encoder_path = (
-        args.semantic_encoder_name_or_path
-        or layer_cfg.get("semantic_encoder_name_or_path")
-        or cfg.get("semantic_encoder_name_or_path")
-        or os.getenv("SEMANTIC_ENCODER_NAME_OR_PATH")
-        or "/workspace/models/openai/clip-vit-large-patch14"
-    )
-    sem_adapter = CLIPSemanticAdapter(
-        encoder_name_or_path=semantic_encoder_path,
-        hidden_size=1152,
-        num_prompt_tokens=16,
-    ).to(device).eval()
-    sem_adapter_sd = ckpt.get("sem_adapter", None)
-    if not bool(args.disable_semantic_branch):
-        if isinstance(sem_adapter_sd, dict) and len(sem_adapter_sd) > 0:
-            required_sem_keys = ("proj.weight", "proj.bias", "out_scale")
-            missing_sem_keys = [k for k in required_sem_keys if k not in sem_adapter_sd]
-            if missing_sem_keys:
-                raise RuntimeError(f"Checkpoint sem_adapter missing required keys in eval: {missing_sem_keys}")
-            missing, unexpected, skipped = load_state_dict_shape_compatible(
-                sem_adapter,
-                sem_adapter_sd,
-                context="eval-sem-adapter",
-            )
-            loaded_count = len(sem_adapter_sd) - len(skipped)
-            if loaded_count <= 0:
-                raise RuntimeError(
-                    "No sem_adapter tensors were loaded; refusing to eval with random semantic adapter."
-                )
-        else:
-            raise RuntimeError("Checkpoint missing sem_adapter while semantic branch is enabled in eval.")
+    sem_adapter = None
 
     vae = AutoencoderKL.from_pretrained(args.vae_path, local_files_only=True).to(device).float().eval()
     vae.enable_slicing()
@@ -616,7 +594,6 @@ def build_model_and_assets(args, device, compute_dtype):
 
     pixart.eval()
     adapter.eval()
-    sem_adapter.eval()
     return pixart, adapter, sem_adapter, vae, null_pack, scheduler
 
 
@@ -659,12 +636,14 @@ def run_ddim_predict(pixart, adapter, sem_adapter, vae, null_pack, scheduler, ba
         t_embed = pixart.t_embedder(t_b.to(dtype=compute_dtype))
         with torch.autocast(device_type="cuda", dtype=compute_dtype, enabled=(device == "cuda")):
             cond = adapter(adapter_in, t_embed=t_embed.float())
-            if not bool(args.disable_semantic_branch):
-                cond["sem_tokens"] = sem_adapter(((adapter_in.clamp(-1, 1) + 1.0) * 0.5).float())
             if "ip_tokens" not in cond and "cond_tokens" not in cond:
                 raise KeyError("adapter output missing ip_tokens/cond_tokens")
             if "local_entry_tokens" not in cond and "cond_map" not in cond:
                 raise KeyError("adapter output missing local_entry_tokens/cond_map")
+            if "detail_tokens" not in cond:
+                raise KeyError("adapter output missing detail_tokens")
+            if "detail_latent_residual" not in cond:
+                raise KeyError("adapter output missing detail_latent_residual")
             # conditional prompt source = adaptive cache (if enabled); unconditional prompt source = null prompt.
             y_cond = null_pack["y"].to(device).repeat(latents.shape[0], 1, 1, 1)
             mask_cond = null_pack["mask"].to(device).repeat(latents.shape[0], 1, 1, 1)
@@ -1025,10 +1004,8 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--sft_strength", type=float, default=1.0)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
-    parser.add_argument("--semantic-encoder-name-or-path", type=str, default=DEFAULT_SEMANTIC_ENCODER)
     parser.add_argument("--lambda-pix", type=float, default=1.0)
     parser.add_argument("--lambda-sem", type=float, default=1.0)
-    parser.add_argument("--disable-semantic-branch", action="store_true")
 
     parser.add_argument("--output_dir", type=str, default="/home/hello/HJT/SRConvnetAdapter/experiments_results")
     parser.add_argument("--save_preds", dest="save_preds", action="store_true")
