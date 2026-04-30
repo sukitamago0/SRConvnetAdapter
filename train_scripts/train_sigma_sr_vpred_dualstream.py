@@ -324,7 +324,9 @@ KV_COMPRESS_SCALE = 2
 KV_COMPRESS_LAYERS = list(range(20, 28))  # late blocks only
 
 # Staged unfreeze for resume from old checkpoint
-TRAIN_STAGE = "single"
+TRAIN_STAGE = os.getenv("TRAIN_STAGE", "B").strip().upper()
+TRAIN_DATA_MODE = os.getenv("TRAIN_DATA_MODE", "mixed").strip().lower()
+DETAIL_INIT_GATE = float(os.getenv("DETAIL_INIT_GATE", "-5.0"))
 AUTO_STAGE_ENABLED = False
 ENABLE_SELECTIVE_TUNING = False
 ENABLE_LORA = True
@@ -365,6 +367,12 @@ def get_loss_weights(epoch_1based: int):
         "gw": float(gw_w),
         "lpips": float(lpips_w),
     }
+
+def get_late_lpips_weight(epoch_1based: int) -> float:
+    if TRAIN_STAGE == "A":
+        return 0.0
+    # Stage B ramp to late LPIPS cap
+    return float(0.15 * _linear_ramp(epoch_1based, start_epoch=LPIPS_START_EPOCH, end_epoch=LPIPS_RAMP_END_EPOCH))
 
 
 def get_sft_strength(epoch_1based: int) -> float:
@@ -997,6 +1005,8 @@ def get_config_snapshot():
         "use_lq_match_train": bool(USE_LQ_MATCH_TRAIN),
         "lq_match_prob": float(LQ_MATCH_PROB),
         "disable_detail_branch": bool(DISABLE_DETAIL_BRANCH),
+        "train_stage": str(TRAIN_STAGE),
+        "train_data_mode": str(TRAIN_DATA_MODE),
         "lq_match_t_max": int(LQ_MATCH_T_MAX),
     }
 
@@ -1006,6 +1016,8 @@ def write_experiment_contract():
         "detail_branch_enabled": bool(not DISABLE_DETAIL_BRANCH),
         "lq_init_strength": float(LQ_INIT_STRENGTH),
         "lq_match_prob": float(LQ_MATCH_PROB),
+        "train_stage": str(TRAIN_STAGE),
+        "train_data_mode": str(TRAIN_DATA_MODE),
         "checkpoint_selection": {
             "mode": str(CKPT_SELECT_MODE),
             "psnr_gate": float(CKPT_SELECT_PSNR_GATE),
@@ -1759,17 +1771,22 @@ def build_optimizer_and_clippables(pixart: nn.Module, adapter: nn.Module, sem_ad
         else:
             cond_params.append(p)
 
+    stage_a = (TRAIN_STAGE == "A")
+    adapter_lr = 2e-4 if stage_a else 3e-4
+    cond_lr = 5e-5 if stage_a else 1e-4
+    final_lr = 3e-5 if stage_a else 5e-5
+    lora_lr = 5e-5 if stage_a else 1e-4
     optim_groups = []
     if adapter_params:
-        optim_groups.append({"params": adapter_params, "lr": 3e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": adapter_params, "lr": adapter_lr, "weight_decay": 0.01})
     if sem_adapter_params:
         optim_groups.append({"params": sem_adapter_params, "lr": 1e-4, "weight_decay": 0.01})
     if cond_params:
-        optim_groups.append({"params": cond_params, "lr": 1e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": cond_params, "lr": cond_lr, "weight_decay": 0.01})
     if final_layer_params:
-        optim_groups.append({"params": final_layer_params, "lr": 5e-5, "weight_decay": 0.01})
+        optim_groups.append({"params": final_layer_params, "lr": final_lr, "weight_decay": 0.01})
     if lora_params:
-        optim_groups.append({"params": lora_params, "lr": 1e-4, "weight_decay": 0.01})
+        optim_groups.append({"params": lora_params, "lr": lora_lr, "weight_decay": 0.01})
     if len(optim_groups) == 0:
         raise RuntimeError("No optimizer groups built; check trainable settings.")
 
@@ -2522,7 +2539,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         ip_pre_stds, ip_post_stds, ip_out_scales = [], [], []
         
         prompt_hit_rates, prompt_tok_counts, prompt_nonpad_ratios = [], [], []
-        detail_gate_means, detail_delta_stds, detail_stream_delta_stds, detail_conv_delta_stds = [], [], [], []
+        detail_gate_means, detail_delta_stds, detail_stream_delta_stds, detail_conv_delta_stds, detail_scale_means = [], [], [], [], []
         prompt_cache_mem = OrderedDict()
         for batch in tqdm(val_loader, desc=f"Val@{steps}"):
             hr = batch["hr"].to(DEVICE); lr = batch["lr"].to(DEVICE)
@@ -2591,6 +2608,7 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
                     detail_delta_stds.append(float(ip_stats.get("detail_delta_std_mean", 0.0)))
                     detail_stream_delta_stds.append(float(ip_stats.get("detail_stream_delta_std_mean", 0.0)))
                     detail_conv_delta_stds.append(float(ip_stats.get("detail_conv_delta_std_mean", 0.0)))
+                    detail_scale_means.append(float(ip_stats.get("detail_scale_mean", 0.0)))
 
                     
 
@@ -2654,13 +2672,16 @@ def validate(epoch, pixart, adapter, sem_adapter, vae, val_loader, null_pack, da
         detail_delta_std_mean = float(np.mean(detail_delta_stds)) if len(detail_delta_stds) > 0 else 0.0
         detail_stream_delta_std_mean = float(np.mean(detail_stream_delta_stds)) if len(detail_stream_delta_stds) > 0 else 0.0
         detail_conv_delta_std_mean = float(np.mean(detail_conv_delta_stds)) if len(detail_conv_delta_stds) > 0 else 0.0
+        detail_scale_mean = float(np.mean(detail_scale_means)) if len(detail_scale_means) > 0 else 0.0
         msg = (
             f"[VAL-PROXY@{steps}][{tag}] Ep{epoch+1}: proxy_psnr={res[0]:.2f} | proxy_ssim={res[1]:.4f} | proxy_lpips={res[2]:.4f} | proxy_dists={res[3]:.4f} | "
-            f"CONDΔ={cdelta:.5f} | text_cond_delta={text_cdelta:.5f} | prompt_cache_hit_rate={prompt_hit_rate:.3f} | avg_prompt_token_count={avg_prompt_token_count:.2f} | avg_prompt_nonpad_ratio={avg_prompt_nonpad_ratio:.3f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | ip_tok_std={ip_tok_std:.4f} | ip_pre_std={ip_pre_std:.4f} | ip_post_std={ip_post_std:.4f} | ip_out_scale={ip_out_scale:.4f} | ip_out_std={ip_out_std:.4f} | ip_alpha={ip_alpha:.4f} | detail_gate_mean={detail_gate_mean:.4f} | detail_delta_std_mean={detail_delta_std_mean:.4f} | detail_stream_delta_std_mean={detail_stream_delta_std_mean:.4f} | detail_conv_delta_std_mean={detail_conv_delta_std_mean:.4f} | ip_K={16} | "
+            f"CONDΔ={cdelta:.5f} | text_cond_delta={text_cdelta:.5f} | prompt_cache_hit_rate={prompt_hit_rate:.3f} | avg_prompt_token_count={avg_prompt_token_count:.2f} | avg_prompt_nonpad_ratio={avg_prompt_nonpad_ratio:.3f} | ad_map_std={adapter_map_std:.4f} | cond_map_std={cond_map_std:.4f} | ip_tok_std={ip_tok_std:.4f} | ip_pre_std={ip_pre_std:.4f} | ip_post_std={ip_post_std:.4f} | ip_out_scale={ip_out_scale:.4f} | ip_out_std={ip_out_std:.4f} | ip_alpha={ip_alpha:.4f} | detail_gate_mean={detail_gate_mean:.4f} | detail_delta_std_mean={detail_delta_std_mean:.4f} | detail_stream_delta_std_mean={detail_stream_delta_std_mean:.4f} | detail_conv_delta_std_mean={detail_conv_delta_std_mean:.4f} | detail_scale_mean={detail_scale_mean:.4f} | ip_K={16} | "
             f"flat_lpips={np.mean(flat_lpipss):.4f} | edge_lpips={np.mean(edge_lpipss):.4f} | "
             f"corner_psnr={np.mean(corner_psnrs):.2f} | corner_lpips={np.mean(corner_lpipss):.4f}"
         )
         print(msg)
+        if abs(detail_gate_mean) < 1e-4 and abs(detail_delta_std_mean) < 1e-4 and abs(detail_stream_delta_std_mean) < 1e-4 and abs(detail_conv_delta_std_mean) < 1e-4 and abs(detail_scale_mean) < 1e-4:
+            print("[WARN][detail-branch][val] detail stats near zero.")
     pixart.train(); adapter.train()
     if sem_adapter is not None:
         sem_adapter.train()
@@ -2678,7 +2699,12 @@ def main():
         if not os.path.exists(pth):
             raise FileNotFoundError(f"Required pretrained path missing: {pth}")
 
-    train_ds = DF2K_Online_Dataset(crop_size=512, is_train=True, scale=4)
+    if TRAIN_DATA_MODE == "df2k":
+        train_ds = DF2K_Online_Dataset(crop_size=512, is_train=True, scale=4)
+    elif TRAIN_DATA_MODE == "mixed":
+        train_ds = MixedRealISRDataset(crop_size=512, scale=4)
+    else:
+        raise ValueError(f"Unsupported TRAIN_DATA_MODE={TRAIN_DATA_MODE}, expected df2k|mixed")
     if VAL_MODE == "realsr":
         val_ds = RealSR_Val_Paired_Dataset(REALSR_VAL_ROOTS, crop_size=512)
         print(f"[VAL] mode=realsr roots={REALSR_VAL_ROOTS} pairs={len(val_ds)}")
@@ -2776,7 +2802,7 @@ def main():
         detail_layers=list(DETAIL_LAYERS),
         detail_conv_layers=list(DETAIL_CONV_LAYERS),
         semantic_layers=list(SEMANTIC_LAYERS),
-        init_gate=-4.0,
+        init_gate=float(DETAIL_INIT_GATE),
     )
     if len(SEMANTIC_LAYERS) > 0:
         sem0 = int(SEMANTIC_LAYERS[0])
@@ -2881,7 +2907,7 @@ def main():
     print("📏 Raw validation frequency: every validation trigger")
     print("[VAL-SCHEDULE] epochs 1-14: every 5 | epochs 15-24: every 2 | epochs 25+: every epoch")
     print(f"[PROMPT-CACHE] train_max_items={TRAIN_PROMPT_CACHE_MAX_ITEMS} val_max_items={VAL_PROMPT_CACHE_MAX_ITEMS}")
-    print(f"[DATALOADER] train_num_workers={NUM_WORKERS} val_num_workers={VAL_NUM_WORKERS}")
+    print(f"[DATALOADER] train_num_workers={NUM_WORKERS} val_num_workers={VAL_NUM_WORKERS} train_data_mode={TRAIN_DATA_MODE}")
     print(f"[GUARD-FWD] extra_guard_forward_every={GUARD_FORWARD_EVERY}")
 
     if START_FROM_BASE_ONLY:
@@ -2924,6 +2950,7 @@ def main():
                 break
 
             hr = batch['hr'].to(DEVICE); lr = batch['lr'].to(DEVICE); lr_small_b = batch['lr_small']
+            source_type = batch.get("source_type", None)
             sample_keys = batch.get("sample_key", None)
             if isinstance(sample_keys, str):
                 sample_keys = [sample_keys]
@@ -3229,6 +3256,9 @@ def main():
                     loss_latent_l1 = torch.zeros((), device=DEVICE, dtype=z0.dtype)
 
                 w = get_loss_weights(epoch + 1)
+                late_lpips_w = get_late_lpips_weight(epoch + 1)
+                detail_latent_w = 0.0 if TRAIN_STAGE == "A" else float(DETAIL_LATENT_WEIGHT)
+                detail_hf_w = 0.0 if TRAIN_STAGE == "A" else float(DETAIL_LATENT_HF_WEIGHT)
                 
                 # Calculate patch-space losses
                 loss_lr_cons = torch.tensor(0.0, device=DEVICE)
@@ -3324,9 +3354,9 @@ def main():
                     + w.get('lr_cons', 0.0) * loss_lr_cons
                     + w.get('gw', 0.0) * loss_gw
                     + (w.get('lpips', 0.0) * loss_lpips if USE_LEGACY_PATCH_LPIPS else 0.0)
-                    + float(LPIPS_LATE_WEIGHT) * late_lpips
-                    + float(DETAIL_LATENT_WEIGHT) * loss_detail_latent
-                    + float(DETAIL_LATENT_HF_WEIGHT) * loss_latent_hf
+                    + float(late_lpips_w) * late_lpips
+                    + float(detail_latent_w) * loss_detail_latent
+                    + float(detail_hf_w) * loss_latent_hf
                     + float(RGB_HF_WEIGHT) * loss_rgb_hf
                     + inject_reg
                 ) / GRAD_ACCUM_STEPS
@@ -3404,6 +3434,7 @@ def main():
                     'lp_w': f"{w.get('lpips', 0.0):.3f}",
                     'lp_legacy': f"{int(USE_LEGACY_PATCH_LPIPS)}",
                     'late_lp': f"{late_lpips.item():.3f}",
+                    'late_w': f"{late_lpips_w:.3f}",
                     'late_n': f"{late_lpips_num_samples}",
                     'late_af': f"{late_lpips_active_frac:.3f}",
                     'sft_s': f"{sft_strength_logged:.3f}",
@@ -3427,6 +3458,7 @@ def main():
                     'l_ad': f"{loss_detail_latent.item():.4f}",
                     'l_lhf': f"{loss_latent_hf.item():.4f}",
                     'l_rhf': f"{loss_rgb_hf.item():.4f}",
+                    'stage': f"{TRAIN_STAGE}",
                     'guard_fwd': f"{int(run_guard_forward)}",
                     'a_hit': f"{prompt_cache_hit_rate:.3f}",
                     'p_miss': f"{int(num_missing_prompt_packs)}",
@@ -3449,6 +3481,14 @@ def main():
                     'ad_drop': f"{int(adapter_dropped)}",
                     'cpu_rss_gb': f"{cpu_rss_gb:.3f}" if math.isfinite(cpu_rss_gb) else "nan",
                 }
+                if source_type is not None:
+                    if isinstance(source_type, (list, tuple)):
+                        src_show = source_type[0]
+                    else:
+                        src_show = str(source_type)
+                    log_dict["src"] = str(src_show)
+                if abs(detail_gate_mean) < 1e-4 and abs(detail_delta_std_mean) < 1e-4 and abs(detail_stream_delta_std_mean) < 1e-4 and abs(detail_conv_delta_std_mean) < 1e-4:
+                    print("[WARN][detail-branch] detail stats near zero for this log window.")
                 log_dict["sft_strength"] = f"{sft_strength_logged:.3f}"
                 pbar.set_postfix(log_dict)
                 LAST_TRAIN_LOG = {
@@ -3457,6 +3497,7 @@ def main():
                     "use_legacy_patch_lpips": bool(USE_LEGACY_PATCH_LPIPS),
                     "lpips_num_samples": int(lpips_num_samples),
                     "late_lpips": float(late_lpips.item()),
+                    "late_lpips_w": float(late_lpips_w),
                     "late_lpips_num_samples": int(late_lpips_num_samples),
                     "late_lpips_active_frac": float(late_lpips_active_frac),
                     "lr_cons_weight": float(w.get('lr_cons', 0.0)),
